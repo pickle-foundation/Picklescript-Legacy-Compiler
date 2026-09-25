@@ -13,8 +13,6 @@ pub const MIN_OBJECT: usize = 32;
 /// Free-bin count: covers objects up to 2^31; bigger sizes go into the last bin.
 pub const NBINS: usize = 28;
 
-/// Room needed to bother splitting a free block (extra header + 8 bytes).
-const SPLIT_MIN: usize = crate::object::pickle_header_size() + 8;
 const FREE_SENTINEL: u32 = 0xDEAD;
 
 #[repr(C)]
@@ -97,19 +95,29 @@ impl Heap {
     }
 
     fn alloc_from_free(&mut self, size: usize) -> Option<*mut PickleObject> {
+        // Bound the free-bin walk: after a few non-fitting nodes (blocks whose
+        // span cannot be split into a valid leftover), bail to the bump
+        // allocator. An unbounded walk turns 32-byte-box churn into O(n^2) once
+        // dead list/string objects fill the shared size bins. capping the scan
+        // keeps every allocation O(1) regardless of chain composition.
+        const MAX_SCAN: usize = 8;
         let mut prev: *mut PickleObject = std::ptr::null_mut();
+        let mut scanned: usize = 0;
         for idx in bin_of(size)..NBINS {
             let mut cur = self.free_heads[idx];
             while !cur.is_null() {
+                if scanned >= MAX_SCAN {
+                    return None;
+                }
+                scanned += 1;
                 unsafe {
                     let full = (*cur).size as usize;
                     // Only reuse a block whose span can exactly match the
-                    // request: either a perfect fit, or a split that leaves a
-                    // leftover big enough to become its own free block. A
-                    // smaller leftover cannot carry a header, so absorbing it
-                    // would make the header size disagree with the block span
-                    // and the sweep would walk into the orphaned bytes.
-                    if full == size || full >= size + SPLIT_MIN {
+                    // request: either a perfect fit, or a split whose leftover
+                    // is itself a valid free object (>= MIN_OBJECT). Splitting
+                    // into a sub-MIN_OBJECT stub is unsafe: such stubs would
+                    // poison the shared bins for every later allocation.
+                    if full == size || full >= size + MIN_OBJECT {
                         let next = (*cur).next;
                         if prev.is_null() {
                             self.free_heads[idx] = next;

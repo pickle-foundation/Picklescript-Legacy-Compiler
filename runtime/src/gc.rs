@@ -14,7 +14,23 @@ use crate::object::{
 use crate::shadow;
 use crate::trace;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
+
+/// `PKL_NO_AUTO_GC=1` suppresses automatic collections. It is read once, not
+/// per allocation: on Windows an environment probe costs ~190us, which would
+/// dwarf the allocation itself on any box/string/list churn workload.
+static NO_AUTO_GC: AtomicBool = AtomicBool::new(false);
+static NO_AUTO_GC_INIT: Once = Once::new();
+
+fn no_auto_gc_once() -> bool {
+    NO_AUTO_GC_INIT.call_once(|| {
+        NO_AUTO_GC.store(
+            std::env::var_os("PKL_NO_AUTO_GC").is_some(),
+            Ordering::Relaxed,
+        );
+    });
+    NO_AUTO_GC.load(Ordering::Relaxed)
+}
 
 /// Static root cells (compiler-emitted global variables and class statics).
 static STATIC_ROOTS: Mutex<Vec<&'static mut RootCell>> = Mutex::new(Vec::new());
@@ -349,7 +365,7 @@ impl Gc {
 
     /// Maybe collect if the allocation threshold has been crossed.
     pub fn maybe_collect(&mut self) {
-        if std::env::var_os("PKL_NO_AUTO_GC").is_none()
+        if !no_auto_gc_once()
             && BYTES_SINCE_GC.load(Ordering::Relaxed) >= AUTO_THRESHOLD.load(Ordering::Relaxed)
         {
             self.collect();
