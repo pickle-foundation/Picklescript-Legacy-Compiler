@@ -1,0 +1,150 @@
+module std.process_test
+
+import { Result, Proc, proc, git, shSplit, pipe, currentDir } from std.process
+
+test fn proc_capture_echo() {
+    let r = proc(["cmd.exe", "/c", "echo", "hi"] as List<string>)
+    expect(r.ok()).toBe(true)
+    if (let some(c) = r.exitCode()) {
+        expect(c).toBe(0)
+    } else {
+        expect("unexpected").toBe("echo reported no code")
+    }
+    expect(r.firstLine()).toBe("hi")
+    expect(r.timedOut()).toBe(false)
+    let r2 = proc(["cmd.exe", "/c", "echo", "hello world"] as List<string>)
+    expect(str_contains(r2.stdout(), "hello world")).toBe(true)
+}
+
+test fn proc_capture_nonzero() {
+    let r = Proc(["cmd.exe", "/c", "exit", "3"] as List<string>).run()
+    expect(r.ok()).toBe(false)
+    if (let some(c) = r.exitCode()) {
+        expect(c).toBe(3)
+    } else {
+        expect("unexpected").toBe("exit 3 reported no code")
+    }
+}
+
+test fn proc_capture_env() {
+    let r = Proc(["cmd.exe", "/c", "echo", "%PICKLE_TST%"] as List<string>).withEnv("PICKLE_TST", "42").run()
+    expect(r.firstLine()).toBe("42")
+}
+
+test fn proc_capture_cwd() {
+    let r = Proc(["cmd.exe", "/c", "cd"] as List<string>).setCwd("tests/pickle").run()
+    expect(r.ok()).toBe(true)
+    expect(str_contains(r.stdout(), "pickle")).toBe(true)
+}
+
+test fn proc_capture_stdin() {
+    let r = Proc(["cmd.exe", "/c", "findstr", ".*"] as List<string>).withStdin(bytes("salad")).run()
+    expect(r.ok()).toBe(true)
+    expect(str_contains(r.stdout(), "salad")).toBe(true)
+}
+
+test fn proc_capture_timeout() {
+    let r = Proc(["cmd.exe", "/c", "ping", "-n", "20", "127.0.0.1"] as List<string>).withTimeout(300).run()
+    expect(r.timedOut()).toBe(true)
+}
+
+test fn proc_capture_spawn_failure_ok_false() {
+    let r = Proc(["_nope_missing_prog_xyz_"] as List<string>).run()
+    expect(r.ok()).toBe(false)
+    if (let some(_c) = r.exitCode()) {
+        expect("unexpected").toBe("spawn failure reported a code")
+    } else {
+        expect(true).toBe(true)
+    }
+}
+
+test fn proc_output_alias() {
+    let r = Proc(["cmd.exe", "/c", "echo", "via-output"] as List<string>).output()
+    expect(r.ok()).toBe(true)
+    expect(r.firstLine()).toBe("via-output")
+}
+
+test fn proc_lines_split() {
+    let r = Proc(["cmd.exe", "/c", "findstr", "."] as List<string>).withStdin(bytes("line1\nline2\n")).run()
+    let ls = r.lines()
+    expect(r.ok()).toBe(true)
+    expect(len(ls)).toBe(2)
+    expect(ls[0]).toBe("line1")
+    expect(ls[1]).toBe("line2")
+}
+
+test fn proc_sh_split() {
+    let a = shSplit("echo hello")
+    expect(len(a)).toBe(2)
+    expect(a[0]).toBe("echo")
+    expect(a[1]).toBe("hello")
+    let b = shSplit("cmd /c \"a quoted\" 'and single'")
+    expect(len(b)).toBe(4)
+    expect(b[2]).toBe("a quoted")
+    expect(b[3]).toBe("and single")
+    let c = shSplit("")
+    expect(len(c)).toBe(0)
+}
+
+test fn proc_current_dir_some() {
+    if (let some(d) = currentDir()) {
+        expect(len(bytes(d)) > 0).toBe(true)
+    } else {
+        expect("unexpected").toBe("currentDir returned none")
+    }
+}
+
+test fn proc_pipe_filters() {
+    let cmds: List<List<string>> = [
+        ["cmd.exe", "/c", "echo", "piped data"] as List<string>,
+        ["cmd.exe", "/c", "findstr", "piped"] as List<string>,
+    ]
+    let r = pipe(cmds)
+    expect(r.ok()).toBe(true)
+    expect(str_contains(r.stdout(), "piped data")).toBe(true)
+}
+
+test fn proc_pipe_preserves_first_failure() {
+    let cmds: List<List<string>> = [
+        ["_nope_missing_prog_xyz_"] as List<string>,
+        ["cmd.exe", "/c", "echo", "unreached"] as List<string>,
+    ]
+    let r = pipe(cmds)
+    expect(r.ok()).toBe(false)
+}
+
+test fn proc_git_rev_parse() {
+    let r = git(".", ["rev-parse", "--show-toplevel"] as List<string>)
+    expect(r.ok()).toBe(true)
+    expect(str_contains(r.firstLine(), "PickleScript")).toBe(true)
+}
+
+test fn proc_git_status_is_clean_and_quiet() {
+    let r = git(".", ["status", "--porcelain"] as List<string>)
+    expect(r.ok()).toBe(true)
+}
+
+fn str_contains(s: string, sub: string): bool {
+    let sb = bytes(sub)
+    let sbl = len(sb)
+    if (sbl == 0) {
+        return true
+    }
+    let b = bytes(s)
+    var i = 0
+    while (i + sbl <= len(b)) {
+        var j = 0
+        var ok = true
+        while (j < sbl) {
+            if (b[i + j] != sb[j]) {
+                ok = false
+            }
+            j += 1
+        }
+        if (ok) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}

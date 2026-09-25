@@ -24,6 +24,7 @@ mod map;
 mod object;
 mod os;
 mod panic;
+mod process;
 mod raw;
 pub(crate) mod shadow;
 mod statics;
@@ -353,6 +354,18 @@ pub mod abi {
     pub use crate::os::pickle_args;
     pub use crate::os::pickle_args_set;
     pub use crate::os::pickle_exit;
+
+    pub use crate::process::pickle_current_dir;
+    pub use crate::process::pickle_proc_code;
+    pub use crate::process::pickle_proc_err_read;
+    pub use crate::process::pickle_proc_in_close;
+    pub use crate::process::pickle_proc_in_write;
+    pub use crate::process::pickle_proc_kill;
+    pub use crate::process::pickle_proc_out_read;
+    pub use crate::process::pickle_proc_running;
+    pub use crate::process::pickle_proc_wait;
+    pub use crate::process::pickle_run_cmd;
+    pub use crate::process::pickle_run_spawn;
 
     pub use crate::stream::pickle_stderr_stream;
     pub use crate::stream::pickle_stdout_stream;

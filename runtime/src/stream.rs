@@ -18,12 +18,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 /// A buffered stream target held by a `Stream` value.
 ///
 /// `Reader`/`Writer` wrap `File` directly, so dropping a target closes the
-/// underlying handle.
-enum StreamTarget {
+/// underlying handle; `Proc` overlays a running subprocess handle (see
+/// `process::ProcInner`), whose `Drop` kills and reaps an un-waited child.
+pub(crate) enum StreamTarget {
     Reader(BufReader<File>),
     Writer(BufWriter<File>),
     Stdout,
     Stderr,
+    Proc(Box<crate::process::ProcInner>),
 }
 
 /// The boxed state behind a `PStream` object.
@@ -31,12 +33,12 @@ enum StreamTarget {
 /// `target` is `Option` so `close()` can take — and thus drop — the
 /// underlying handle; a closed stream holds nothing.
 pub(crate) struct StreamInner {
-    closed: bool,
-    target: Option<StreamTarget>,
+    pub(crate) closed: bool,
+    pub(crate) target: Option<StreamTarget>,
 }
 
 /// The managed `PStream` object owning `inner`.
-fn stream_new(inner: StreamInner) -> *mut PickleObject {
+pub(crate) fn stream_new(inner: StreamInner) -> *mut PickleObject {
     let gc = crate::gc::gc_mut();
     let obj = gc.alloc(STREAM_OBJECT_SIZE as u32, PICKLE_CLASS_STREAM);
     let ptr = Box::into_raw(Box::new(inner));
@@ -218,13 +220,15 @@ pub extern "C" fn pickle_stream_flush(stream: *mut PickleObject) -> bool {
         }
         Some(StreamTarget::Stderr) => std::io::stderr().flush().is_ok(),
         Some(StreamTarget::Reader(_)) => true,
+        Some(StreamTarget::Proc(_)) => true,
         None => false,
     }
 }
 
 /// Close `stream`, flushing any buffered output and releasing the handle.
 /// Idempotent: `true` on the first close, `false` for a closed or foreign
-/// stream.
+/// stream. Closing a process handle kills and reaps its un-exited child
+/// (`ProcInner`'s `Drop`), so no zombie outlives a dropped handle.
 #[no_mangle]
 pub extern "C" fn pickle_stream_close(stream: *mut PickleObject) -> bool {
     if stream.is_null() {
@@ -243,7 +247,24 @@ pub extern "C" fn pickle_stream_close(stream: *mut PickleObject) -> bool {
         }
         Some(StreamTarget::Stderr) => std::io::stderr().flush().is_ok(),
         Some(StreamTarget::Reader(_)) => true,
+        Some(StreamTarget::Proc(_)) => true,
         None => false,
+    }
+}
+
+/// The `process::ProcInner` behind a process-handle `Stream`, or dangling
+/// when `stream` is not a live process handle.
+pub(crate) fn proc_inner_mut(stream: *mut PickleObject) -> *mut crate::process::ProcInner {
+    if stream.is_null() {
+        return std::ptr::null_mut();
+    }
+    let inner = unsafe { &mut *inner_of(stream) };
+    if inner.closed {
+        return std::ptr::null_mut();
+    }
+    match &mut inner.target {
+        Some(StreamTarget::Proc(p)) => p.as_mut(),
+        _ => std::ptr::null_mut(),
     }
 }
 

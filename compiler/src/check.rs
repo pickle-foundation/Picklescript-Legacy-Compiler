@@ -2399,6 +2399,33 @@ impl<'a> Checker<'a> {
             if bname == "args" {
                 return self.check_args_builtin(e, args);
             }
+            // `run_cmd(...)`: subprocess capture as `(int?, string, string, bool)?`.
+            if bname == "run_cmd" {
+                return self.check_run_cmd(e, args);
+            }
+            // `run_spawn(...)`: a `Stream?` handle to a running child.
+            if bname == "run_spawn" {
+                return self.check_run_spawn(e, args);
+            }
+            // `proc_*`: queries on a process-handle `Stream`.
+            if bname == "proc_wait"
+                || bname == "proc_running"
+                || bname == "proc_code"
+                || bname == "proc_kill"
+                || bname == "proc_in_close"
+            {
+                return self.check_proc_handle(e, bname, args);
+            }
+            if bname == "proc_out_read" || bname == "proc_err_read" {
+                return self.check_proc_read(e, bname, args);
+            }
+            if bname == "proc_in_write" {
+                return self.check_proc_write(e, args);
+            }
+            // `current_dir()`: the working directory as `string?`.
+            if bname == "current_dir" {
+                return self.check_current_dir(e, args);
+            }
             // `exit(code)`: terminate the process with a numeric code.
             if bname == "exit" {
                 return self.check_exit(e, args);
@@ -4599,6 +4626,268 @@ impl<'a> Checker<'a> {
             return Ty::Unknown;
         }
         Ty::List(Box::new(Ty::String))
+    }
+
+    /// A process-handle operand: `h` must be a `Stream` (or untyped).
+    fn check_handle(&mut self, a: &CallArg) -> bool {
+        let at = self.check_expr(&a.value);
+        if matches!(at, Ty::Stream | Ty::Unknown) {
+            return true;
+        }
+        self.err(a.value.span, "the process handle must be a `Stream`");
+        false
+    }
+
+    /// `run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out,
+    /// timeout_ms, inherit_io)`: runs a subprocess to completion and returns
+    /// `(int?, string, string, bool)?` — exit code, stdout, stderr, and a
+    /// timeout flag — or `none` when the program cannot be spawned.
+    fn check_run_cmd(&mut self, e: &Expr, args: &[CallArg]) -> Ty {
+        if args.len() != 8 || args.iter().any(|a| a.name.is_some() || a.spread) {
+            self.err(
+                e.span,
+                "`run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out, timeout_ms, inherit_io)` takes exactly eight argument(s)",
+            );
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        // argv: List<string>
+        let av = self.check_expr(&args[0].value);
+        if !matches!(av, Ty::List(ref i) if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown))
+            && !matches!(av, Ty::Unknown)
+        {
+            self.err(args[0].value.span, "`run_cmd`'s `argv` must be a `List<string>`");
+            return Ty::Unknown;
+        }
+        // cwd?: string | none
+        let cwd = self.check_expr(&args[1].value);
+        if !matches!(cwd, Ty::String | Ty::Unknown | Ty::None)
+            && !matches!(cwd, Ty::Option(ref i) if matches!(**i, Ty::String | Ty::Unknown))
+        {
+            self.err(args[1].value.span, "`run_cmd`'s `cwd` must be a `string` or `none`");
+            return Ty::Unknown;
+        }
+        // envs?: Map<string, string> | none
+        let envs = self.check_expr(&args[2].value);
+        if !matches!(
+            envs,
+            Ty::Map(ref k, ref v)
+                if (matches!(**k, Ty::String) || matches!(**k, Ty::Unknown))
+                    && (matches!(**v, Ty::String) || matches!(**v, Ty::Unknown))
+        ) && !matches!(envs, Ty::Unknown | Ty::None)
+            && !matches!(envs, Ty::Option(ref i) if matches!(**i, Ty::Map(..)))
+        {
+            self.err(
+                args[2].value.span,
+                "`run_cmd`'s `envs` must be a `Map<string, string>` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        // env_removes?: List<string> | none
+        let rm = self.check_expr(&args[3].value);
+        if !matches!(
+            rm,
+            Ty::List(ref i)
+                if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown)
+        ) && !matches!(rm, Ty::Unknown | Ty::None)
+            && !matches!(rm, Ty::Option(ref i) if matches!(**i, Ty::List(ref j) if matches!(**j, Ty::String | Ty::Unknown)))
+        {
+            self.err(
+                args[3].value.span,
+                "`run_cmd`'s `env_removes` must be a `List<string>` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        // stdin_bytes?: List<byte> | none
+        let si = self.check_expr(&args[4].value);
+        if !matches!(
+            si,
+            Ty::List(ref i) if matches!(**i, Ty::Byte) | matches!(**i, Ty::Unknown)
+        ) && !matches!(si, Ty::Unknown | Ty::None)
+            && !matches!(si, Ty::Option(ref i) if matches!(**i, Ty::List(ref j) if matches!(**j, Ty::Byte | Ty::Unknown)))
+        {
+            self.err(
+                args[4].value.span,
+                "`run_cmd`'s `stdin_bytes` must be a `List<byte>` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        // max_out?: int | none
+        let mx = self.check_expr(&args[5].value);
+        if !matches!(mx, Ty::Int | Ty::Unknown | Ty::None)
+            && !matches!(mx, Ty::Option(ref i) if matches!(**i, Ty::Int))
+        {
+            self.err(args[5].value.span, "`run_cmd`'s `max_out` must be an `int` or `none`");
+            return Ty::Unknown;
+        }
+        // timeout_ms?: int | none
+        let tm = self.check_expr(&args[6].value);
+        if !matches!(tm, Ty::Int | Ty::Unknown | Ty::None)
+            && !matches!(tm, Ty::Option(ref i) if matches!(**i, Ty::Int))
+        {
+            self.err(
+                args[6].value.span,
+                "`run_cmd`'s `timeout_ms` must be an `int` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        // inherit_io: bool
+        let inh = self.check_expr(&args[7].value);
+        if !matches!(inh, Ty::Bool | Ty::Unknown) {
+            self.err(args[7].value.span, "`run_cmd`'s `inherit_io` must be a `bool`");
+            return Ty::Unknown;
+        }
+        Ty::Option(Box::new(Ty::Tuple(vec![
+            Ty::Option(Box::new(Ty::Int)),
+            Ty::String,
+            Ty::String,
+            Ty::Bool,
+        ])))
+    }
+
+    /// `run_spawn(argv, cwd, envs, env_removes, max_out)`: start a child and
+    /// return a `Stream?` handle for asynchronous `proc_*` access.
+    fn check_run_spawn(&mut self, e: &Expr, args: &[CallArg]) -> Ty {
+        if args.len() != 5 || args.iter().any(|a| a.name.is_some() || a.spread) {
+            self.err(
+                e.span,
+                "`run_spawn(argv, cwd, envs, env_removes, max_out)` takes exactly five arguments",
+            );
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        let av = self.check_expr(&args[0].value);
+        if !matches!(av, Ty::List(ref i) if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown))
+            && !matches!(av, Ty::Unknown)
+        {
+            self.err(args[0].value.span, "`run_spawn`'s `argv` must be a `List<string>`");
+            return Ty::Unknown;
+        }
+        let cwd = self.check_expr(&args[1].value);
+        if !matches!(cwd, Ty::String | Ty::Unknown | Ty::None)
+            && !matches!(cwd, Ty::Option(ref i) if matches!(**i, Ty::String | Ty::Unknown))
+        {
+            self.err(args[1].value.span, "`run_spawn`'s `cwd` must be a `string` or `none`");
+            return Ty::Unknown;
+        }
+        let envs = self.check_expr(&args[2].value);
+        if !matches!(
+            envs,
+            Ty::Map(ref k, ref v)
+                if (matches!(**k, Ty::String) || matches!(**k, Ty::Unknown))
+                    && (matches!(**v, Ty::String) || matches!(**v, Ty::Unknown))
+        ) && !matches!(envs, Ty::Unknown | Ty::None)
+            && !matches!(envs, Ty::Option(ref i) if matches!(**i, Ty::Map(..)))
+        {
+            self.err(
+                args[2].value.span,
+                "`run_spawn`'s `envs` must be a `Map<string, string>` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        let rm = self.check_expr(&args[3].value);
+        if !matches!(
+            rm,
+            Ty::List(ref i)
+                if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown)
+        ) && !matches!(rm, Ty::Unknown | Ty::None)
+            && !matches!(rm, Ty::Option(ref i) if matches!(**i, Ty::List(ref j) if matches!(**j, Ty::String | Ty::Unknown)))
+        {
+            self.err(
+                args[3].value.span,
+                "`run_spawn`'s `env_removes` must be a `List<string>` or `none`",
+            );
+            return Ty::Unknown;
+        }
+        let mx = self.check_expr(&args[4].value);
+        if !matches!(mx, Ty::Int | Ty::Unknown | Ty::None)
+            && !matches!(mx, Ty::Option(ref i) if matches!(**i, Ty::Int))
+        {
+            self.err(args[4].value.span, "`run_spawn`'s `max_out` must be an `int` or `none`");
+            return Ty::Unknown;
+        }
+        Ty::Option(Box::new(Ty::Stream))
+    }
+
+    /// `proc_wait(h)` / `proc_running(h)` / `proc_code(h)` / `proc_kill(h)` /
+    /// `proc_in_close(h)`: single-handle process queries.
+    fn check_proc_handle(&mut self, e: &Expr, bname: &str, args: &[CallArg]) -> Ty {
+        if args.len() != 1 || args[0].name.is_some() || args[0].spread {
+            self.err(e.span, format!("`{bname}(handle)` takes exactly one argument"));
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        if !self.check_handle(&args[0]) {
+            return Ty::Unknown;
+        }
+        match bname {
+            "proc_code" => Ty::Option(Box::new(Ty::Int)),
+            _ => Ty::Bool,
+        }
+    }
+
+    /// `proc_out_read(h, n)` / `proc_err_read(h, n)`: drained bytes as
+    /// `List<byte>?`.
+    fn check_proc_read(&mut self, e: &Expr, bname: &str, args: &[CallArg]) -> Ty {
+        if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
+            self.err(e.span, format!("`{bname}(handle, n)` takes exactly two arguments"));
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        if !self.check_handle(&args[0]) {
+            return Ty::Unknown;
+        }
+        let n = self.check_expr(&args[1].value);
+        if !matches!(n, Ty::Int | Ty::Unknown) {
+            self.err(args[1].value.span, format!("`{bname}`'s `n` must be an `int`"));
+            return Ty::Unknown;
+        }
+        Ty::Option(Box::new(Ty::List(Box::new(Ty::Byte))))
+    }
+
+    /// `proc_in_write(h, b)`: write `b` (a `List<byte>`) to the child's stdin,
+    /// returning the number of bytes written.
+    fn check_proc_write(&mut self, e: &Expr, args: &[CallArg]) -> Ty {
+        if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
+            self.err(e.span, "`proc_in_write(handle, b)` takes exactly two arguments");
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        if !self.check_handle(&args[0]) {
+            return Ty::Unknown;
+        }
+        let b = self.check_expr(&args[1].value);
+        if !matches!(
+            b,
+            Ty::List(ref i) if matches!(**i, Ty::Byte) | matches!(**i, Ty::Unknown)
+        ) && !matches!(b, Ty::Unknown)
+        {
+            self.err(args[1].value.span, "`proc_in_write`'s `b` must be a `List<byte>`");
+            return Ty::Unknown;
+        }
+        Ty::Int
+    }
+
+    /// `current_dir()`: the workspace directory as `string?`.
+    fn check_current_dir(&mut self, e: &Expr, args: &[CallArg]) -> Ty {
+        if !args.is_empty() {
+            self.err(e.span, "`current_dir()` takes no arguments");
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        Ty::Option(Box::new(Ty::String))
     }
 
     /// `exit(code)`: terminate the process with a numeric exit code.

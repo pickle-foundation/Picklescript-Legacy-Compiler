@@ -1,0 +1,245 @@
+test fn proc_capture_echo() {
+    let r = run_cmd(["cmd.exe", "/c", "echo", "hello world"], none, none, none, none, none, none, false)
+    match (r) {
+        case some((code, out, err, timed)) -> {
+            if (let some(c) = code) {
+                expect(c).toBe(0)
+            } else {
+                expect("unexpected").toBe("echo exited without a code (signal?)")
+            }
+            expect(timed).toBe(false)
+            expect(str_contains(out, "hello world")).toBe(true)
+        }
+        case none -> expect("unexpected").toBe("echo could not be spawned")
+    }
+}
+
+test fn proc_capture_nonzero_exit() {
+    let r = run_cmd(["cmd.exe", "/c", "exit", "7"], none, none, none, none, none, none, false)
+    match (r) {
+        case some((code, out, err, timed)) -> {
+            if (let some(c) = code) {
+                expect(c).toBe(7)
+            } else {
+                expect("unexpected").toBe("exit 7 reported no code")
+            }
+            expect(timed).toBe(false)
+        }
+        case none -> expect("unexpected").toBe("exit could not be spawned")
+    }
+}
+
+test fn proc_capture_env() {
+    let envs = {"PICKLE_TST": "42"}
+    let r = run_cmd(["cmd.exe", "/c", "echo", "%PICKLE_TST%"], none, envs, none, none, none, none, false)
+    match (r) {
+        case some((_code, out, _err, _timed)) -> expect(str_contains(out, "42")).toBe(true)
+        case none -> expect("unexpected").toBe("env echo could not be spawned")
+    }
+}
+
+test fn proc_capture_cwd() {
+    let r = run_cmd(["cmd.exe", "/c", "cd"], "tests/pickle", none, none, none, none, none, false)
+    match (r) {
+        case some((_code, out, _err, _timed)) -> expect(str_contains(out, "pickle")).toBe(true)
+        case none -> expect("unexpected").toBe("cd could not be spawned")
+    }
+}
+
+test fn proc_capture_stdin() {
+    let r = run_cmd(["cmd.exe", "/c", "findstr", ".*"], none, none, none, bytes("hello stdin"), none, none, false)
+    match (r) {
+        case some((code, out, _err, _timed)) -> {
+            if (let some(c) = code) {
+                expect(c).toBe(0)
+            } else {
+                expect("unexpected").toBe("findstr exited without a code")
+            }
+            expect(str_contains(out, "hello stdin")).toBe(true)
+        }
+        case none -> expect("unexpected").toBe("findstr could not be spawned")
+    }
+}
+
+test fn proc_capture_timeout() {
+    let r = run_cmd(["cmd.exe", "/c", "ping", "-n", "20", "127.0.0.1"], none, none, none, none, none, 300, false)
+    match (r) {
+        case some((_code, _out, _err, timed)) -> expect(timed).toBe(true)
+        case none -> expect("unexpected").toBe("ping could not be spawned")
+    }
+}
+
+test fn proc_capture_spawn_failure_is_none() {
+    let r = run_cmd(["_no_such_program_xyz_123_"], none, none, none, none, none, none, false)
+    if (let some(_t) = r) {
+        expect("unexpected").toBe("missing program reported a result")
+    } else {
+        expect(true).toBe(true)
+    }
+}
+
+test fn proc_inherit_io_reports_empty_output() {
+    let r = run_cmd(["cmd.exe", "/c", "echo", "inherited"], none, none, none, none, none, none, true)
+    match (r) {
+        case some((code, out, err, timed)) -> {
+            if (let some(c) = code) {
+                expect(c).toBe(0)
+            } else {
+                expect("unexpected").toBe("inherited echo reported no code")
+            }
+            expect(len(bytes(out))).toBe(0)
+            expect(len(bytes(err))).toBe(0)
+            expect(timed).toBe(false)
+        }
+        case none -> expect("unexpected").toBe("inherited echo could not be spawned")
+    }
+}
+
+test fn proc_current_dir_is_some() {
+    let c = current_dir()
+    if (let some(dir) = c) {
+        expect(len(bytes(dir)) > 0).toBe(true)
+    } else {
+        expect("unexpected").toBe("current_dir returned none")
+    }
+}
+
+test fn proc_spawn_async_capture() {
+    let h = run_spawn(["cmd.exe", "/c", "ping", "-n", "4", "127.0.0.1"], none, none, none, none)
+    if (let some(stream) = h) {
+        expect(proc_wait(stream)).toBe(true)
+        let code = proc_code(stream)
+        if (let some(c) = code) {
+            expect(c).toBe(0)
+        } else {
+            expect("unexpected").toBe("spawned ping reported no code after wait")
+        }
+        expect(proc_running(stream)).toBe(false)
+        // Pipes are open throughout the spawn; leave nothing leaking.
+        expect(proc_in_close(stream)).toBe(true)
+    } else {
+        expect("unexpected").toBe("ping could not be spawned with run_spawn")
+    }
+}
+
+test fn proc_spawn_interleaved_read() {
+    // The child prints "alpha" immediately, pings for ~2s, then prints
+    // "beta". Keep polling stdout while it runs to prove incremental reads.
+    let h = run_spawn(["cmd.exe", "/c", "echo", "alpha", "&", "ping", "-n", "3", "127.0.0.1", "&", "echo", "beta"], none, none, none, 4096)
+    if (let some(stream) = h) {
+        expect(proc_running(stream)).toBe(true)
+        var out = ""
+        var guard = 0
+        // Poll non-blocking while the child lives (~2s of pings); alpha
+        // arrives immediately, beta only after the second ping, so reads
+        // span the whole run without ever deadlocking on a full pipe.
+        while (guard < 1000000 && proc_running(stream)) {
+            let chunk = proc_out_read(stream, 512)
+            if (let some(bs) = chunk) {
+                if (len(bs) > 0) {
+                    out = "{out}{str(bs)}"
+                }
+            }
+            guard += 1
+        }
+        expect(proc_wait(stream)).toBe(true)
+        let code = proc_code(stream)
+        if (let some(c) = code) {
+            expect(c).toBe(0)
+        } else {
+            expect("unexpected").toBe("interleaved ping reported no code")
+        }
+        // After wait the drainers are joined; drain everything remaining and
+        // then EOF (none) must be reported.
+        var saw_eof = false
+        var guard2 = 0
+        while (guard2 < 20000) {
+            let chunk = proc_out_read(stream, 512)
+            if (let some(bs) = chunk) {
+                if (len(bs) > 0) {
+                    out = "{out}{str(bs)}"
+                }
+            } else {
+                saw_eof = true
+                guard2 = 20000
+            }
+            guard2 += 1
+        }
+        expect(saw_eof).toBe(true)
+        expect(str_contains(out, "alpha")).toBe(true)
+        expect(str_contains(out, "beta")).toBe(true)
+    } else {
+        expect("unexpected").toBe("interleaved ping could not be spawned")
+    }
+}
+
+test fn proc_spawn_stdin_roundtrip() {
+    let h = run_spawn(["cmd.exe", "/c", "findstr", ".*"], none, none, none, 4096)
+    if (let some(stream) = h) {
+        expect(proc_in_write(stream, bytes("async pipe"))).toBe(10)
+        expect(proc_in_close(stream)).toBe(true)
+        expect(proc_wait(stream)).toBe(true)
+        let code = proc_code(stream)
+        if (let some(c) = code) {
+            expect(c).toBe(0)
+        } else {
+            expect("unexpected").toBe("async findstr reported no code")
+        }
+        // The echoed line is buffered after wait; drain until none (EOF).
+        var out = ""
+        var found = false
+        var guard = 0
+        while (guard < 10000) {
+            let chunk = proc_out_read(stream, 128)
+            if (let some(bs) = chunk) {
+                if (len(bs) > 0) {
+                    out = "{out}{str(bs)}"
+                    if (str_contains(out, "async pipe")) {
+                        found = true
+                    }
+                }
+            }
+            guard += 1
+        }
+        expect(found).toBe(true)
+    } else {
+        expect("unexpected").toBe("async findstr could not be spawned")
+    }
+}
+
+test fn proc_spawn_kill_later() {
+    let h = run_spawn(["cmd.exe", "/c", "ping", "-n", "60", "127.0.0.1"], none, none, none, none)
+    if (let some(stream) = h) {
+        expect(proc_running(stream)).toBe(true)
+        expect(proc_kill(stream)).toBe(true)
+        expect(proc_wait(stream)).toBe(true)
+        expect(proc_running(stream)).toBe(false)
+    } else {
+        expect("unexpected").toBe("kill target could not be spawned")
+    }
+}
+
+fn str_contains(s: string, sub: string): bool {
+    let sb = bytes(sub)
+    let sbl = len(sb)
+    if (sbl == 0) {
+        return true
+    }
+    let b = bytes(s)
+    var i = 0
+    while (i + sbl <= len(b)) {
+        var j = 0
+        var ok = true
+        while (j < sbl) {
+            if (b[i + j] != sb[j]) {
+                ok = false
+            }
+            j += 1
+        }
+        if (ok) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}

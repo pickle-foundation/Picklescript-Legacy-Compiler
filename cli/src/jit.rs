@@ -581,7 +581,26 @@ pub(crate) fn lower_func(
 
     let mut externs: Vec<(String, Signature)> = call_cache
         .into_iter()
-        .map(|(name, (_sr, _gv, sig))| (name, sig))
+        .map(|(key, (_sr, _gv, sig))| {
+            // The runtime symbol a relocation references is the bare
+            // `symbol` argument of `extern_pair` (e.g. `pickle_str_from_bytes`),
+            // while the cache key carries a signature suffix: parameters are
+            // comma-joined and the return type is `->ret` (so a zero-param
+            // extern has no comma at all: `pickle_panic_no_match->Unit`).
+            // Report the bare symbol so the object backend imports the name
+            // that every `symbol_value` relocation actually references.
+            // Relocations carry only the name, so two signatures sharing a
+            // bare symbol cannot both be imported; key on the bare name.
+            let bare = key
+                .split("->")
+                .next()
+                .unwrap_or(&key)
+                .split(',')
+                .next()
+                .unwrap_or(&key)
+                .to_string();
+            (bare, sig)
+        })
         .collect();
     externs.sort_by(|a, b| a.0.cmp(&b.0));
     externs.dedup_by(|a, b| a.0 == b.0);
@@ -1053,6 +1072,17 @@ fn runtime_addr(name: &str) -> Option<usize> {
         "pickle_stream_write" => abi::pickle_stream_write as *const () as usize,
         "pickle_stream_flush" => abi::pickle_stream_flush as *const () as usize,
         "pickle_stream_close" => abi::pickle_stream_close as *const () as usize,
+        "pickle_run_cmd" => abi::pickle_run_cmd as *const () as usize,
+        "pickle_run_spawn" => abi::pickle_run_spawn as *const () as usize,
+        "pickle_proc_wait" => abi::pickle_proc_wait as *const () as usize,
+        "pickle_proc_running" => abi::pickle_proc_running as *const () as usize,
+        "pickle_proc_code" => abi::pickle_proc_code as *const () as usize,
+        "pickle_proc_kill" => abi::pickle_proc_kill as *const () as usize,
+        "pickle_proc_out_read" => abi::pickle_proc_out_read as *const () as usize,
+        "pickle_proc_err_read" => abi::pickle_proc_err_read as *const () as usize,
+        "pickle_proc_in_write" => abi::pickle_proc_in_write as *const () as usize,
+        "pickle_proc_in_close" => abi::pickle_proc_in_close as *const () as usize,
+        "pickle_current_dir" => abi::pickle_current_dir as *const () as usize,
         "pickle_shadow_push" => abi::pickle_shadow_push as *const () as usize,
         "pickle_shadow_pop" => abi::pickle_shadow_pop as *const () as usize,
         "pickle_shadow_get" => abi::pickle_shadow_get as *const () as usize,
@@ -1172,6 +1202,17 @@ pub fn register_runtime_symbols() {
         "pickle_stream_write",
         "pickle_stream_flush",
         "pickle_stream_close",
+        "pickle_run_cmd",
+        "pickle_run_spawn",
+        "pickle_proc_wait",
+        "pickle_proc_running",
+        "pickle_proc_code",
+        "pickle_proc_kill",
+        "pickle_proc_out_read",
+        "pickle_proc_err_read",
+        "pickle_proc_in_write",
+        "pickle_proc_in_close",
+        "pickle_current_dir",
         "pickle_shadow_push",
         "pickle_shadow_pop",
         "pickle_shadow_get",

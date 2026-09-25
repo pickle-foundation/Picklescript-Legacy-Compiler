@@ -1274,6 +1274,17 @@ impl<'a> Emitter<'a> {
                     | "stderr_stream"
                     | "args"
                     | "exit"
+                    | "run_cmd"
+                    | "run_spawn"
+                    | "proc_wait"
+                    | "proc_running"
+                    | "proc_code"
+                    | "proc_kill"
+                    | "proc_out_read"
+                    | "proc_err_read"
+                    | "proc_in_write"
+                    | "proc_in_close"
+                    | "current_dir"
                     | "captureBegin"
                     | "captureTake"
             )
@@ -8533,6 +8544,17 @@ impl<'a> Emitter<'a> {
                         | "stderr_stream"
                         | "args"
                         | "exit"
+                        | "run_cmd"
+                        | "run_spawn"
+                        | "proc_wait"
+                        | "proc_running"
+                        | "proc_code"
+                        | "proc_kill"
+                        | "proc_out_read"
+                        | "proc_err_read"
+                        | "proc_in_write"
+                        | "proc_in_close"
+                        | "current_dir"
                         | "captureBegin"
                         | "captureTake"
                 ) {
@@ -9889,6 +9911,139 @@ impl<'a> Emitter<'a> {
                 let code = self.expr(&args[0].value)?;
                 self.extern_call_void("pickle_exit", vec![IrTy::Int], vec![code]);
                 Ok(self.unit_temp())
+            }
+            "run_cmd" => {
+                if args.len() != 8 || args.iter().any(|a| a.name.is_some() || a.spread) {
+                    return self.bad(
+                        e.span,
+                        "`run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out, timeout_ms, inherit_io)` takes exactly eight arguments",
+                    );
+                }
+                let mut temps = Vec::with_capacity(8);
+                for a in args {
+                    let t = self.expr(&a.value)?;
+                    // Optional `int` operands (max_out, timeout_ms) are passed
+                    // as their boxed pointer; `none` already lowers to null.
+                    let t = if matches!(self.ty_of(&a.value.span), Some(Ty::Int)) {
+                        self.extern_call_t1("pickle_box_i64", vec![IrTy::Int], IrTy::Ptr, vec![t])?
+                    } else {
+                        t
+                    };
+                    temps.push(t);
+                }
+                // Returns `(int?, string, string, bool)` as a tuple object, or
+                // `null` (`none`) when the program cannot be spawned.
+                self.extern_call_t1(
+                    "pickle_run_cmd",
+                    vec![
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Bool,
+                    ],
+                    IrTy::Ptr,
+                    temps,
+                )
+            }
+            "run_spawn" => {
+                if args.len() != 5 || args.iter().any(|a| a.name.is_some() || a.spread) {
+                    return self.bad(
+                        e.span,
+                        "`run_spawn(argv, cwd, envs, env_removes, max_out)` takes exactly five arguments",
+                    );
+                }
+                let mut temps = Vec::with_capacity(5);
+                for a in args {
+                    let t = self.expr(&a.value)?;
+                    // Optional `int` operand (max_out) is passed boxed; `none`
+                    // already lowers to null.
+                    let t = if matches!(self.ty_of(&a.value.span), Some(Ty::Int)) {
+                        self.extern_call_t1("pickle_box_i64", vec![IrTy::Int], IrTy::Ptr, vec![t])?
+                    } else {
+                        t
+                    };
+                    temps.push(t);
+                }
+                // Returns a `Stream` handle object, or `null` (`none`) when
+                // the program cannot be spawned.
+                self.extern_call_t1(
+                    "pickle_run_spawn",
+                    vec![
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                        IrTy::Ptr,
+                    ],
+                    IrTy::Ptr,
+                    temps,
+                )
+            }
+            "proc_wait" | "proc_running" | "proc_code" | "proc_kill" | "proc_in_close" => {
+                if args.len() != 1 || args[0].name.is_some() || args[0].spread {
+                    return self.bad(e.span, format!("`{name}(handle)` takes exactly one argument"));
+                }
+                let h = self.expr(&args[0].value)?;
+                // `proc_code` returns an `int` box or `null` (`none`); the
+                // rest return a `bool` (or `true`/`false` semantics).
+                let sym = match name.as_str() {
+                    "proc_wait" => "pickle_proc_wait",
+                    "proc_running" => "pickle_proc_running",
+                    "proc_kill" => "pickle_proc_kill",
+                    "proc_in_close" => "pickle_proc_in_close",
+                    _ => "pickle_proc_code",
+                };
+                let ret = if name == "proc_code" {
+                    IrTy::Ptr
+                } else {
+                    IrTy::Bool
+                };
+                self.extern_call_t1(sym, vec![IrTy::Ptr], ret, vec![h])
+            }
+            "proc_out_read" | "proc_err_read" => {
+                if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
+                    return self.bad(
+                        e.span,
+                        format!("`{name}(handle, n)` takes exactly two arguments"),
+                    );
+                }
+                let h = self.expr(&args[0].value)?;
+                let n = self.expr(&args[1].value)?;
+                let sym = if name == "proc_out_read" {
+                    "pickle_proc_out_read"
+                } else {
+                    "pickle_proc_err_read"
+                };
+                // Returns a `List<byte>` object, or `null` (`none`) at EOF.
+                self.extern_call_t1(sym, vec![IrTy::Ptr, IrTy::Int], IrTy::Ptr, vec![h, n])
+            }
+            "proc_in_write" => {
+                if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
+                    return self.bad(
+                        e.span,
+                        "`proc_in_write(handle, b)` takes exactly two arguments",
+                    );
+                }
+                let h = self.expr(&args[0].value)?;
+                let b = self.expr(&args[1].value)?;
+                self.extern_call_t1(
+                    "pickle_proc_in_write",
+                    vec![IrTy::Ptr, IrTy::Ptr],
+                    IrTy::Int,
+                    vec![h, b],
+                )
+            }
+            "current_dir" => {
+                if !args.is_empty() {
+                    return self.bad(e.span, "`current_dir()` takes no arguments");
+                }
+                // Returns the working directory as a `string` object, or
+                // `null` (`none`) when it cannot be determined.
+                self.extern_call_t1("pickle_current_dir", vec![], IrTy::Ptr, vec![])
             }
             "captureBegin" => {
                 if !args.is_empty()

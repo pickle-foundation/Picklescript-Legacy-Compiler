@@ -451,6 +451,72 @@ impl<'a> Resolver<'a> {
             mk("args", vec![], Ty::List(Box::new(Ty::String)), false),
             // `exit(code)`: terminate the process with a numeric code.
             mk("exit", vec![], Ty::Empty, false),
+            // `run_cmd(argv, cwd, envs, env_removes, stdin_bytes, max_out,
+            // timeout_ms, inherit_io)`: run a subprocess to completion,
+            // returning `(int?, string, string, bool)?` (code, stdout, stderr,
+            // timed-out), or `none` when it could not be spawned — checked
+            // strictly by a dedicated checker rule; the loose declaration just
+            // makes the name resolvable and dispatchable.
+            mk(
+                "run_cmd",
+                vec![
+                    any("argv"),
+                    any("cwd"),
+                    any("envs"),
+                    any("env_removes"),
+                    any("stdin_bytes"),
+                    any("max_out"),
+                    any("timeout_ms"),
+                    any("inherit_io"),
+                ],
+                Ty::Option(Box::new(Ty::Tuple(vec![
+                    Ty::Option(Box::new(Ty::Int)),
+                    Ty::String,
+                    Ty::String,
+                    Ty::Bool,
+                ]))),
+                true,
+            ),
+            // `run_spawn(argv, cwd, envs, env_removes, max_out)`: start a
+            // child as a `Stream?` handle for async `proc_*` access.
+            mk(
+                "run_spawn",
+                vec![
+                    any("argv"),
+                    any("cwd"),
+                    any("envs"),
+                    any("env_removes"),
+                    any("max_out"),
+                ],
+                Ty::Option(Box::new(Ty::Stream)),
+                true,
+            ),
+            // `proc_wait(h)` etc.: process-handle queries on a `Stream`.
+            mk("proc_wait", vec![any("h")], Ty::Bool, true),
+            mk("proc_running", vec![any("h")], Ty::Bool, true),
+            mk("proc_code", vec![any("h")], Ty::Option(Box::new(Ty::Int)), true),
+            mk("proc_kill", vec![any("h")], Ty::Bool, true),
+            mk(
+                "proc_out_read",
+                vec![any("h"), any("n")],
+                Ty::Option(Box::new(Ty::List(Box::new(Ty::Byte)))),
+                true,
+            ),
+            mk(
+                "proc_err_read",
+                vec![any("h"), any("n")],
+                Ty::Option(Box::new(Ty::List(Box::new(Ty::Byte)))),
+                true,
+            ),
+            mk("proc_in_write", vec![any("h"), any("b")], Ty::Int, true),
+            mk("proc_in_close", vec![any("h")], Ty::Bool, true),
+            // `current_dir()`: the working directory as `string?`.
+            mk(
+                "current_dir",
+                vec![],
+                Ty::Option(Box::new(Ty::String)),
+                false,
+            ),
             // `captureBegin()` / `captureTake()`: raw-buffer capture flags --
             // checked strictly by dedicated rules; loose declarations make the
             // names resolvable and dispatchable inside the `pickle test`
