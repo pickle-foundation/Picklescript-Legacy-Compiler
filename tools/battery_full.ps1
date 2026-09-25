@@ -217,4 +217,20 @@ if (-not (Test-Path -LiteralPath $pklcTest)) {
     Write-Output "GATE9 TEST BYTE-PARITY (stdout+exit, $($g9tests.Count) files): PASS=$g9ok FAIL=$g9fail"
 }
 
+# ---- GATE 10: runtime-selfhost unit suite — the ported runtime tested in Pickle ----
+# The runtime pillar's parallel to GATE7: every `runtime-selfhost/*_test.pkl` runs under
+# the Rust test harness (`pickle test runtime-selfhost` dir mode picks up all `*_test.pkl`)
+# and every file must report 0 failures. Like GATE7 this is a local-only gate: both
+# selfhost trees are gitignored by design until the switchover.
+$g10total = 0; $g10pass = 0; $g10fail = 0
+$out10 = & $cli test "runtime-selfhost" 2>&1
+foreach ($l in ($out10 | Select-String "test result:")) {
+    if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
+        $g10pass += [int]$matches[1]
+        $g10fail += [int]$matches[2]
+        $g10total += [int]$matches[1] + [int]$matches[2]
+    }
+}
+Write-Output "GATE10 RUNTIME-SELFHOST SUITE (direct: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10fail -eq 0)"
+
 Write-Output "===== BATTERY COMPLETE ====="
