@@ -12,6 +12,16 @@
 //! functions carry no unwind info), so `assert` records failure instead of
 //! panicking, and the runner does not use `catch_unwind`.
 
+// `expect(...)`/`assert` lowering emits the `pickle_expect_*` /
+// `pickle_test_fail_obj` externs, which a freestanding (nostd) build must
+// also provide so a selfhost-linked program can use them. Only the adapter
+// registry and the `pickle_runtime_run_tests` runner need `std` (Mutex); the
+// externs themselves use `alloc` + the always-compiled modules.
+#[cfg(feature = "nostd")]
+use alloc::string::{String, ToString};
+#[cfg(feature = "nostd")]
+use alloc::vec::Vec;
+
 /// A single test descriptor. `#[repr(C)]` so the host toolchain can lay it
 /// out next to compiled code.
 #[repr(C)]
@@ -40,15 +50,20 @@ pub const HOOK_AFTER_ALL: u8 = 3;
 
 // Descriptors are inert data (`name` points into static bytes); the Vec copy
 // is only ever read back on the running thread.
+#[cfg(not(feature = "nostd"))]
 unsafe impl Send for PickleTest {}
+#[cfg(not(feature = "nostd"))]
 unsafe impl Send for PickleHook {}
 
+#[cfg(not(feature = "nostd"))]
 /// Registered tests, in registration order.
 static TESTS: std::sync::Mutex<Vec<PickleTest>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(not(feature = "nostd"))]
 /// Registered hooks, in registration order.
 static HOOKS: std::sync::Mutex<Vec<RegisteredHook>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(not(feature = "nostd"))]
 /// An owned hook copy (group bytes are copied out of the caller's buffer).
 #[derive(Clone)]
 struct RegisteredHook {
@@ -57,6 +72,7 @@ struct RegisteredHook {
     body: extern "C" fn(),
 }
 
+#[cfg(not(feature = "nostd"))]
 /// ABI: register `count` test descriptors. Returns the total number of
 /// registered tests.
 #[no_mangle]
@@ -74,6 +90,7 @@ pub extern "C" fn pickle_test_register_table(table: *const PickleTest, count: u3
     tests.len() as u32
 }
 
+#[cfg(not(feature = "nostd"))]
 /// ABI: register `count` hook descriptors. Returns the total number of
 /// registered hooks.
 #[no_mangle]
@@ -102,6 +119,7 @@ pub extern "C" fn pickle_test_register_hooks(table: *const PickleHook, count: u3
     hooks.len() as u32
 }
 
+#[cfg(not(feature = "nostd"))]
 /// ABI: drop every registered test and hook. `pickle test` calls this between
 /// files so each module's tests run in isolation.
 #[no_mangle]
@@ -258,6 +276,7 @@ pub extern "C" fn pickle_expect_list_contains(
     0
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Run every registered test (group-aware: emits `describe` headers, runs the
 /// group's `beforeAll`/`beforeEach`/`afterEach`/`afterAll` hooks around each
 /// test, and reports one line per test plus a summary). Returns 0 when all
@@ -330,6 +349,7 @@ pub extern "C" fn pickle_runtime_run_tests() -> i32 {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn test_name(t: &PickleTest) -> String {
     if t.name.is_null() {
         "<unnamed>".to_string()
@@ -341,6 +361,7 @@ fn test_name(t: &PickleTest) -> String {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Split a compiled test name `"g1 > g2 > desc"` into its (group path, test
 /// description). A name with no `" > "` lives in the root group.
 fn split_test_name(t: &PickleTest) -> (String, String) {
@@ -353,6 +374,7 @@ fn split_test_name(t: &PickleTest) -> (String, String) {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Every proper ancestor group string of `group` (the prefixes of its path).
 /// `""` (root) yields `[]`; `"a>b"` yields `["a", "a>b"]` after joining.
 fn group_prefixes(group: &str) -> Vec<String> {
@@ -367,6 +389,7 @@ fn group_prefixes(group: &str) -> Vec<String> {
     out
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Run every registered hook of `kind` whose group is exactly `group`.
 fn run_hooks(hooks: &[RegisteredHook], group: &str, kind: u8) {
     for h in hooks.iter().filter(|h| h.kind == kind && h.group == group) {
@@ -374,6 +397,7 @@ fn run_hooks(hooks: &[RegisteredHook], group: &str, kind: u8) {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// `describe <last segment>` at the group's indentation depth.
 fn group_header(group: &str, depth: usize) {
     let name = group.split(" > ").last().unwrap_or(group);
@@ -382,6 +406,7 @@ fn group_header(group: &str, depth: usize) {
     let _ = &mut line;
 }
 
+#[cfg(not(feature = "nostd"))]
 fn report(desc: &str, depth: usize, ok: bool, detail: Option<&str>) {
     let colored = crate::console::terminal_color_enabled();
     let mut line = format!("{}test {desc} ... ", "  ".repeat(depth));
@@ -408,6 +433,7 @@ fn report(desc: &str, depth: usize, ok: bool, detail: Option<&str>) {
     crate::console::write_to_con(line.as_bytes());
 }
 
+#[cfg(not(feature = "nostd"))]
 fn report_summary(passed: usize, failed: usize) {
     let colored = crate::console::terminal_color_enabled();
     let mut line = String::new();
@@ -422,7 +448,7 @@ fn report_summary(passed: usize, failed: usize) {
     crate::console::write_to_con(line.as_bytes());
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "nostd")))]
 mod tests {
     use super::*;
 

@@ -47,7 +47,6 @@ mod statics;
 #[cfg(not(feature = "nostd"))]
 mod stream;
 pub(crate) mod strings;
-#[cfg(not(feature = "nostd"))]
 mod test;
 #[cfg(not(feature = "nostd"))]
 mod threads;
@@ -608,19 +607,14 @@ declare_abi! {
     pickle_str_set => crate::strings::pickle_str_set,
     pickle_str_to_bytes => crate::strings::pickle_str_to_bytes,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_expect_display => crate::test::pickle_expect_display,
-    #[cfg(not(feature = "nostd"))]
     pickle_expect_list_contains => crate::test::pickle_expect_list_contains,
-    #[cfg(not(feature = "nostd"))]
     pickle_expect_obj_eq => crate::test::pickle_expect_obj_eq,
-    #[cfg(not(feature = "nostd"))]
     pickle_expect_str_contains => crate::test::pickle_expect_str_contains,
     #[cfg(not(feature = "nostd"))]
     pickle_runtime_run_tests => crate::test::pickle_runtime_run_tests,
     #[cfg(not(feature = "nostd"))]
     pickle_test_clear => crate::test::pickle_test_clear,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_fail_obj => crate::test::pickle_test_fail_obj,
     #[cfg(not(feature = "nostd"))]
     pickle_test_register_hooks => crate::test::pickle_test_register_hooks,
