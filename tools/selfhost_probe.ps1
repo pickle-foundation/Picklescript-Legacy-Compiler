@@ -1,5 +1,6 @@
 ﻿param(
-    [Parameter(Mandatory = $true)][string]$Target
+    [Parameter(Mandatory = $true)][string]$Target,
+    [switch]$SelfhostLink
 )
 
 $ErrorActionPreference = "Continue"
@@ -33,20 +34,31 @@ try {
 $obj = Join-Path $Probe "funcs.obj"
 if (-not (Test-Path $obj)) { Write-Output "OBJ NOT FOUND: $obj"; exit 1 }
 
-# ---- 4. build the runtime rlib ----
-$rtDir = Join-Path $Probe "rt"
-Push-Location $Root
-try {
-    & cargo build -p pickle-runtime --target-dir $rtDir *> $null
-    if ($LASTEXITCODE -ne 0) { Write-Output "RT BUILD FAIL exit=$LASTEXITCODE"; exit 1 }
-} finally { Pop-Location }
-$deps = Join-Path $rtDir "debug\deps"
-$rlib = Get-ChildItem $deps -Filter "libpickle_runtime-*.rlib" | Select-Object -First 1 -ExpandProperty FullName
-if (-not $rlib) { Write-Output "RLIB NOT FOUND"; exit 1 }
+# ---- 4. link: selfhost pelink (nostd combined.lib) or rustc + shim ----
+$exe = Join-Path $Probe "probe.exe"
+if ($SelfhostLink) {
+    $Combined = @(
+        "$Temp\rarc\combined.lib"
+        "$Env:TEMP\opencode\rarc\combined.lib"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $Combined) { Write-Output "COMBINED LIB NOT FOUND: $Temp\rarc\combined.lib (rebuild via cargo build -p pickle-runtime --features nostd + ar)"; exit 1 }
+    $drvOut = & $Cli run compiler-selfhost\linker.pkl -- $obj $Combined $exe 2>&1
+    $drvOutTxt = $drvOut -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $drvOutTxt -notmatch "LINKER WROTE") { Write-Output "SELFHOST LINK FAIL exit=$LASTEXITCODE"; Write-Output $drvOutTxt; exit 1 }
+    Write-Output "SELFHOST LINKED: $($drvOutTxt -replace '[\r\n]+','; ')"
+} else {
+    $rtDir = Join-Path $Probe "rt"
+    Push-Location $Root
+    try {
+        & cargo build -p pickle-runtime --target-dir $rtDir *> $null
+        if ($LASTEXITCODE -ne 0) { Write-Output "RT BUILD FAIL exit=$LASTEXITCODE"; exit 1 }
+    } finally { Pop-Location }
+    $deps = Join-Path $rtDir "debug\deps"
+    $rlib = Get-ChildItem $deps -Filter "libpickle_runtime-*.rlib" | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $rlib) { Write-Output "RLIB NOT FOUND"; exit 1 }
 
-# ---- 5. link via rustc + shim (mirrors cli/src/build.rs link_object) ----
-$shim = Join-Path $Probe "main_shim.rs"
-@'
+    $shim = Join-Path $Probe "main_shim.rs"
+    @'
 unsafe extern "C" {
     fn pickle_main();
     fn pickle_args_set(argc: usize, argv: *const *const u8);
@@ -84,9 +96,10 @@ fn main() {
 }
 '@ | Set-Content -Encoding utf8 $shim
 
-$exe = Join-Path $Probe "probe.exe"
-& rustc $shim --edition 2021 -C opt-level=2 -C panic=abort "--extern=pickle_runtime=$rlib" "-C" "link-arg=$(Join-Path $Probe 'funcs.obj')" -o $exe *> $null
-if ($LASTEXITCODE -ne 0) { Write-Output "LINK FAIL exit=$LASTEXITCODE"; exit 1 }
+    $exePath = $exe
+    & rustc $shim --edition 2021 -C opt-level=2 -C panic=abort "--extern=pickle_runtime=$rlib" "-C" "link-arg=$(Join-Path $Probe 'funcs.obj')" -o $exePath *> $null
+    if ($LASTEXITCODE -ne 0) { Write-Output "LINK FAIL exit=$LASTEXITCODE"; exit 1 }
+}
 
 # ---- 6. run the probe and compare to the oracle ----
 Push-Location $Probe

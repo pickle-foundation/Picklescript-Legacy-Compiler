@@ -56,11 +56,12 @@ unsafe impl GlobalAlloc for PfHeap {
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         HeapFree(GetProcessHeap(), 0, ptr as *mut c_void);
     }
-    unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let h = GetProcessHeap();
         let newp = HeapAlloc(h, 8, new_size) as *mut u8;
         if !newp.is_null() {
-            core::ptr::copy(ptr, newp, new_size);
+            let copy_n = core::cmp::min(layout.size(), new_size);
+            core::ptr::copy(ptr, newp, copy_n);
             HeapFree(h, 0, ptr as *mut c_void);
         }
         newp
