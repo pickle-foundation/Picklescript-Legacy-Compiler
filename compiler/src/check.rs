@@ -2426,6 +2426,17 @@ impl<'a> Checker<'a> {
             if bname == "current_dir" {
                 return self.check_current_dir(e, args);
             }
+            // `thread_spawn(body)` / `once_run(o, body)`: the two builtins that
+            // are handed a closure object to run on another thread. Their bodies
+            // have to be real zero-argument functions — the runtime reads slot
+            // 0 of the object as a code address, so anything else would be a
+            // wild call.
+            if bname == "thread_spawn" {
+                return self.check_task_body(e, bname, args, 0);
+            }
+            if bname == "once_run" {
+                return self.check_task_body(e, bname, args, 1);
+            }
             // `exit(code)`: terminate the process with a numeric code.
             if bname == "exit" {
                 return self.check_exit(e, args);
@@ -4829,6 +4840,67 @@ impl<'a> Checker<'a> {
         match bname {
             "proc_code" => Ty::Option(Box::new(Ty::Int)),
             _ => Ty::Bool,
+        }
+    }
+
+    /// `thread_spawn(body)` and `once_run(o, body)`. `body_index` is the
+    /// argument that has to be a zero-argument function: a lambda, or a name
+    /// bound to one. The other arguments are handles (`int`).
+    fn check_task_body(&mut self, e: &Expr, bname: &str, args: &[CallArg], body_index: usize) -> Ty {
+        let label = if body_index == 0 {
+            "`thread_spawn(body)`".to_string()
+        } else {
+            "`once_run(once, body)`".to_string()
+        };
+        if args.len() != body_index + 1
+            || args.iter().any(|a| a.name.is_some() || a.spread)
+        {
+            self.err(e.span, format!("{label} takes exactly one body argument"));
+            for a in args {
+                let _ = self.check_expr(&a.value);
+            }
+            return Ty::Unknown;
+        }
+        for (i, a) in args.iter().enumerate() {
+            if i == body_index {
+                continue;
+            }
+            let t = self.check_expr(&a.value);
+            if !matches!(t, Ty::Int | Ty::Unknown) {
+                self.err(a.value.span, "a synchronisation handle is an `int`");
+                return Ty::Unknown;
+            }
+        }
+        let body = self.check_expr(&args[body_index].value);
+        match &body {
+            Ty::Fn(pty, prt) => {
+                if !pty.is_empty() {
+                    self.err(
+                        args[body_index].value.span,
+                        format!("{label}'s body must take no parameters"),
+                    );
+                } else if !matches!(prt.as_ref(), Ty::Empty | Ty::Unknown) {
+                    self.err(
+                        args[body_index].value.span,
+                        format!("{label}'s body must return nothing"),
+                    );
+                }
+            }
+            Ty::Unknown => {}
+            other => {
+                self.err(
+                    args[body_index].value.span,
+                    format!(
+                        "{label}'s body must be a function, found `{}`",
+                        other
+                    ),
+                );
+            }
+        }
+        if bname == "once_run" {
+            Ty::Bool
+        } else {
+            Ty::Int
         }
     }
 

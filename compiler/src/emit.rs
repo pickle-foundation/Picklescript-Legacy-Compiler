@@ -1093,7 +1093,10 @@ impl<'a> Emitter<'a> {
                 else_else,
             } => {
                 match cond {
-                    IfCond::Cond(c) => self.walk_expr(c, owner_cid, owner_name, lmark, scope, acc),
+                    IfCond::Cond(c) => {
+                        self.walk_expr(c, owner_cid, owner_name, lmark, scope, acc);
+                        self.walk_block(then, owner_cid, owner_name, lmark, scope, acc);
+                    }
                     IfCond::Binding { pattern, value } => {
                         self.walk_expr(value, owner_cid, owner_name, lmark, scope, acc);
                         scope.push(HashSet::new());
@@ -1241,53 +1244,22 @@ impl<'a> Emitter<'a> {
         Ok(caps)
     }
 
+    /// Whether a free name inside a lambda body refers to something outside it
+    /// (a top-level `fn`, a class, a `const`) rather than to a capture.
     fn is_enclosing_global(&self, name: &str) -> bool {
         self.module.funcs_by_name.contains_key(name)
             || self.class_decls.contains_key(name)
             || self.consts_inits.contains_key(name)
-            || matches!(
-                name,
-                "print"
-                    | "println"
-                    | "len"
-                    | "alloc"
-                    | "free"
-                    | "assert"
-                    | "expect"
-                    | "abs"
-                    | "range"
-                    | "min"
-                    | "max"
-                    | "clamp"
-                    | "str"
-                    | "bytes"
-                    | "read_file"
-                    | "write_file"
-                    | "file_exists"
-                    | "delete"
-                    | "list_dir"
-                    | "mkdir"
-                    | "stream_open_read"
-                    | "stream_open_write"
-                    | "stream_open_append"
-                    | "stdout_stream"
-                    | "stderr_stream"
-                    | "args"
-                    | "exit"
-                    | "run_cmd"
-                    | "run_spawn"
-                    | "proc_wait"
-                    | "proc_running"
-                    | "proc_code"
-                    | "proc_kill"
-                    | "proc_out_read"
-                    | "proc_err_read"
-                    | "proc_in_write"
-                    | "proc_in_close"
-                    | "current_dir"
-                    | "captureBegin"
-                    | "captureTake"
-            )
+            // Every builtin callable is seeded by the resolver with a synthetic
+            // span (file 0, empty range), which is what tells a builtin apart
+            // from a user's top-level `fn` of the same name. Asking the resolver
+            // keeps this from becoming a second list of every builtin.
+            || self.resolved.fns.get(name).is_some_and(|infos| {
+                infos.iter().any(|c| c.span.file.0 == 0 && c.span.end == 0)
+            })
+            // These three are dispatched without a `CallableInfo` entry (raw
+            // allocation and the test helper), so they are named here.
+            || matches!(name, "alloc" | "free" | "expect")
     }
 
     /// Register a lambda's hoisted body and its closure class.
@@ -10045,6 +10017,20 @@ impl<'a> Emitter<'a> {
                 // `null` (`none`) when it cannot be determined.
                 self.extern_call_t1("pickle_current_dir", vec![], IrTy::Ptr, vec![])
             }
+            _ if self.flat_builtin(name).is_some() => {
+                // Tasks and synchronisation: fixed-arity calls with no special
+                // lowering, described by a table rather than two dozen
+                // near-identical arms.
+                let (sym, params, ret, names) = self.flat_builtin(name).unwrap();
+                let args = self.positional_args(e, name, args, &names)?;
+                match ret {
+                    Some(ret) => self.extern_call_t1(sym, params, ret, args),
+                    None => {
+                        self.extern_call_void(sym, params, args);
+                        Ok(self.unit_temp())
+                    }
+                }
+            }
             "captureBegin" => {
                 if !args.is_empty()
                     || args.iter().any(|a| a.name.is_some() || a.spread)
@@ -10087,6 +10073,88 @@ impl<'a> Emitter<'a> {
                     .find(|c| !(c.span.file.0 == 0 && c.span.end == 0))
             })
             .is_some_and(|c| !c.generics.is_empty())
+    }
+
+    /// The tasks and synchronisation builtins, as
+    /// `(runtime symbol, argument IR types, result IR type, argument names)`.
+    /// A `None` result means the call returns nothing.
+    ///
+    /// Every handle here is an `int` naming a row in a runtime table (a task, a
+    /// mutex, a condition variable, ...), and a task body or `once` body is a
+    /// zero-argument `fn` value — a closure object the runtime calls with the
+    /// object as its hidden environment argument. Nothing in this table needs a
+    /// closure conversion or a boxing step, which is why it can be a table: the
+    /// work is all in the runtime.
+    fn flat_builtin(&self, name: &str) -> Option<(&'static str, Vec<IrTy>, Option<IrTy>, &'static [&'static str])> {
+        use IrTy::{Bool, Int, Ptr};
+        const INT: &[IrTy] = &[Int];
+        const NONE: Option<IrTy> = None;
+        Some(match name {
+            // Tasks. `thread_spawn` takes the closure object itself, not a call
+            // to it: the new OS thread runs it, so the spawn cannot lower it.
+            "thread_spawn" => ("pickle_thread_spawn", vec![Ptr], Some(Int), &["body"]),
+            "thread_join" => ("pickle_thread_join", INT.to_vec(), Some(Bool), &["task"]),
+            "thread_finished" => ("pickle_thread_finished", INT.to_vec(), Some(Bool), &["task"]),
+            // A `string?` message: `null` when the task is running or was clean.
+            "thread_message" => ("pickle_thread_panic_message", INT.to_vec(), Some(Ptr), &["task"]),
+            "thread_count" => ("pickle_thread_count", vec![], Some(Int), &[]),
+            "thread_current" => ("pickle_thread_current", vec![], Some(Int), &[]),
+            "sleep_ms" => ("pickle_thread_sleep_ms", INT.to_vec(), NONE, &["ms"]),
+            "thread_yield" => ("pickle_thread_yield", vec![], NONE, &[]),
+            // Synchronisation.
+            "mutex_new" => ("pickle_mutex_new", vec![], Some(Int), &[]),
+            "mutex_lock" => ("pickle_mutex_lock", INT.to_vec(), NONE, &["m"]),
+            "mutex_trylock" => ("pickle_mutex_trylock", INT.to_vec(), Some(Bool), &["m"]),
+            "mutex_unlock" => ("pickle_mutex_unlock", INT.to_vec(), NONE, &["m"]),
+            "cond_new" => ("pickle_cond_new", vec![], Some(Int), &[]),
+            "cond_signal" => ("pickle_cond_signal", INT.to_vec(), NONE, &["c"]),
+            "cond_broadcast" => ("pickle_cond_broadcast", INT.to_vec(), NONE, &["c"]),
+            "cond_wait" => ("pickle_cond_wait", vec![Int, Int], NONE, &["c", "m"]),
+            "sem_new" => ("pickle_sem_new", INT.to_vec(), Some(Int), &["permits"]),
+            "sem_acquire" => ("pickle_sem_acquire", vec![Int, Int], NONE, &["s", "n"]),
+            "sem_try_acquire" => ("pickle_sem_try_acquire", vec![Int, Int], Some(Bool), &["s", "n"]),
+            "sem_release" => ("pickle_sem_release", vec![Int, Int], NONE, &["s", "n"]),
+            "atomic_new" => ("pickle_atomic_new", INT.to_vec(), Some(Int), &["value"]),
+            "atomic_load" => ("pickle_atomic_load", INT.to_vec(), Some(Int), &["a"]),
+            "atomic_store" => ("pickle_atomic_store", vec![Int, Int], NONE, &["a", "value"]),
+            "atomic_add" => ("pickle_atomic_add", vec![Int, Int], Some(Int), &["a", "delta"]),
+            "atomic_cas" => (
+                "pickle_atomic_cas",
+                vec![Int, Int, Int],
+                Some(Bool),
+                &["a", "expected", "value"],
+            ),
+            "once_new" => ("pickle_once_new", vec![], Some(Int), &[]),
+            "once_done" => ("pickle_once_done", INT.to_vec(), Some(Bool), &["o"]),
+            "once_run" => ("pickle_once_run", vec![Int, Ptr], Some(Bool), &["o", "body"]),
+            _ => return None,
+        })
+    }
+
+    /// Check a fixed-arity builtin's arguments and evaluate them left to right.
+    fn positional_args(
+        &mut self,
+        e: &Expr,
+        name: &str,
+        args: &[CallArg],
+        params: &[&str],
+    ) -> Result<Vec<Temp>, ()> {
+        if args.len() != params.len() || args.iter().any(|a| a.name.is_some() || a.spread) {
+            let word = if params.len() == 1 { "argument" } else { "arguments" };
+            return self.bad(
+                e.span,
+                format!(
+                    "`{name}({})` takes exactly {} {word}",
+                    params.join(", "),
+                    params.len()
+                ),
+            );
+        }
+        let mut temps = Vec::with_capacity(args.len());
+        for a in args {
+            temps.push(self.expr(&a.value)?);
+        }
+        Ok(temps)
     }
 
     /// Lower `name<Type,...>(args)`. The call is monomorphized: the generic

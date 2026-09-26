@@ -111,9 +111,13 @@ pub extern "C" fn pickle_test_clear() {
 }
 
 /// ABI: a failed `assert(cond, msg?)`. `obj` is a managed `string` object, or
-/// null when the assertion carried no message. In capture mode (running a
-/// test) the message is recorded and the caller continues; outside tests the
+/// null when the assertion carried no message. Inside a test (capture mode) or
+/// a task body the message is recorded and the caller continues; elsewhere the
 /// failure is fatal, like `panic`.
+///
+/// Continuing is the point: `assert` is lowered to a void call on a path whose
+/// control flow stays valid, so the body can keep going and a task can finish
+/// (and be reported as failed) rather than dying mid-frame.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pickle_test_fail_obj(obj: *const crate::object::PickleObject) {
@@ -124,8 +128,7 @@ pub extern "C" fn pickle_test_fail_obj(obj: *const crate::object::PickleObject) 
         let len = crate::strings::string_bytes_len(obj);
         unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(bytes, len)).into_owned() }
     };
-    if crate::panic::is_capturing() {
-        crate::panic::record_panic_msg(msg);
+    if crate::panic::record_recoverable(msg.clone()) {
         return;
     }
     crate::panic::fatal(&msg);

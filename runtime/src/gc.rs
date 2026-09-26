@@ -35,7 +35,10 @@ fn no_auto_gc_once() -> bool {
 /// Static root cells (compiler-emitted global variables and class statics).
 static STATIC_ROOTS: Mutex<Vec<&'static mut RootCell>> = Mutex::new(Vec::new());
 
-/// Serialises collectors; also acts as the world stop on multi-thread.
+/// Guards against a re-entrant collection on one thread (a finalizer or
+/// allocation helper that runs inside a sweep). The stop-the-world guarantee
+/// itself comes from the [`crate::world`] lock, which the collector holds for
+/// the whole cycle.
 static COLLECT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Set while a GC is in progress so a re-entrant allocation can panic.
@@ -275,6 +278,13 @@ impl Gc {
     }
 
     /// Run a full mark-and-sweep cycle.
+    ///
+    /// The caller already owns the world lock (every path in here reaches the
+    /// heap through [`gc_mut`]), and it holds it for the whole cycle: the walk
+    /// reads peer threads' shadow stacks, so no other thread may be mutating
+    /// while it runs. [`COLLECT_LOCK`] therefore only guards against a
+    /// *re-entrant* collection on this same thread — a finalizer or a
+    /// `temp_unroot` helper that allocates from inside a sweep.
     pub fn collect(&mut self) {
         // Only one collector at a time.
         let _guard = match COLLECT_LOCK.try_lock() {
@@ -493,7 +503,12 @@ pub fn is_initialized() -> bool {
     unsafe { !GLOBAL_GC.is_null() }
 }
 
+/// The heap, reachable only while its thread owns the world lock. Every access
+/// goes through [`gc_mut`], which takes the lock if the caller does not hold
+/// it, so the collector's single-mutator assumption holds no matter which OS
+/// thread is running compiled code.
 pub(crate) fn gc_mut() -> &'static mut Gc {
+    crate::world::acquire();
     unsafe {
         assert!(!GLOBAL_GC.is_null(), "pickle runtime not initialised");
         &mut *GLOBAL_GC

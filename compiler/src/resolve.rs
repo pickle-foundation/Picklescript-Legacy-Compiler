@@ -532,6 +532,59 @@ impl<'a> Resolver<'a> {
             // `string`) by a dedicated rule; the loose declaration just makes
             // the name resolvable and dispatchable.
             mk("assert", vec![any("args")], Ty::Empty, true),
+
+            // --- Tasks (see `docs/07-runtime.md`, "Tasks & scheduling") ---
+            //
+            // A task handle is a plain `int` naming a row in the runtime's task
+            // table, and a task body is a zero-argument `fn` value (a closure
+            // object). These are the raw handles; the `std.thread` module wraps
+            // them in classes, so the builtin names are prefixed rather than
+            // competing with the friendly ones.
+            mk("thread_spawn", vec![any("body")], Ty::Int, false),
+            mk("thread_join", vec![any("task")], Ty::Bool, false),
+            mk("thread_finished", vec![any("task")], Ty::Bool, false),
+            mk(
+                "thread_message",
+                vec![any("task")],
+                Ty::Option(Box::new(Ty::String)),
+                false,
+            ),
+            mk("thread_count", vec![], Ty::Int, false),
+            mk("thread_current", vec![], Ty::Int, false),
+            mk("sleep_ms", vec![any("ms")], Ty::Empty, false),
+            mk("thread_yield", vec![], Ty::Empty, false),
+
+            // --- Synchronisation ---
+            //
+            // Mutex/cond/semaphore/atomic/once handles are `int`s too. A handle
+            // is 0 for `none` and names a row in the runtime's primitive table;
+            // using one as the wrong kind of primitive is a runtime error, not a
+            // silent confusion, because the primitives live in one table.
+            mk("mutex_new", vec![], Ty::Int, false),
+            mk("mutex_lock", vec![any("m")], Ty::Empty, false),
+            mk("mutex_trylock", vec![any("m")], Ty::Bool, false),
+            mk("mutex_unlock", vec![any("m")], Ty::Empty, false),
+            mk("cond_new", vec![], Ty::Int, false),
+            mk("cond_signal", vec![any("c")], Ty::Empty, false),
+            mk("cond_broadcast", vec![any("c")], Ty::Empty, false),
+            mk("cond_wait", vec![any("c"), any("m")], Ty::Empty, false),
+            mk("sem_new", vec![any("permits")], Ty::Int, false),
+            mk("sem_acquire", vec![any("s"), any("n")], Ty::Empty, false),
+            mk("sem_try_acquire", vec![any("s"), any("n")], Ty::Bool, false),
+            mk("sem_release", vec![any("s"), any("n")], Ty::Empty, false),
+            mk("atomic_new", vec![any("value")], Ty::Int, false),
+            mk("atomic_load", vec![any("a")], Ty::Int, false),
+            mk("atomic_store", vec![any("a"), any("value")], Ty::Empty, false),
+            mk("atomic_add", vec![any("a"), any("delta")], Ty::Int, false),
+            mk(
+                "atomic_cas",
+                vec![any("a"), any("expected"), any("value")],
+                Ty::Bool,
+                false,
+            ),
+            mk("once_new", vec![], Ty::Int, false),
+            mk("once_done", vec![any("o")], Ty::Bool, false),
+            mk("once_run", vec![any("o"), any("body")], Ty::Bool, false),
         ];
         for c in builtins {
             self.fns.entry(c.name.clone()).or_default().push(c);

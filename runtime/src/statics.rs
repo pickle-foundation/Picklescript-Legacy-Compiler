@@ -61,7 +61,8 @@ pub(crate) fn reset() {
 #[no_mangle]
 pub extern "C" fn pickle_static_get(class_id: u32, slot: u32) -> *mut PickleObject {
     let cell = cell_bits(class_id, slot) as *mut *mut PickleObject;
-    // SAFETY: `cell_bits` returns a live heap cell; the runtime is single-threaded.
+    // SAFETY: `cell_bits` returns a live heap cell, and the caller owns the
+    // world lock (see `crate::world`), so no task thread is mutating it.
     unsafe { *cell }
 }
 
@@ -69,7 +70,8 @@ pub extern "C" fn pickle_static_get(class_id: u32, slot: u32) -> *mut PickleObje
 #[no_mangle]
 pub extern "C" fn pickle_static_set(class_id: u32, slot: u32, value: *mut PickleObject) {
     let cell = cell_bits(class_id, slot) as *mut *mut PickleObject;
-    // SAFETY: `cell_bits` returns a live heap cell; the runtime is single-threaded.
+    // SAFETY: `cell_bits` returns a live heap cell, and the caller owns the
+    // world lock (see `crate::world`), so no task thread is mutating it.
     unsafe {
         *cell = value;
     }

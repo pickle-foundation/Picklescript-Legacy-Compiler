@@ -49,7 +49,10 @@ static REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Flat registry of threads; also the intrusive list of `GcThread` nodes.
 static mut THREAD_HEAD: *mut GcThread = std::ptr::null_mut();
-static THREAD_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Id handed to the next thread that registers. Ids start at 1 so that 0 can
+/// mean "no thread" to callers of `pickle_gc_register_thread`/`pickle_thread_current`,
+/// which report 0 for an unregistered thread.
+static THREAD_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// Lock the thread registry for mutation or traversal. Returns the guard;
 /// hold it for the duration of any operation that touches `THREAD_HEAD` or a

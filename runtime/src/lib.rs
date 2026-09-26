@@ -31,8 +31,11 @@ mod statics;
 mod stream;
 pub(crate) mod strings;
 mod test;
+mod threads;
 mod trace;
 mod r#tuple;
+mod sync;
+pub mod world;
 
 /// Descriptor for the builtin types; ids 0..=9 are reserved and `tuple` keeps a
 /// (non-traced) placeholder so user classes, registered via
@@ -220,9 +223,18 @@ pub extern "C" fn pickle_runtime_register_class_table(
 }
 
 /// Tear down the collector. Usually not needed at exit, but available.
+///
+/// A program's tasks outlive its `main`, and a task's heap references are only
+/// meaningless once it has finished, so the pool is drained first: the thread
+/// that tears the heap down must not be the one that is about to pull the rug
+/// out from under a task. The world lock is handed back afterwards so a
+/// shutdown from a task (or a test) cannot leave the process unable to run
+/// anything else.
 #[no_mangle]
 pub extern "C" fn pickle_runtime_shutdown() {
+    threads::drain();
     gc::shutdown();
+    world::release();
 }
 
 /// Reset the runtime to a pristine state between `pickle test` files: drop
@@ -266,162 +278,234 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
-/// Crate-public ABI surface for the sibling `pickle-cli` crate: re-exports the
-/// `pickle_*` symbols under a single stable path.
-#[doc(hidden)]
-pub mod abi {
-    pub use crate::pickle_runtime_init;
-    pub use crate::pickle_runtime_reset;
-    pub use crate::pickle_runtime_shutdown;
+/// Declare the runtime's linkable ABI once, deriving every consumer-side
+/// table from that single list: the `abi` re-export module for the sibling
+/// `pickle-cli` crate, [`ALL_ABI_NAMES`] for the crash reporter's symbol
+/// table, and [`runtime_addr`] for the linker's `pickle_*` resolution. A new
+/// ABI symbol therefore needs exactly one edit to become linkable.
+macro_rules! declare_abi {
+    ($( $name:ident => $path:path ),* $(,)?) => {
+        /// Crate-public ABI surface for the sibling `pickle-cli` crate:
+        /// re-exports the `pickle_*` symbols under a single stable path.
+        #[doc(hidden)]
+        pub mod abi {
+            $( pub use $path; )*
+            pub use crate::test::{PickleHook, PickleTest};
+        }
 
-    pub use crate::class::pickle_class_add_iface_method;
-    pub use crate::class::pickle_class_add_interface;
-    pub use crate::class::pickle_class_cast;
-    pub use crate::class::pickle_class_implements;
-    pub use crate::class::pickle_class_is;
-    pub use crate::class::pickle_class_new;
-    pub use crate::class::pickle_class_register;
-    pub use crate::class::pickle_iface_cast;
-    pub use crate::class::pickle_iface_method;
-    pub use crate::class::pickle_obj_slot_get;
-    pub use crate::class::pickle_obj_slot_set;
+        /// Every ABI symbol name, in declaration order.
+        pub const ALL_ABI_NAMES: &[&str] = &[ $( stringify!($name) ),* ];
 
-    pub use crate::gc::pickle_manual_adopt;
-    pub use crate::gc::pickle_manual_free;
+        /// The address of ABI symbol `name`, or `None` when it is not part of
+        /// the runtime ABI. (Symbols supplied by the host rather than the
+        /// runtime — `pickle_fmod` — are not listed here.)
+        pub fn runtime_addr(name: &str) -> Option<usize> {
+            match name {
+                $( stringify!($name) => Some($path as *const () as usize), )*
+                _ => None,
+            }
+        }
+    };
+}
 
-    pub use crate::statics::pickle_static_get;
-    pub use crate::statics::pickle_static_set;
+declare_abi! {
+    pickle_runtime_init => crate::pickle_runtime_init,
+    pickle_runtime_reset => crate::pickle_runtime_reset,
+    pickle_runtime_shutdown => crate::pickle_runtime_shutdown,
 
-    pub use crate::console::pickle_print_bool;
-    pub use crate::console::pickle_print_byte;
-    pub use crate::console::pickle_print_bytes;
-    pub use crate::console::pickle_print_char;
-    pub use crate::console::pickle_print_cstr;
-    pub use crate::console::pickle_print_f64;
-    pub use crate::console::pickle_print_i64;
-    pub use crate::console::pickle_print_newline;
-    pub use crate::console::pickle_print_obj;
-    pub use crate::console::pickle_print_u64;
+    pickle_class_add_iface_method => crate::class::pickle_class_add_iface_method,
+    pickle_class_add_interface => crate::class::pickle_class_add_interface,
+    pickle_class_cast => crate::class::pickle_class_cast,
+    pickle_class_implements => crate::class::pickle_class_implements,
+    pickle_class_is => crate::class::pickle_class_is,
+    pickle_class_new => crate::class::pickle_class_new,
+    pickle_class_register => crate::class::pickle_class_register,
+    pickle_iface_cast => crate::class::pickle_iface_cast,
+    pickle_iface_method => crate::class::pickle_iface_method,
+    pickle_obj_slot_get => crate::class::pickle_obj_slot_get,
+    pickle_obj_slot_set => crate::class::pickle_obj_slot_set,
 
-    pub use crate::boxscalar::pickle_box_bool;
-    pub use crate::boxscalar::pickle_box_char;
-    pub use crate::boxscalar::pickle_box_f64;
-    pub use crate::boxscalar::pickle_box_i64;
-    pub use crate::boxscalar::pickle_unbox_bool;
-    pub use crate::boxscalar::pickle_unbox_char;
-    pub use crate::boxscalar::pickle_unbox_f64;
-    pub use crate::boxscalar::pickle_unbox_i64;
+    pickle_manual_adopt => crate::gc::pickle_manual_adopt,
+    pickle_manual_free => crate::gc::pickle_manual_free,
 
-    pub use crate::list::pickle_list_get;
-    pub use crate::list::pickle_list_insert;
-    pub use crate::list::pickle_list_len;
-    pub use crate::list::pickle_list_new;
-    pub use crate::list::pickle_list_pop;
-    pub use crate::list::pickle_list_push;
-    pub use crate::list::pickle_list_remove;
-    pub use crate::list::pickle_list_set;
-    pub use crate::list::pickle_list_sort;
-    pub use crate::list::pickle_range;
+    pickle_static_get => crate::statics::pickle_static_get,
+    pickle_static_set => crate::statics::pickle_static_set,
 
-    pub use crate::map::pickle_map_get;
-    pub use crate::map::pickle_map_get_boxed;
-    pub use crate::map::pickle_map_has;
-    pub use crate::map::pickle_map_keys;
-    pub use crate::map::pickle_map_len;
-    pub use crate::map::pickle_map_new;
-    pub use crate::map::pickle_map_remove;
-    pub use crate::map::pickle_map_set;
-    pub use crate::map::pickle_map_values;
+    pickle_print_bool => crate::console::pickle_print_bool,
+    pickle_print_byte => crate::console::pickle_print_byte,
+    pickle_print_bytes => crate::console::pickle_print_bytes,
+    pickle_print_char => crate::console::pickle_print_char,
+    pickle_print_cstr => crate::console::pickle_print_cstr,
+    pickle_print_f64 => crate::console::pickle_print_f64,
+    pickle_print_i64 => crate::console::pickle_print_i64,
+    pickle_print_newline => crate::console::pickle_print_newline,
+    pickle_print_obj => crate::console::pickle_print_obj,
+    pickle_print_u64 => crate::console::pickle_print_u64,
 
-    pub use crate::r#enum::pickle_enum_eq;
-    pub use crate::r#enum::pickle_enum_field;
-    pub use crate::r#enum::pickle_enum_new;
-    pub use crate::r#enum::pickle_enum_set_field;
-    pub use crate::r#enum::pickle_enum_tag;
+    pickle_box_bool => crate::boxscalar::pickle_box_bool,
+    pickle_box_char => crate::boxscalar::pickle_box_char,
+    pickle_box_f64 => crate::boxscalar::pickle_box_f64,
+    pickle_box_i64 => crate::boxscalar::pickle_box_i64,
+    pickle_unbox_bool => crate::boxscalar::pickle_unbox_bool,
+    pickle_unbox_char => crate::boxscalar::pickle_unbox_char,
+    pickle_unbox_f64 => crate::boxscalar::pickle_unbox_f64,
+    pickle_unbox_i64 => crate::boxscalar::pickle_unbox_i64,
 
-    pub use crate::r#tuple::pickle_tuple_field;
-    pub use crate::r#tuple::pickle_tuple_len;
-    pub use crate::r#tuple::pickle_tuple_new;
-    pub use crate::r#tuple::pickle_tuple_set_field;
+    pickle_list_get => crate::list::pickle_list_get,
+    pickle_list_insert => crate::list::pickle_list_insert,
+    pickle_list_len => crate::list::pickle_list_len,
+    pickle_list_new => crate::list::pickle_list_new,
+    pickle_list_pop => crate::list::pickle_list_pop,
+    pickle_list_push => crate::list::pickle_list_push,
+    pickle_list_remove => crate::list::pickle_list_remove,
+    pickle_list_set => crate::list::pickle_list_set,
+    pickle_list_sort => crate::list::pickle_list_sort,
+    pickle_range => crate::list::pickle_range,
 
-    pub use crate::fs::pickle_delete;
-    pub use crate::fs::pickle_file_exists;
-    pub use crate::fs::pickle_list_dir;
-    pub use crate::fs::pickle_mkdir;
-    pub use crate::fs::pickle_read_file;
-    pub use crate::fs::pickle_write_file;
+    pickle_map_get => crate::map::pickle_map_get,
+    pickle_map_get_boxed => crate::map::pickle_map_get_boxed,
+    pickle_map_has => crate::map::pickle_map_has,
+    pickle_map_keys => crate::map::pickle_map_keys,
+    pickle_map_len => crate::map::pickle_map_len,
+    pickle_map_new => crate::map::pickle_map_new,
+    pickle_map_remove => crate::map::pickle_map_remove,
+    pickle_map_set => crate::map::pickle_map_set,
+    pickle_map_values => crate::map::pickle_map_values,
 
-    pub use crate::os::pickle_args;
-    pub use crate::os::pickle_args_set;
-    pub use crate::os::pickle_exit;
+    pickle_enum_eq => crate::r#enum::pickle_enum_eq,
+    pickle_enum_field => crate::r#enum::pickle_enum_field,
+    pickle_enum_new => crate::r#enum::pickle_enum_new,
+    pickle_enum_set_field => crate::r#enum::pickle_enum_set_field,
+    pickle_enum_tag => crate::r#enum::pickle_enum_tag,
 
-    pub use crate::process::pickle_current_dir;
-    pub use crate::process::pickle_proc_code;
-    pub use crate::process::pickle_proc_err_read;
-    pub use crate::process::pickle_proc_in_close;
-    pub use crate::process::pickle_proc_in_write;
-    pub use crate::process::pickle_proc_kill;
-    pub use crate::process::pickle_proc_out_read;
-    pub use crate::process::pickle_proc_running;
-    pub use crate::process::pickle_proc_wait;
-    pub use crate::process::pickle_run_cmd;
-    pub use crate::process::pickle_run_spawn;
+    pickle_tuple_field => crate::r#tuple::pickle_tuple_field,
+    pickle_tuple_len => crate::r#tuple::pickle_tuple_len,
+    pickle_tuple_new => crate::r#tuple::pickle_tuple_new,
+    pickle_tuple_set_field => crate::r#tuple::pickle_tuple_set_field,
 
-    pub use crate::stream::pickle_stderr_stream;
-    pub use crate::stream::pickle_stdout_stream;
-    pub use crate::stream::pickle_stream_close;
-    pub use crate::stream::pickle_stream_flush;
-    pub use crate::stream::pickle_stream_open_append;
-    pub use crate::stream::pickle_stream_open_read;
-    pub use crate::stream::pickle_stream_open_write;
-    pub use crate::stream::pickle_stream_read;
-    pub use crate::stream::pickle_stream_write;
+    pickle_delete => crate::fs::pickle_delete,
+    pickle_file_exists => crate::fs::pickle_file_exists,
+    pickle_list_dir => crate::fs::pickle_list_dir,
+    pickle_mkdir => crate::fs::pickle_mkdir,
+    pickle_read_file => crate::fs::pickle_read_file,
+    pickle_write_file => crate::fs::pickle_write_file,
 
-    pub use crate::panic::pickle_panic_arity_diff;
-    pub use crate::panic::pickle_panic_no_iface_method;
-    pub use crate::panic::pickle_panic_no_match;
-    pub use crate::panic::pickle_panic_none_unwrap;
-    pub use crate::panic::pickle_test_capture_begin;
-    pub use crate::panic::pickle_test_capture_take;
+    pickle_args => crate::os::pickle_args,
+    pickle_args_set => crate::os::pickle_args_set,
+    pickle_exit => crate::os::pickle_exit,
 
-    pub use crate::raw::pickle_raw_alloc;
-    pub use crate::raw::pickle_raw_free;
+    pickle_current_dir => crate::process::pickle_current_dir,
+    pickle_proc_code => crate::process::pickle_proc_code,
+    pickle_proc_err_read => crate::process::pickle_proc_err_read,
+    pickle_proc_in_close => crate::process::pickle_proc_in_close,
+    pickle_proc_in_write => crate::process::pickle_proc_in_write,
+    pickle_proc_kill => crate::process::pickle_proc_kill,
+    pickle_proc_out_read => crate::process::pickle_proc_out_read,
+    pickle_proc_running => crate::process::pickle_proc_running,
+    pickle_proc_wait => crate::process::pickle_proc_wait,
+    pickle_run_cmd => crate::process::pickle_run_cmd,
+    pickle_run_spawn => crate::process::pickle_run_spawn,
 
-    pub use crate::shadow::pickle_shadow_get;
-    pub use crate::shadow::pickle_shadow_pop;
-    pub use crate::shadow::pickle_shadow_push;
-    pub use crate::shadow::pickle_shadow_set;
+    pickle_stderr_stream => crate::stream::pickle_stderr_stream,
+    pickle_stdout_stream => crate::stream::pickle_stdout_stream,
+    pickle_stream_close => crate::stream::pickle_stream_close,
+    pickle_stream_flush => crate::stream::pickle_stream_flush,
+    pickle_stream_open_append => crate::stream::pickle_stream_open_append,
+    pickle_stream_open_read => crate::stream::pickle_stream_open_read,
+    pickle_stream_open_write => crate::stream::pickle_stream_open_write,
+    pickle_stream_read => crate::stream::pickle_stream_read,
+    pickle_stream_write => crate::stream::pickle_stream_write,
 
-    pub use crate::strings::pickle_str_cmp;
-    pub use crate::strings::pickle_str_concat;
-    pub use crate::strings::pickle_str_from_bool;
-    pub use crate::strings::pickle_str_from_byte;
-    pub use crate::strings::pickle_str_from_bytes;
-    pub use crate::strings::pickle_str_from_char;
-    pub use crate::strings::pickle_str_from_f64;
-    pub use crate::strings::pickle_str_from_i64;
-    pub use crate::strings::pickle_str_from_list;
-    pub use crate::strings::pickle_str_get;
-    pub use crate::strings::pickle_str_len;
-    pub use crate::strings::pickle_str_set;
-    pub use crate::strings::pickle_str_to_bytes;
+    pickle_panic_arity_diff => crate::panic::pickle_panic_arity_diff,
+    pickle_panic_bytes => crate::panic::pickle_panic_bytes,
+    pickle_panic_cstr => crate::panic::pickle_panic_cstr,
+    pickle_panic_no_iface_method => crate::panic::pickle_panic_no_iface_method,
+    pickle_panic_no_match => crate::panic::pickle_panic_no_match,
+    pickle_panic_none_unwrap => crate::panic::pickle_panic_none_unwrap,
+    pickle_test_capture_begin => crate::panic::pickle_test_capture_begin,
+    pickle_test_capture_take => crate::panic::pickle_test_capture_take,
 
-    pub use crate::test::pickle_expect_display;
-    pub use crate::test::pickle_expect_list_contains;
-    pub use crate::test::pickle_expect_obj_eq;
-    pub use crate::test::pickle_expect_str_contains;
-    pub use crate::test::pickle_runtime_run_tests;
-    pub use crate::test::pickle_test_clear;
-    pub use crate::test::pickle_test_fail_obj;
-    pub use crate::test::pickle_test_register_hooks;
-    pub use crate::test::pickle_test_register_table;
-    pub use crate::test::PickleHook;
-    pub use crate::test::PickleTest;
+    pickle_thread_count => crate::threads::pickle_thread_count,
+    pickle_thread_current => crate::threads::pickle_thread_current,
+    pickle_thread_finished => crate::threads::pickle_thread_finished,
+    pickle_thread_join => crate::threads::pickle_thread_join,
+    pickle_thread_panic_message => crate::threads::pickle_thread_panic_message,
+    pickle_thread_sleep_ms => crate::threads::pickle_thread_sleep_ms,
+    pickle_thread_spawn => crate::threads::pickle_thread_spawn,
+    pickle_thread_yield => crate::threads::pickle_thread_yield,
+
+    pickle_atomic_add => crate::sync::pickle_atomic_add,
+    pickle_atomic_cas => crate::sync::pickle_atomic_cas,
+    pickle_atomic_load => crate::sync::pickle_atomic_load,
+    pickle_atomic_new => crate::sync::pickle_atomic_new,
+    pickle_atomic_store => crate::sync::pickle_atomic_store,
+    pickle_cond_broadcast => crate::sync::pickle_cond_broadcast,
+    pickle_cond_new => crate::sync::pickle_cond_new,
+    pickle_cond_signal => crate::sync::pickle_cond_signal,
+    pickle_cond_wait => crate::sync::pickle_cond_wait,
+    pickle_mutex_lock => crate::sync::pickle_mutex_lock,
+    pickle_mutex_new => crate::sync::pickle_mutex_new,
+    pickle_mutex_trylock => crate::sync::pickle_mutex_trylock,
+    pickle_mutex_unlock => crate::sync::pickle_mutex_unlock,
+    pickle_once_done => crate::sync::pickle_once_done,
+    pickle_once_new => crate::sync::pickle_once_new,
+    pickle_once_run => crate::sync::pickle_once_run,
+    pickle_sem_acquire => crate::sync::pickle_sem_acquire,
+    pickle_sem_new => crate::sync::pickle_sem_new,
+    pickle_sem_release => crate::sync::pickle_sem_release,
+    pickle_sem_try_acquire => crate::sync::pickle_sem_try_acquire,
+
+    pickle_raw_alloc => crate::raw::pickle_raw_alloc,
+    pickle_raw_free => crate::raw::pickle_raw_free,
+
+    pickle_shadow_get => crate::shadow::pickle_shadow_get,
+    pickle_shadow_pop => crate::shadow::pickle_shadow_pop,
+    pickle_shadow_push => crate::shadow::pickle_shadow_push,
+    pickle_shadow_set => crate::shadow::pickle_shadow_set,
+
+    pickle_str_cmp => crate::strings::pickle_str_cmp,
+    pickle_str_concat => crate::strings::pickle_str_concat,
+    pickle_str_from_bool => crate::strings::pickle_str_from_bool,
+    pickle_str_from_byte => crate::strings::pickle_str_from_byte,
+    pickle_str_from_bytes => crate::strings::pickle_str_from_bytes,
+    pickle_str_from_char => crate::strings::pickle_str_from_char,
+    pickle_str_from_f64 => crate::strings::pickle_str_from_f64,
+    pickle_str_from_i64 => crate::strings::pickle_str_from_i64,
+    pickle_str_from_list => crate::strings::pickle_str_from_list,
+    pickle_str_get => crate::strings::pickle_str_get,
+    pickle_str_len => crate::strings::pickle_str_len,
+    pickle_str_set => crate::strings::pickle_str_set,
+    pickle_str_to_bytes => crate::strings::pickle_str_to_bytes,
+
+    pickle_expect_display => crate::test::pickle_expect_display,
+    pickle_expect_list_contains => crate::test::pickle_expect_list_contains,
+    pickle_expect_obj_eq => crate::test::pickle_expect_obj_eq,
+    pickle_expect_str_contains => crate::test::pickle_expect_str_contains,
+    pickle_runtime_run_tests => crate::test::pickle_runtime_run_tests,
+    pickle_test_clear => crate::test::pickle_test_clear,
+    pickle_test_fail_obj => crate::test::pickle_test_fail_obj,
+    pickle_test_register_hooks => crate::test::pickle_test_register_hooks,
+    pickle_test_register_table => crate::test::pickle_test_register_table,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_abi_name_resolves() {
+        for name in ALL_ABI_NAMES {
+            assert!(runtime_addr(name).is_some(), "{name} must resolve");
+        }
+        assert!(runtime_addr("pickle_no_such_symbol").is_none());
+        // The manifest is what the linker's `pickle_*` table and the crash
+        // reporter read, so a symbol that is not listed is not linkable.
+        assert_eq!(
+            ALL_ABI_NAMES.len(),
+            ALL_ABI_NAMES.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "ABI names must be unique"
+        );
+    }
 
     #[test]
     fn full_cycle_alloc_mark_sweep() {

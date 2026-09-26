@@ -3,6 +3,19 @@
 //!
 //! In capture mode (the test harness) panics become recorded failures so a
 //! failing `test fn` body can be reported without aborting the process.
+//!
+//! Compiled frames carry no unwind info, so nothing on this path may unwind a
+//! Rust panic through one (see [`crate::test`]). That splits failures in two:
+//!
+//! - *Recoverable*: `assert` (and the test hook) records a message and the
+//!   compiled body carries on, which is already how [`crate::test`] works. A
+//!   task body is in this class too — a task's failure is recorded on the
+//!   thread ([`take_task_panic`]) so `join` can report it, and the task is
+//!   checked for that first, before the test harness' global capture mode.
+//! - *Fatal*: `panic`, a `none` unwrap, a non-exhaustive `match`, a bad spread
+//!   arity. The emitter models these as a void call on a path that cannot
+//!   continue, so they must genuinely diverge: they print and exit, exactly as
+//!   a panic in a Go goroutine that never recovers does.
 
 use std::io::Write;
 
@@ -14,6 +27,13 @@ static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 thread_local! {
     static LAST_PANIC: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// Whether this thread is a task body ([`crate::threads`]). Checked before
+    /// [`CAPTURE`]: a task spawned from a running test inherits the harness'
+    /// capture mode, but its failure belongs to the task, not to that test.
+    static TASK_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The message a task body recorded, waiting for its `join`.
+    static TASK_PANIC: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -71,6 +91,47 @@ pub(crate) fn record_panic_msg(msg: impl Into<String>) {
     record_panic(msg.into());
 }
 
+/// Whether this thread is running a task body, so a recoverable failure is
+/// recorded for that task's `join` instead of the test harness.
+pub fn in_task_mode() -> bool {
+    TASK_MODE.with(|m| m.get())
+}
+
+/// Mark this thread as a task body, or leave task mode. Entering clears any
+/// message left over; leaving hands the message back, so a task that records a
+/// failure and is then joined twice still reports it once.
+pub fn set_task_mode(task: bool) {
+    TASK_MODE.with(|m| m.set(task));
+    if task {
+        TASK_PANIC.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// The message this task body recorded, if any. Consumed by
+/// [`crate::threads`] when the task finishes.
+pub(crate) fn take_task_panic() -> Option<String> {
+    TASK_PANIC.with(|p| p.borrow_mut().take())
+}
+
+/// Record a *recoverable* failure — one whose compiled call site is allowed to
+/// return and carry on (`assert`, the test hook). Returns whether it was
+/// recorded, i.e. whether the caller should return instead of failing hard.
+///
+/// A task records to its own slot first: a task spawned by a test inherits
+/// capture mode, but the failure is the task's and belongs to its `join`.
+pub fn record_recoverable(msg: impl Into<String>) -> bool {
+    let msg = msg.into();
+    if in_task_mode() {
+        TASK_PANIC.with(|p| *p.borrow_mut() = Some(msg));
+        return true;
+    }
+    if is_capturing() {
+        record_panic(msg);
+        return true;
+    }
+    false
+}
+
 /// Write the fatal banner plus `msg` to stderr and exit 1. Used outside
 /// capture mode by `panic` and failing `assert`s in non-test code.
 pub(crate) fn fatal(msg: &str) -> ! {
@@ -93,9 +154,10 @@ fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
     }
 }
 
-/// ABI: `panic("...")` from PickleScript. In capture mode (a running test)
-/// this becomes a recoverable failure; otherwise it prints a banner and
-/// exits 1.
+/// ABI: `panic("...")` from PickleScript. Always fatal: the emitter puts this
+/// call on a path that cannot continue, so returning would hand compiled code an
+/// uninitialised value, and unwinding is not available through a JIT frame.
+/// A test that wants a recoverable failure uses `assert`.
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pickle_panic_bytes(ptr: *const u8, len: usize) -> ! {
@@ -104,15 +166,17 @@ pub extern "C" fn pickle_panic_bytes(ptr: *const u8, len: usize) -> ! {
     } else {
         unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned() }
     };
-    if is_capturing() {
-        record_panic(msg);
-        std::panic::panic_any("pickle panic");
+    if in_task_mode() {
+        // Name the task in the message: the failing body is otherwise invisible
+        // in a program with many of them.
+        fatal(&format!("pickle: task failed: {msg}"));
     }
     fatal(&msg);
 }
 
 /// ABI: `panic("...")` from a NUL-terminated C string.
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn pickle_panic_cstr(ptr: *const u8) -> ! {
     let mut len = 0usize;
     unsafe {
