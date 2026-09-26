@@ -371,6 +371,18 @@ impl Gc {
         ALLOC_SINCE_GC.store(0, Ordering::Relaxed);
         BYTES_SINCE_GC.store(0, Ordering::Relaxed);
         COLLECTING.store(false, Ordering::Release);
+        // Adaptive auto-collect: after each cycle, raise the threshold towards
+        // the surviving heap so large-live-set workloads stop thrashing. A
+        // stable multi-hundred-MB working set (e.g. the self-hosted compiler)
+        // were sweeping the whole arena after every 8 MiB of allocation; with
+        // the threshold pinned to a multiple of the live set, collections
+        // amortize instead of taking over the run time.
+        let next = DEFAULT_AUTO_COLLECT_THRESHOLD.max(
+            self.live_bytes
+                .load(Ordering::Relaxed)
+                .saturating_mul(2),
+        );
+        AUTO_THRESHOLD.store(next.min(1 << 30), Ordering::Relaxed);
     }
 
     /// Maybe collect if the allocation threshold has been crossed.

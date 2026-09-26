@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 use pickle_compiler::ir::{
-    BinOp, Callee, FuncId, IrConst, IrFunc, IrInstr, IrModule, IrTerm, IrTy, Slot, UnOp,
+    BinOp, Callee, FuncId, IrConst, IrFunc, IrInstr, IrModule, IrTerm, IrTy, Slot, Temp, UnOp,
 };
 
 use pickle_runtime::runtime_addr as abi_runtime_addr;
@@ -421,6 +421,13 @@ impl Jit {
         flag_builder
             .set("is_pic", "false")
             .with_context(|| "cannot set is_pic=false")?;
+        // Compile speed matters more than catching backend bugs we have
+        // already exercised: the verifier re-checks every CLIF function and
+        // adds noticeable fixed cost per function for large modules (e.g.
+        // JIT-compiling the self-host compiler's ~3000 functions).
+        flag_builder
+            .set("enable_verifier", "false")
+            .with_context(|| "cannot set enable_verifier=false")?;
         let flags = Flags::new(flag_builder);
         let isa_builder = cranelift_native::builder().map_err(|e| anyhow!("host ISA: {e}"))?;
         let isa = isa_builder.finish(flags).map_err(anyhow::Error::msg)?;
@@ -612,6 +619,236 @@ fn unit_value(builder: &mut FunctionBuilder) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Emit a call to a runtime native and return its single result value (or the
+/// unit sentinel for `()`-returning calls). Shared by the generic extern-call
+/// path and the fallible slow paths of [`try_inline_extern_call`].
+fn call_extern_value(
+    builder: &mut FunctionBuilder,
+    call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
+    symbol: &str,
+    params: &[IrTy],
+    ret: IrTy,
+    iargs: &[Value],
+) -> Value {
+    let (s, gv) = extern_pair(builder, call_cache, symbol, params, ret);
+    let addr = builder.ins().symbol_value(types::I64, gv);
+    let inst = builder.ins().call_indirect(s, addr, iargs);
+    builder
+        .inst_results(inst)
+        .first()
+        .copied()
+        .unwrap_or_else(|| unit_value(builder))
+}
+
+/// Managed-object header/payload offsets, shared with `runtime/src/object.rs`
+/// and `runtime/src/layout.rs`. `Enums`/`Str`/etc. keep `size` at +16 because
+/// the 24-byte header is `{ next: *mut, class_id: u32, flags: u32, size: u32,
+/// _pad: u32 }`; every payload begins at +24.
+const OBJ_SIZE_OFF: i64 = 16;
+const OBJ_PAYLOAD_OFF: i64 = 24;
+const SLOT_BYTES: i64 = 8;
+
+/// Inline a few runtime natives whose semantics are plain memory reads/writes
+/// at fixed offsets (class fields, enum tags/payloads, boxed-int payloads).
+///
+/// Every fallible edge (null object, out-of-bounds slot) takes a cold branch
+/// that calls the *original* native, so null panics, bounds `null`/no-op
+/// behaviour and `PKL_GC_TRACE` taps stay byte-identical to the runtime. The
+/// emitted IR/IRX text is untouched; only generated machine code changes.
+///
+/// Returns `Ok(true)` when the call was lowered inline (including `dst`
+/// bookkeeping), `Ok(false)` when the caller should fall through to the
+/// generic indirect-call path.
+fn try_inline_extern_call(
+    plan: &Plan,
+    builder: &mut FunctionBuilder,
+    frame: Option<StackSlot>,
+    symbol: &str,
+    params: &[IrTy],
+    ret: IrTy,
+    iargs: &[Value],
+    values: &mut HashMap<u32, Value>,
+    call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
+    dst: Option<Temp>,
+) -> Result<bool> {
+    if iargs.is_empty() {
+        return Ok(false);
+    }
+    let obj = iargs[0];
+    let ret_managed = is_managed(ret);
+    let finish = |builder: &mut FunctionBuilder, values: &mut HashMap<u32, Value>, v: Value| {
+        if let Some(d) = dst {
+            if ret_managed {
+                write_through(builder, plan, frame, d.0, v);
+            }
+            values.insert(d.0, v);
+        }
+    };
+    match symbol {
+        // `pickle_obj_slot_get(obj, slot) -> ptr`: raw load of a class field.
+        // Runtime (`class_slot`): null/negative/`slot > slots` yield null,
+        // where `slots = (size - 24 - 8) / 8` and `size < 32` is rejected.
+        "pickle_obj_slot_get" => {
+            let slot = iargs[1];
+            let zero = builder.ins().iconst(types::I64, 0);
+            let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
+            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
+            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let sz = builder.ins().uextend(types::I64, sz32);
+            let c32 = builder.ins().iconst(types::I64, 32);
+            let big_enough = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let sz_m32 = builder.ins().isub(sz, c32);
+            let c3 = builder.ins().iconst(types::I64, 3);
+            let slots = builder.ins().ushr(sz_m32, c3);
+            let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
+            let nn = builder.ins().band(not_null, nonneg);
+            let be = builder.ins().band(big_enough, in_bounds);
+            let valid = builder.ins().band(nn, be);
+            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF);
+            let sh = builder.ins().ishl(slot, c3);
+            let inner = builder.ins().iadd(off, sh);
+            let addr = builder.ins().iadd(obj, inner);
+            let merge = emit_guarded_load(builder, call_cache, symbol, params, ret, iargs, valid, |b| {
+                b.ins().load(types::I64, MemFlags::trusted(), addr, 0)
+            });
+            finish(builder, values, builder.block_params(merge)[0]);
+            Ok(true)
+        }
+        // `pickle_obj_slot_set(obj, slot, value)`: raw store of a class field.
+        // Same guards; out-of-range writes are silently ignored by the runtime.
+        "pickle_obj_slot_set" => {
+            let slot = iargs[1];
+            let zero = builder.ins().iconst(types::I64, 0);
+            let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
+            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
+            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let sz = builder.ins().uextend(types::I64, sz32);
+            let c32 = builder.ins().iconst(types::I64, 32);
+            let big_enough = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let sz_m32 = builder.ins().isub(sz, c32);
+            let c3 = builder.ins().iconst(types::I64, 3);
+            let slots = builder.ins().ushr(sz_m32, c3);
+            let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
+            let nn = builder.ins().band(not_null, nonneg);
+            let be = builder.ins().band(big_enough, in_bounds);
+            let valid = builder.ins().band(nn, be);
+            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF);
+            let sh = builder.ins().ishl(slot, c3);
+            let inner = builder.ins().iadd(off, sh);
+            let addr = builder.ins().iadd(obj, inner);
+            emit_guarded_store(builder, call_cache, symbol, params, ret, iargs, valid, addr, iargs[2]);
+            Ok(true)
+        }
+        // `pickle_enum_tag(obj) -> int`: unguarded load of the tag i64 at +24.
+        "pickle_enum_tag" => {
+            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF);
+            let addr = builder.ins().iadd(obj, off);
+            let v = builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+            finish(builder, values, v);
+            Ok(true)
+        }
+        // `pickle_enum_field(obj, idx) -> ptr`: payload field load, null when
+        // out of bounds. `field_count = (size - 24 - 8).max(0) / 8` (layout.rs).
+        "pickle_enum_field" => {
+            let idx = iargs[1];
+            let zero = builder.ins().iconst(types::I64, 0);
+            let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
+            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, zero);
+            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let sz = builder.ins().uextend(types::I64, sz32);
+            let c32 = builder.ins().iconst(types::I64, 32);
+            let sz_ge_32 = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let sz_m32 = builder.ins().isub(sz, c32);
+            let sat = builder.ins().select(sz_ge_32, sz_m32, zero);
+            let c3 = builder.ins().iconst(types::I64, 3);
+            let count = builder.ins().ushr(sat, c3);
+            let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+            let nn = builder.ins().band(not_null, nonneg);
+            let valid = builder.ins().band(nn, in_bounds);
+            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF + SLOT_BYTES);
+            let sh = builder.ins().ishl(idx, c3);
+            let inner = builder.ins().iadd(off, sh);
+            let addr = builder.ins().iadd(obj, inner);
+            let merge = emit_guarded_load(builder, call_cache, symbol, params, ret, iargs, valid, |b| {
+                b.ins().load(types::I64, MemFlags::trusted(), addr, 0)
+            });
+            finish(builder, values, builder.block_params(merge)[0]);
+            Ok(true)
+        }
+        // `pickle_unbox_i64(obj) -> int`: load of the i64 payload at +24; a
+        // null object takes the slow path so the runtime's panic fires.
+        "pickle_unbox_i64" => {
+            let zero = builder.ins().iconst(types::I64, 0);
+            let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
+            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF);
+            let addr = builder.ins().iadd(obj, off);
+            let fast = builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+            let slow = builder.create_block();
+            let merge = builder.create_block();
+            builder.append_block_param(merge, types::I64);
+            builder.ins().brif(not_null, merge, &[BlockArg::Value(fast)], slow, &[] as &[BlockArg]);
+            builder.switch_to_block(slow);
+            let slow_v = call_extern_value(builder, call_cache, symbol, params, ret, iargs);
+            builder.ins().jump(merge, &[BlockArg::Value(slow_v)]);
+            builder.switch_to_block(merge);
+            finish(builder, values, builder.block_params(merge)[0]);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Shared tail of the guarded-load inline paths: branch on `valid`; the fast
+/// case loads via `addr` and the cold case calls the original native. Returns
+/// the merge block whose first parameter is the result.
+fn emit_guarded_load(
+    builder: &mut FunctionBuilder,
+    call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
+    symbol: &str,
+    params: &[IrTy],
+    ret: IrTy,
+    iargs: &[Value],
+    valid: Value,
+    fast_load: impl FnOnce(&mut FunctionBuilder) -> Value,
+) -> Block {
+    let slow = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let fast = fast_load(builder);
+    builder.ins().brif(valid, merge, &[BlockArg::Value(fast)], slow, &[] as &[BlockArg]);
+    builder.switch_to_block(slow);
+    let slow_v = call_extern_value(builder, call_cache, symbol, params, ret, iargs);
+    builder.ins().jump(merge, &[BlockArg::Value(slow_v)]);
+    builder.switch_to_block(merge);
+    merge
+}
+
+/// Shared tail of the guarded-store inline paths: store through `addr` on the
+/// fast path, call the original native on the cold path.
+fn emit_guarded_store(
+    builder: &mut FunctionBuilder,
+    call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
+    symbol: &str,
+    params: &[IrTy],
+    ret: IrTy,
+    iargs: &[Value],
+    valid: Value,
+    addr: Value,
+    value: Value,
+) {
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(valid, fast, &[] as &[BlockArg], slow, &[] as &[BlockArg]);
+    builder.switch_to_block(fast);
+    builder.ins().store(MemFlags::trusted(), value, addr, 0);
+    builder.ins().jump(done, &[] as &[BlockArg]);
+    builder.switch_to_block(slow);
+    call_extern_value(builder, call_cache, symbol, params, ret, iargs);
+    builder.ins().jump(done, &[] as &[BlockArg]);
+    builder.switch_to_block(done);
+}
+
 fn lower_instr(
     module: &IrModule,
     func: &IrFunc,
@@ -864,6 +1101,22 @@ fn lower_instr(
                     (e.symbol.clone(), e.params.clone(), e.ret)
                 }
             };
+            if let Callee::Extern(_) = callee {
+                if try_inline_extern_call(
+                    plan,
+                    builder,
+                    frame,
+                    &name,
+                    &params,
+                    ret,
+                    &iargs,
+                    values,
+                    call_cache,
+                    *dst,
+                )? {
+                    return Ok(());
+                }
+            }
             let (s, gv) = extern_pair(builder, call_cache, &name, &params, ret);
             let addr = builder.ins().symbol_value(types::I64, gv);
             let inst = builder.ins().call_indirect(s, addr, &iargs);

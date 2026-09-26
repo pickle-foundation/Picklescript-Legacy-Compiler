@@ -145,12 +145,18 @@ impl Heap {
             let seg = self.segments;
             let room = (*seg).cap - (*seg).used;
             if size > room {
-                let new_cap = ((*seg).cap * 2).max(1 << 20).max(size);
-                // If size is enormous, just size it exactly; else cap at a sane max.
+                // Grow the arena in modest, bounded chunks. Unbounded doubling
+                // lets a churn-heavy workload with a modest live set grow a
+                // single segment to gigabytes before a failure to commit
+                // virtual memory; a cap keeps every segment allocation cheap
+                // and survivable. A giant single request still gets an exact
+                // (unbounded) segment.
+                const SEG_CAP_MAX: usize = 1 << 26; // 64 MiB
+                let grown = ((*seg).cap * 2).max(1 << 20).max(size);
                 let new_cap = if size >= (*seg).cap * 4 {
                     size
                 } else {
-                    new_cap
+                    grown.min(SEG_CAP_MAX)
                 };
                 let fresh = Segment::alloc(new_cap);
                 (*fresh).next = seg;
