@@ -13,8 +13,13 @@ use crate::object::{
 };
 use crate::shadow;
 use crate::trace;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(not(feature = "nostd"))]
 use std::sync::{Mutex, Once};
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, Once};
 
 /// `PKL_NO_AUTO_GC=1` suppresses automatic collections. It is read once, not
 /// per allocation: on Windows an environment probe costs ~190us, which would
@@ -24,10 +29,11 @@ static NO_AUTO_GC_INIT: Once = Once::new();
 
 fn no_auto_gc_once() -> bool {
     NO_AUTO_GC_INIT.call_once(|| {
-        NO_AUTO_GC.store(
-            std::env::var_os("PKL_NO_AUTO_GC").is_some(),
-            Ordering::Relaxed,
-        );
+        #[cfg(feature = "nostd")]
+        let present = crate::nostd::getenv_present("PKL_NO_AUTO_GC");
+        #[cfg(not(feature = "nostd"))]
+        let present = std::env::var_os("PKL_NO_AUTO_GC").is_some();
+        NO_AUTO_GC.store(present, Ordering::Relaxed);
     });
     NO_AUTO_GC.load(Ordering::Relaxed)
 }
@@ -55,6 +61,10 @@ pub const DEFAULT_AUTO_COLLECT_THRESHOLD: u32 = 8 * 1024 * 1024;
 
 /// Current auto-collect threshold, settable at runtime.
 static AUTO_THRESHOLD: AtomicU32 = AtomicU32::new(DEFAULT_AUTO_COLLECT_THRESHOLD);
+
+/// True once `pickle_gc_set_threshold` has been called: an explicit threshold
+/// is a fixed user policy and the adaptive post-collect adjustment is skipped.
+static AUTO_THRESHOLD_MANUAL: AtomicBool = AtomicBool::new(false);
 
 /// Total completed collection cycles (observability for tests).
 static COLLECTIONS: AtomicU32 = AtomicU32::new(0);
@@ -133,7 +143,7 @@ impl Gc {
     /// Class name of `class_id` (for printing/reflection), if registered.
     pub fn class_name(&self, class_id: u32) -> Option<&[u8]> {
         let d = self.descriptors.get(class_id)?;
-        unsafe { Some(std::slice::from_raw_parts(d.name_ptr, d.name_len as usize)) }
+        unsafe { Some(core::slice::from_raw_parts(d.name_ptr, d.name_len as usize)) }
     }
 
     /// Register a class descriptor; returns its class id (index).
@@ -382,7 +392,9 @@ impl Gc {
                 .load(Ordering::Relaxed)
                 .saturating_mul(2),
         );
-        AUTO_THRESHOLD.store(next.min(1 << 30), Ordering::Relaxed);
+        if !AUTO_THRESHOLD_MANUAL.load(Ordering::Relaxed) {
+            AUTO_THRESHOLD.store(next.min(1 << 30), Ordering::Relaxed);
+        }
     }
 
     /// Maybe collect if the allocation threshold has been crossed.
@@ -496,7 +508,7 @@ impl TempRootLease {
     fn release_inner(&mut self) {
         if !self.0.is_null() {
             gc_mut().temp_unroot(self.0);
-            self.0 = std::ptr::null_mut();
+            self.0 = core::ptr::null_mut();
         }
     }
 }
@@ -508,7 +520,7 @@ impl Drop for TempRootLease {
 }
 
 /// The process-global GC. Initialised by `pickle_runtime_init`.
-static mut GLOBAL_GC: *mut Gc = std::ptr::null_mut();
+static mut GLOBAL_GC: *mut Gc = core::ptr::null_mut();
 
 /// Whether the runtime has been initialised.
 pub fn is_initialized() -> bool {
@@ -520,6 +532,11 @@ pub fn is_initialized() -> bool {
 /// it, so the collector's single-mutator assumption holds no matter which OS
 /// thread is running compiled code.
 pub(crate) fn gc_mut() -> &'static mut Gc {
+    #[cfg(feature = "nostd")]
+    {
+        // Single-threaded freestanding build: no world lock to take.
+    }
+    #[cfg(not(feature = "nostd"))]
     crate::world::acquire();
     unsafe {
         assert!(!GLOBAL_GC.is_null(), "pickle runtime not initialised");
@@ -544,7 +561,7 @@ pub(crate) fn shutdown() {
         if !GLOBAL_GC.is_null() {
             let mut gc = Box::from_raw(GLOBAL_GC);
             gc.heap.destroy();
-            GLOBAL_GC = std::ptr::null_mut();
+            GLOBAL_GC = core::ptr::null_mut();
         }
     }
 }
@@ -575,7 +592,7 @@ pub extern "C" fn pickle_manual_free(obj: *mut PickleObject) {
 pub extern "C" fn pickle_gc_root_add(cell: *mut *mut PickleObject) -> *mut RootCell {
     let node = Box::into_raw(Box::new(RootCell {
         cell,
-        next: std::ptr::null_mut(),
+        next: core::ptr::null_mut(),
     }));
     STATIC_ROOTS.lock().unwrap().push(unsafe { &mut *node });
     node
@@ -590,7 +607,7 @@ pub extern "C" fn pickle_gc_root_drop(handle: *mut RootCell) {
     let mut list = STATIC_ROOTS.lock().unwrap();
     list.retain(|c| {
         let ptr = &**c as *const RootCell;
-        !std::ptr::eq(ptr, handle)
+        !core::ptr::eq(ptr, handle)
     });
     // SAFETY: handle came from `pickle_gc_root_add`.
     unsafe {
@@ -618,10 +635,12 @@ pub extern "C" fn pickle_gc_collection_count() -> u32 {
     COLLECTIONS.load(Ordering::Relaxed)
 }
 
-/// Set the auto-collect threshold in object bytes.
+/// Set the auto-collect threshold in object bytes. Once set explicitly the
+/// adaptive post-collect adjustment is disabled until the next reset.
 #[no_mangle]
 pub extern "C" fn pickle_gc_set_threshold(bytes: u32) {
     AUTO_THRESHOLD.store(bytes, Ordering::Relaxed);
+    AUTO_THRESHOLD_MANUAL.store(true, Ordering::Relaxed);
 }
 
 /// Reset the collector: counters, dropped root cells, heap teardown and a
@@ -633,6 +652,7 @@ pub(crate) fn reset() {
     ALLOC_SINCE_GC.store(0, Ordering::Relaxed);
     BYTES_SINCE_GC.store(0, Ordering::Relaxed);
     AUTO_THRESHOLD.store(DEFAULT_AUTO_COLLECT_THRESHOLD, Ordering::Relaxed);
+    AUTO_THRESHOLD_MANUAL.store(false, Ordering::Relaxed);
     COLLECTIONS.store(0, Ordering::Relaxed);
     // Drop roots left behind by the previous module (e.g. leaked static-field
     // cells) so they can never trace objects from a destroyed heap.
@@ -676,7 +696,7 @@ mod tests {
             flags: 0,
             slot_count: 0,
             mask_words: 0,
-            managed_mask: std::ptr::null(),
+            managed_mask: core::ptr::null(),
             finalizer: crate::object::builtin_nop_finalizer,
         })
     }
@@ -696,7 +716,7 @@ mod tests {
             flags: PICKLE_CLASS_FLAG_FINALIZER,
             slot_count: 0,
             mask_words: 0,
-            managed_mask: std::ptr::null(),
+            managed_mask: core::ptr::null(),
             finalizer: count_finalizer,
         })
     }
@@ -980,7 +1000,7 @@ mod tests {
             flags: 0,
             slot_count: 1,
             mask_words: 0,
-            managed_mask: std::ptr::null(),
+            managed_mask: core::ptr::null(),
             finalizer: crate::object::builtin_nop_finalizer,
         });
         gc.set_class_owned_mask(id, 0b1);

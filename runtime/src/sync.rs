@@ -187,29 +187,29 @@ impl PSem {
 
 /// A 64-bit atomic cell.
 pub struct PAtomic {
-    cell: std::sync::atomic::AtomicI64,
+    cell: core::sync::atomic::AtomicI64,
 }
 
 impl PAtomic {
     fn new(value: i64) -> Self {
         PAtomic {
-            cell: std::sync::atomic::AtomicI64::new(value),
+            cell: core::sync::atomic::AtomicI64::new(value),
         }
     }
 
     fn load(&self) -> i64 {
-        self.cell.load(std::sync::atomic::Ordering::Acquire)
+        self.cell.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn store(&self, value: i64) {
         self.cell
-            .store(value, std::sync::atomic::Ordering::Release);
+            .store(value, core::sync::atomic::Ordering::Release);
     }
 
     /// Add `delta`, returning the value from before the addition.
     fn add(&self, delta: i64) -> i64 {
         self.cell
-            .fetch_add(delta, std::sync::atomic::Ordering::AcqRel)
+            .fetch_add(delta, core::sync::atomic::Ordering::AcqRel)
     }
 
     /// Compare-and-swap, returning whether the swap happened.
@@ -218,8 +218,8 @@ impl PAtomic {
             .compare_exchange(
                 expected,
                 value,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
             )
             .is_ok()
     }
@@ -736,7 +736,7 @@ pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::Pi
     match channel_of(handle) {
         Some(c) => match c.try_recv() {
             Some(v) => crate::boxscalar::pickle_box_i64(v),
-            None => std::ptr::null_mut(),
+            None => core::ptr::null_mut(),
         },
         None => not_a(handle, "a channel"),
     }
@@ -764,7 +764,7 @@ pub extern "C" fn pickle_channel_closed(handle: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -784,7 +784,7 @@ mod tests {
                         if now > 1 {
                             overlap_ref.fetch_add(1, Ordering::AcqRel);
                         }
-                        std::hint::spin_loop();
+                        core::hint::spin_loop();
                         inside_ref.fetch_sub(1, Ordering::AcqRel);
                         m.unlock();
                     }

@@ -17,34 +17,36 @@
 //!   continue, so they must genuinely diverge: they print and exit, exactly as
 //!   a panic in a Go goroutine that never recovers does.
 
+use alloc::string::String;
+#[cfg(not(feature = "nostd"))]
 use std::io::Write;
 
 /// Fatal message prefix written to stderr.
 const FATAL: &[u8] = b"fatal: ";
 
 /// Capture mode: turn fatal panics into recoverable, recorded failures.
-static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAPTURE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
-    static LAST_PANIC: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+    static LAST_PANIC: core::cell::RefCell<Option<String>> =
+        const { core::cell::RefCell::new(None) };
     /// Whether this thread is a task body ([`crate::threads`]). Checked before
     /// [`CAPTURE`]: a task spawned from a running test inherits the harness'
     /// capture mode, but its failure belongs to the task, not to that test.
-    static TASK_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TASK_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// The message a task body recorded, waiting for its `join`.
-    static TASK_PANIC: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+    static TASK_PANIC: core::cell::RefCell<Option<String>> =
+        const { core::cell::RefCell::new(None) };
 }
 
 /// Whether panics are being captured for the test harness.
 pub fn is_capturing() -> bool {
-    CAPTURE.load(std::sync::atomic::Ordering::Relaxed)
+    CAPTURE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Enter/leave capture mode. Leaving also clears any captured message.
 pub fn set_capture_mode(capture: bool) {
-    CAPTURE.store(capture, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE.store(capture, core::sync::atomic::Ordering::Relaxed);
     if !capture {
         LAST_PANIC.with(|c| *c.borrow_mut() = None);
     }
@@ -59,6 +61,7 @@ pub fn take_captured_panic() -> Option<String> {
 /// a failing test body records a message instead of killing the process. Does
 /// not clear a pending message: a failure recorded before the begin (e.g. by
 /// a hook) must survive until the harness' `captureTake()`.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_test_capture_begin() {
     set_capture_mode(true);
@@ -67,6 +70,7 @@ pub extern "C" fn pickle_test_capture_begin() {
 /// ABI: `captureTake()` from the ported test harness. Exits nothing and
 /// returns the message of the most recent captured failure as a `string?`
 /// object (null when none), or null if capture is off.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_test_capture_take() -> *mut crate::object::PickleObject {
     if is_capturing() {
@@ -78,7 +82,7 @@ pub extern "C" fn pickle_test_capture_take() -> *mut crate::object::PickleObject
             );
         }
     }
-    std::ptr::null_mut()
+    core::ptr::null_mut()
 }
 
 fn record_panic(msg: String) {
@@ -132,18 +136,29 @@ pub fn record_recoverable(msg: impl Into<String>) -> bool {
     false
 }
 
-/// Write the fatal banner plus `msg` to stderr and exit 1. Used outside
-/// capture mode by `panic` and failing `assert`s in non-test code.
+/// Write the fatal banner plus `msg` and exit 1. Used outside capture mode
+/// by `panic` and failing `assert`s in non-test code.
 pub(crate) fn fatal(msg: &str) -> ! {
-    let stderr = std::io::stderr();
-    let mut lock = stderr.lock();
-    let _ = lock.write_all(FATAL);
-    let _ = lock.write_all(msg.as_bytes());
-    let _ = lock.write_all(b"\n");
-    let _ = lock.flush();
-    std::process::exit(1);
+    #[cfg(not(feature = "nostd"))]
+    {
+        let stderr = std::io::stderr();
+        let mut lock = stderr.lock();
+        let _ = lock.write_all(FATAL);
+        let _ = lock.write_all(msg.as_bytes());
+        let _ = lock.write_all(b"\n");
+        let _ = lock.flush();
+        std::process::exit(1);
+    }
+    #[cfg(feature = "nostd")]
+    {
+        crate::nostd::console_write(FATAL);
+        crate::nostd::console_write(msg.as_bytes());
+        crate::nostd::console_write(b"\n");
+        crate::nostd::exit(1);
+    }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
     if let Some(s) = info.payload().downcast_ref::<&str>() {
         s.to_string()
@@ -164,7 +179,7 @@ pub extern "C" fn pickle_panic_bytes(ptr: *const u8, len: usize) -> ! {
     let msg = if ptr.is_null() || len == 0 {
         String::new()
     } else {
-        unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).into_owned() }
+        unsafe { String::from_utf8_lossy(core::slice::from_raw_parts(ptr, len)).into_owned() }
     };
     if in_task_mode() {
         // Name the task in the message: the failing body is otherwise invisible
@@ -227,7 +242,7 @@ pub extern "C" fn pickle_panic_arity_diff() -> ! {
 /// `pickle test` can report a failing test without aborting the process.
 /// Under `cfg(test)` this is a no-op: the Rust test harness needs panics to
 /// unwind to report failures itself.
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "nostd")))]
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let msg = panic_text(info);
@@ -250,7 +265,12 @@ pub fn install_panic_hook() {
     }));
 }
 
-#[cfg(test)]
+/// No-op on a freestanding build: the `#[panic_handler]` in [`crate::nostd`]
+/// is the only panic path there.
+#[cfg(feature = "nostd")]
+pub fn install_panic_hook() {}
+
+#[cfg(all(test, not(feature = "nostd")))]
 pub fn install_panic_hook() {}
 
 #[cfg(test)]

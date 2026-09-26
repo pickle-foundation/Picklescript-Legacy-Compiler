@@ -33,7 +33,7 @@ fn require_capacity(gc: &mut Gc, list: *mut PickleObject, need: usize) {
         if !old_data.is_null() {
             let preserve = cap.min(new_cap) * 8;
             if preserve > 0 {
-                std::ptr::copy_nonoverlapping(old_data as *const u8, fresh, preserve);
+                core::ptr::copy_nonoverlapping(old_data as *const u8, fresh, preserve);
             }
             crate::heap::raw_free(old_data as *mut u8);
         }
@@ -56,7 +56,7 @@ pub fn list_new(cap: usize, gc: &mut Gc) -> *mut PickleObject {
 pub fn list_get(list: *const PickleObject, index: usize) -> *mut PickleObject {
     unsafe {
         if index >= list_len(list) {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         *list_data(list).add(index)
     }
@@ -86,7 +86,7 @@ pub fn list_pop(list: *mut PickleObject) -> *mut PickleObject {
     unsafe {
         let n = list_len(list);
         if n == 0 {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         let v = *list_data(list).add(n - 1);
         list_set_len(list, n - 1);

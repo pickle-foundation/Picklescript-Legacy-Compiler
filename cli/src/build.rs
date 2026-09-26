@@ -274,6 +274,8 @@ pub fn link_object(
         .arg("2021")
         .arg("-C")
         .arg("opt-level=2")
+        .arg("-C")
+        .arg("panic=abort")
         .arg(format!("--extern=pickle_runtime={}", rlib.display()))
         .arg("-C")
         .arg(format!("link-arg={}", obj_path.display()))

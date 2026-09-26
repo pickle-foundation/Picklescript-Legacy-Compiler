@@ -27,6 +27,11 @@ fn new_box(class_id: u32, bits: i64) -> *mut PickleObject {
     unsafe {
         *payload(obj) = bits;
     }
+    #[cfg(feature = "nostd")]
+    if crate::nostd::getenv_present("PKL_GC_TRACE") {
+        eprintln!("GCBOX + {:p} class={} bits={}", obj, class_id, bits);
+    }
+    #[cfg(not(feature = "nostd"))]
     if std::env::var_os("PKL_GC_TRACE").is_some() {
         eprintln!("GCBOX + {:p} class={} bits={}", obj, class_id, bits);
     }
@@ -75,6 +80,11 @@ pub(crate) fn unbox_bits(obj: *const PickleObject, what: &str) -> i64 {
     if obj.is_null() {
         panic!("pickle: cannot unbox null as {what}");
     }
+    #[cfg(feature = "nostd")]
+    if crate::nostd::getenv_present("PKL_GC_TRACE") {
+        eprintln!("GCBOX ! unbox {:p} as {}", obj, what);
+    }
+    #[cfg(not(feature = "nostd"))]
     if std::env::var_os("PKL_GC_TRACE").is_some() {
         eprintln!("GCBOX ! unbox {:p} as {}", obj, what);
     }
@@ -169,7 +179,7 @@ mod tests {
 
     #[test]
     fn unbox_null_panics() {
-        let err = std::panic::catch_unwind(|| unbox_bits(std::ptr::null(), "int"));
+        let err = std::panic::catch_unwind(|| unbox_bits(core::ptr::null(), "int"));
         assert!(err.is_err());
     }
 }

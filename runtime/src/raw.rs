@@ -6,9 +6,9 @@
 //! not a safety mechanism (a dangling pointer used before `free` is unchecked,
 //! exactly like C).
 
-use std::alloc::{alloc, dealloc, Layout};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use alloc::alloc::{alloc, dealloc, Layout};
+use core::cell::RefCell;
+use alloc::collections::BTreeMap;
 
 /// Alignment for every raw block. Covers all scalar sizes (1..=8) and any
 /// future pointer payloads, and keeps every element naturally aligned.
@@ -16,7 +16,7 @@ const ALIGN: usize = 8;
 
 // ptr -> allocation size, so `free` can rebuild the exact `Layout`.
 thread_local! {
-    static LIVE: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    static LIVE: RefCell<BTreeMap<usize, usize>> = RefCell::new(BTreeMap::new());
 }
 
 /// Allocate `size` raw bytes. Returns the block address (a `*T` in Pk code).

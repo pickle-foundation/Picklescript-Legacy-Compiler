@@ -8,11 +8,11 @@ use crate::object::PickleObject;
 use crate::strings::{string_bytes_len, string_bytes_ptr, string_from_bytes};
 
 pub(crate) fn path_bytes(path: *const PickleObject) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts(string_bytes_ptr(path), string_bytes_len(path)) }
+    unsafe { core::slice::from_raw_parts(string_bytes_ptr(path), string_bytes_len(path)) }
 }
 
 pub(crate) fn path_of(path: *const PickleObject) -> &'static std::path::Path {
-    std::path::Path::new(std::str::from_utf8(path_bytes(path)).unwrap_or(""))
+    std::path::Path::new(core::str::from_utf8(path_bytes(path)).unwrap_or(""))
 }
 
 /// Read a whole file as a `string`. Strings are opaque UTF-8 byte arrays, so
@@ -25,7 +25,7 @@ pub extern "C" fn pickle_read_file(path: *const PickleObject) -> *mut PickleObje
             let gc = crate::gc::gc_mut();
             string_from_bytes(data.as_ptr(), data.len(), gc)
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
@@ -65,7 +65,7 @@ pub extern "C" fn pickle_list_dir(path: *const PickleObject) -> *mut PickleObjec
     let _lease = gc.temp_lease(l);
     let entries = match std::fs::read_dir(path_of(path)) {
         Ok(read) => read,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return core::ptr::null_mut(),
     };
     for entry in entries.flatten() {
         let p = entry.path();

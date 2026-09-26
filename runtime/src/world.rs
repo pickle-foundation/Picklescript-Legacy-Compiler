@@ -25,8 +25,8 @@
 //! [`parked`](parked) helper is the API for that and hand-written blocking
 //! helpers must use it.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// Owner sentinel for "the world lock is free". Thread ids start at 1 so the
@@ -187,7 +187,7 @@ pub fn contended() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use core::sync::atomic::AtomicUsize;
 
     #[test]
     fn same_thread_reacquire_is_cheap_and_idempotent() {
@@ -235,7 +235,7 @@ mod tests {
                     }
                     assert!(held_by_current_thread());
                     for _ in 0..50 {
-                        std::hint::spin_loop();
+                        core::hint::spin_loop();
                     }
                     inside_ref.fetch_sub(1, Ordering::AcqRel);
                     release();

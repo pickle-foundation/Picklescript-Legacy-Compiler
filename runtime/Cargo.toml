@@ -10,5 +10,6 @@ crate-type = ["staticlib", "lib"]
 [features]
 default = []
 entry = []
+nostd = []
 
 [dependencies]

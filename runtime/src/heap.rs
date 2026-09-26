@@ -6,7 +6,8 @@
 //! memory layout, allocation, and sweeping.
 
 use crate::object::PickleObject;
-use std::alloc::{dealloc, Layout};
+use alloc::alloc::{dealloc, Layout};
+use alloc::vec::Vec;
 
 /// Minimum object size (header + one aligned slot), also the smallest bin.
 pub const MIN_OBJECT: usize = 32;
@@ -14,6 +15,17 @@ pub const MIN_OBJECT: usize = 32;
 pub const NBINS: usize = 28;
 
 const FREE_SENTINEL: u32 = 0xDEAD;
+
+fn gc_trace_env() -> bool {
+    #[cfg(feature = "nostd")]
+    {
+        crate::nostd::getenv_present("PKL_GC_TRACE")
+    }
+    #[cfg(not(feature = "nostd"))]
+    {
+        std::env::var_os("PKL_GC_TRACE").is_some()
+    }
+}
 
 #[repr(C)]
 struct Segment {
@@ -26,17 +38,17 @@ struct Segment {
     data_offset: usize,
 }
 
-const DATA_OFFSET: usize = std::mem::size_of::<Segment>();
+const DATA_OFFSET: usize = core::mem::size_of::<Segment>();
 
 impl Segment {
     fn alloc(cap: usize) -> *mut Segment {
         let total = DATA_OFFSET + cap;
         unsafe {
             let layout = Layout::from_size_align(total, 16).unwrap();
-            let mem = std::alloc::alloc(layout);
+            let mem = alloc::alloc::alloc(layout);
             assert!(!mem.is_null(), "pickle: out of virtual memory");
             let seg = mem as *mut Segment;
-            (*seg).next = std::ptr::null_mut();
+            (*seg).next = core::ptr::null_mut();
             (*seg).cap = cap;
             (*seg).used = 0;
             (*seg).data_offset = DATA_OFFSET;
@@ -79,7 +91,7 @@ impl Heap {
         let first = Segment::alloc(1 << 20);
         Heap {
             segments: first,
-            free_heads: vec![std::ptr::null_mut(); NBINS],
+            free_heads: vec![core::ptr::null_mut(); NBINS],
         }
     }
 
@@ -101,7 +113,7 @@ impl Heap {
         // dead list/string objects fill the shared size bins. capping the scan
         // keeps every allocation O(1) regardless of chain composition.
         const MAX_SCAN: usize = 8;
-        let mut prev: *mut PickleObject = std::ptr::null_mut();
+        let mut prev: *mut PickleObject = core::ptr::null_mut();
         let mut scanned: usize = 0;
         for idx in bin_of(size)..NBINS {
             let mut cur = self.free_heads[idx];
@@ -135,7 +147,7 @@ impl Heap {
                     cur = (*cur).next;
                 }
             }
-            prev = std::ptr::null_mut();
+            prev = core::ptr::null_mut();
         }
         None
     }
@@ -187,7 +199,7 @@ impl Heap {
         let total = 8 + n + 8;
         unsafe {
             let layout = Layout::from_size_align(total, 8).unwrap();
-            let mem = std::alloc::alloc(layout);
+            let mem = alloc::alloc::alloc(layout);
             assert!(!mem.is_null(), "pickle: out of memory");
             (mem as *mut usize).write(n);
             mem.add(8)
@@ -198,7 +210,7 @@ impl Heap {
     pub fn raw_realloc(&mut self, ptr: *mut u8, new_n: usize, preserve: usize) -> *mut u8 {
         let fresh = self.raw_alloc(new_n);
         unsafe {
-            std::ptr::copy_nonoverlapping(ptr, fresh, preserve.min(new_n));
+            core::ptr::copy_nonoverlapping(ptr, fresh, preserve.min(new_n));
             raw_free(ptr);
         }
         fresh
@@ -249,7 +261,7 @@ impl Heap {
                 let start = (*seg).data_base();
                 let top = start.add((*seg).used);
                 let mut cur = start;
-                let mut dead_start: *mut u8 = std::ptr::null_mut();
+                let mut dead_start: *mut u8 = core::ptr::null_mut();
                 let mut dead_len: usize = 0;
 
                 let flush = |heap: &mut Heap, dead_start: *mut u8, dead_len: usize| {
@@ -260,7 +272,7 @@ impl Heap {
                 let flush_dead =
                     |heap: &mut Heap, dead_start: &mut *mut u8, dead_len: &mut usize| {
                         flush(heap, *dead_start, *dead_len);
-                        *dead_start = std::ptr::null_mut();
+                        *dead_start = core::ptr::null_mut();
                         *dead_len = 0;
                     };
 
@@ -283,12 +295,12 @@ impl Heap {
                             flush_dead(self, &mut dead_start, &mut dead_len);
                             deferred.push(obj);
                         } else {
-                            if std::env::var_os("PKL_GC_TRACE").is_some()
+                            if gc_trace_env()
                                 && (*obj).class_id == crate::object::PICKLE_CLASS_BOX_INT
                             {
                                 eprintln!("GCBOX - {:p} swept", obj);
                             }
-                            if std::env::var_os("PKL_GC_TRACE").is_some() {
+                            if gc_trace_env() {
                                 let cid = (*obj).class_id;
                                 if cid == crate::object::PICKLE_CLASS_LIST
                                     || cid == crate::object::PICKLE_CLASS_MAP
@@ -327,8 +339,8 @@ impl Heap {
                 Segment::dealloc(seg);
                 seg = next;
             }
-            self.segments = std::ptr::null_mut();
-            self.free_heads = vec![std::ptr::null_mut(); NBINS];
+            self.segments = core::ptr::null_mut();
+            self.free_heads = vec![core::ptr::null_mut(); NBINS];
         }
     }
 }

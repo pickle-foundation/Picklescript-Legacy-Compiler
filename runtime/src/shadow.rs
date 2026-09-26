@@ -6,6 +6,7 @@
 //! epilogue. The collector treats every registered thread's frame slots as
 //! roots.
 
+use alloc::boxed::Box;
 use crate::object::PickleObject;
 
 /// Layout of a shadow frame. Slots follow the header inline:
@@ -45,25 +46,34 @@ pub struct GcThread {
 /// and each node's frame list. The collector takes it for the whole walk so a
 /// concurrent `register_thread`/`unregister_thread`/`pickle_shadow_push` cannot
 /// free or mutate a node while it is being traced.
-static REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(not(feature = "nostd"))]
+use std::sync::{Mutex, MutexGuard};
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, MutexGuard};
+
+/// Serialises mutations of and walks over the thread registry (`THREAD_HEAD`)
+/// and each node's frame list. The collector takes it for the whole walk so a
+/// concurrent `register_thread`/`unregister_thread`/`pickle_shadow_push` cannot
+/// free or mutate a node while it is being traced.
+static REGISTRY: Mutex<()> = Mutex::new(());
 
 /// Flat registry of threads; also the intrusive list of `GcThread` nodes.
-static mut THREAD_HEAD: *mut GcThread = std::ptr::null_mut();
+static mut THREAD_HEAD: *mut GcThread = core::ptr::null_mut();
 /// Id handed to the next thread that registers. Ids start at 1 so that 0 can
 /// mean "no thread" to callers of `pickle_gc_register_thread`/`pickle_thread_current`,
 /// which report 0 for an unregistered thread.
-static THREAD_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static THREAD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 /// Lock the thread registry for mutation or traversal. Returns the guard;
 /// hold it for the duration of any operation that touches `THREAD_HEAD` or a
 /// node's `frames` list.
-pub(crate) fn lock_registry() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn lock_registry() -> MutexGuard<'static, ()> {
     REGISTRY.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-std::thread_local! {
+thread_local! {
     /// Thread-local handle into the registry (null until registered).
-    static CURRENT_THREAD: std::cell::Cell<*mut GcThread> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static CURRENT_THREAD: core::cell::Cell<*mut GcThread> = const { core::cell::Cell::new(core::ptr::null_mut()) };
 }
 
 fn assert_ptr_empty(p: *mut u8, len: usize) {
@@ -120,7 +130,7 @@ pub fn register_thread() -> *mut GcThread {
 
 /// Insert `node` into the registry under the already-held registry guard.
 /// Does not touch the thread-local handle (that is the caller's job).
-fn insert_thread_locked(_guard: &std::sync::MutexGuard<'static, ()>, node: *mut GcThread) {
+fn insert_thread_locked(_guard: &MutexGuard<'static, ()>, node: *mut GcThread) {
     unsafe {
         (*node).next = THREAD_HEAD;
         THREAD_HEAD = node;
@@ -129,15 +139,15 @@ fn insert_thread_locked(_guard: &std::sync::MutexGuard<'static, ()>, node: *mut 
 
 /// Ensure the current thread is registered, assuming the registry guard is held.
 /// Returns the thread's `GcThread` node (thread-local, so no lock needed to read).
-fn ensure_registered_locked(guard: &std::sync::MutexGuard<'static, ()>) -> *mut GcThread {
+fn ensure_registered_locked(guard: &MutexGuard<'static, ()>) -> *mut GcThread {
     let existing = current_thread();
     if !existing.is_null() {
         return existing;
     }
     let node = Box::into_raw(Box::new(GcThread {
-        frames: std::ptr::null_mut(),
-        id: THREAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-        next: std::ptr::null_mut(),
+        frames: core::ptr::null_mut(),
+        id: THREAD_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst),
+        next: core::ptr::null_mut(),
     }));
     insert_thread_locked(guard, node);
     CURRENT_THREAD.with(|c| c.set(node));
@@ -149,7 +159,7 @@ pub fn unregister_thread(node: *mut GcThread) {
     let _guard = lock_registry();
     unsafe {
         let mut cur = THREAD_HEAD;
-        let mut prev: *mut GcThread = std::ptr::null_mut();
+        let mut prev: *mut GcThread = core::ptr::null_mut();
         while !cur.is_null() {
             if cur == node {
                 if prev.is_null() {
@@ -163,7 +173,7 @@ pub fn unregister_thread(node: *mut GcThread) {
             cur = (*cur).next;
         }
         // Detach local TLS, then drop the node.
-        CURRENT_THREAD.with(|c| c.set(std::ptr::null_mut()));
+        CURRENT_THREAD.with(|c| c.set(core::ptr::null_mut()));
         drop(Box::from_raw(node));
     }
 }
@@ -191,7 +201,7 @@ fn pop_frame(frame: *mut ShadowFrame) {
         let thread = ensure_registered_locked(&_guard);
         assert_eq!((*thread).frames, frame, "shadow stack pop out of order");
         (*thread).frames = (*frame).prev;
-        (*frame).prev = std::ptr::null_mut();
+        (*frame).prev = core::ptr::null_mut();
     }
 }
 
@@ -249,7 +259,7 @@ mod tests {
 
     #[test]
     fn frame_is_16_byte_header() {
-        assert_eq!(std::mem::size_of::<ShadowFrame>(), 16);
+        assert_eq!(core::mem::size_of::<ShadowFrame>(), 16);
     }
 
     #[test]
@@ -261,7 +271,7 @@ mod tests {
         let _guard = crate::gc::test_begin();
         register_thread();
         let mut frame = ShadowFrame {
-            prev: std::ptr::null_mut(),
+            prev: core::ptr::null_mut(),
             slot_count: 2,
             _pad: 0,
         };

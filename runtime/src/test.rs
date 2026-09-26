@@ -89,7 +89,7 @@ pub extern "C" fn pickle_test_register_hooks(table: *const PickleHook, count: u3
             let group = if h.group.is_null() {
                 String::new()
             } else {
-                let bytes = std::slice::from_raw_parts(h.group, h.group_len as usize);
+                let bytes = core::slice::from_raw_parts(h.group, h.group_len as usize);
                 String::from_utf8_lossy(bytes).into_owned()
             };
             hooks.push(RegisteredHook {
@@ -126,7 +126,7 @@ pub extern "C" fn pickle_test_fail_obj(obj: *const crate::object::PickleObject) 
     } else {
         let bytes = crate::strings::string_bytes_ptr(obj);
         let len = crate::strings::string_bytes_len(obj);
-        unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(bytes, len)).into_owned() }
+        unsafe { String::from_utf8_lossy(core::slice::from_raw_parts(bytes, len)).into_owned() }
     };
     if crate::panic::record_recoverable(msg.clone()) {
         return;
@@ -183,7 +183,7 @@ pub extern "C" fn pickle_expect_obj_eq(
             );
             // SAFETY: both slices come straight from managed string payloads.
             let eq =
-                unsafe { std::slice::from_raw_parts(pa, la) == std::slice::from_raw_parts(pb, lb) };
+                unsafe { core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb) };
             eq as i32
         }
         (PICKLE_CLASS_LIST, PICKLE_CLASS_LIST) => {
@@ -228,8 +228,8 @@ pub extern "C" fn pickle_expect_str_contains(
     if ln > lh {
         return 0;
     }
-    let h = unsafe { std::slice::from_raw_parts(ph, lh) };
-    let n = unsafe { std::slice::from_raw_parts(pn, ln) };
+    let h = unsafe { core::slice::from_raw_parts(ph, lh) };
+    let n = unsafe { core::slice::from_raw_parts(pn, ln) };
     if n.is_empty() {
         return 1;
     }
@@ -335,7 +335,7 @@ fn test_name(t: &PickleTest) -> String {
         "<unnamed>".to_string()
     } else {
         unsafe {
-            String::from_utf8_lossy(std::slice::from_raw_parts(t.name, t.name_len as usize))
+            String::from_utf8_lossy(core::slice::from_raw_parts(t.name, t.name_len as usize))
                 .into_owned()
         }
     }
@@ -429,14 +429,14 @@ mod tests {
     extern "C" fn pass() {}
 
     extern "C" fn fail_assert() {
-        pickle_test_fail_obj(std::ptr::null());
+        pickle_test_fail_obj(core::ptr::null());
     }
 
-    static MSG: std::sync::atomic::AtomicPtr<crate::object::PickleObject> =
-        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    static MSG: core::sync::atomic::AtomicPtr<crate::object::PickleObject> =
+        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
     extern "C" fn fail_msg() {
-        let obj = MSG.load(std::sync::atomic::Ordering::Relaxed);
+        let obj = MSG.load(core::sync::atomic::Ordering::Relaxed);
         pickle_test_fail_obj(obj);
     }
 
@@ -488,7 +488,7 @@ mod tests {
         let _guard = crate::gc::test_begin();
         capture_start();
         let s = crate::strings::string_from_bytes(b"nope".as_ptr(), 4, crate::gc::gc_mut());
-        MSG.store(s, std::sync::atomic::Ordering::Relaxed);
+        MSG.store(s, core::sync::atomic::Ordering::Relaxed);
         let table = [
             PickleTest {
                 name: b"ok\0".as_ptr(),

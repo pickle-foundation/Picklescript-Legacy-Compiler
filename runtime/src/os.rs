@@ -45,7 +45,7 @@ pub unsafe extern "C" fn pickle_args_set(argc: usize, argv: *const *const u8) {
                 len += 1;
             }
         }
-        let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+        let bytes = unsafe { core::slice::from_raw_parts(p, len) };
         stored.push(bytes.to_vec());
     }
 }

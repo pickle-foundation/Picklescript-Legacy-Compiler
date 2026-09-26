@@ -16,7 +16,8 @@
 //! The payload begins immediately after the header at a stable position that
 //! is 8-byte aligned (24 = 3 * 8).
 
-use std::ffi::c_void;
+use alloc::vec::Vec;
+use core::ffi::c_void;
 
 /// Class ids for builtin types. User classes emitted by the compiler start at
 /// `PICKLE_CLASS_USER_BASE`.
@@ -76,7 +77,7 @@ const HEADER_BYTES: usize = 24;
 /// Tombstone sentinel used for removed map keys. Never heap-allocated and
 /// never swept; its address is a stable "removed" marker.
 pub static NIL_SENTINEL: PickleObjectHeader = PickleObjectHeader {
-    next: std::ptr::null_mut(),
+    next: core::ptr::null_mut(),
     class_id: PICKLE_CLASS_STRING,
     flags: 0,
     size: 0,
@@ -95,7 +96,7 @@ pub const fn nil_sentinel() -> *const PickleObjectHeader {
 /// (and hash/equality treat the sentinel exactly like null). Never
 /// heap-allocated and never swept.
 pub static NONE_KEY: PickleObjectHeader = PickleObjectHeader {
-    next: std::ptr::null_mut(),
+    next: core::ptr::null_mut(),
     class_id: PICKLE_CLASS_STRING,
     flags: 0,
     size: 0,
@@ -115,7 +116,7 @@ pub const fn pickle_header_size() -> usize {
 impl PickleObjectHeader {
     /// Create a fresh header; `size` must be >= header and a multiple of 8.
     pub fn init(&mut self, class_id: u32, size: u32) {
-        self.next = std::ptr::null_mut();
+        self.next = core::ptr::null_mut();
         self.class_id = class_id;
         self.flags = 0;
         self.size = size;
@@ -244,7 +245,7 @@ pub const STRING_DESCRIPTOR: ClassDescriptor = ClassDescriptor {
     flags: 0,
     slot_count: 0,
     mask_words: 0,
-    managed_mask: std::ptr::null(),
+    managed_mask: core::ptr::null(),
     finalizer: builtin_nop_finalizer,
 };
 
@@ -256,13 +257,13 @@ mod tests {
 
     #[test]
     fn header_is_24_bytes() {
-        assert_eq!(std::mem::size_of::<PickleObjectHeader>(), 24);
+        assert_eq!(core::mem::size_of::<PickleObjectHeader>(), 24);
     }
 
     #[test]
     fn payload_offset_is_24() {
         let mut obj: PickleObjectHeader = PickleObjectHeader {
-            next: std::ptr::null_mut(),
+            next: core::ptr::null_mut(),
             class_id: 0,
             flags: 0,
             size: 32,
@@ -275,7 +276,7 @@ mod tests {
     #[test]
     fn marker_roundtrip() {
         let mut obj: PickleObjectHeader = PickleObjectHeader {
-            next: std::ptr::null_mut(),
+            next: core::ptr::null_mut(),
             class_id: 0,
             flags: 0,
             size: 32,

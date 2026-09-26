@@ -32,7 +32,7 @@ pub(crate) fn enum_init(obj: *mut PickleObject, tag: i64, field_count: usize) {
         if field_count > 0 {
             let size = enum_object_size(field_count);
             let fields = (obj as *mut u8).add(ENUM_FIELDS_OFF);
-            std::ptr::write_bytes(fields, 0, size - ENUM_FIELDS_OFF);
+            core::ptr::write_bytes(fields, 0, size - ENUM_FIELDS_OFF);
         }
     }
 }
@@ -52,7 +52,7 @@ pub fn enum_set_field(obj: *mut PickleObject, index: usize, value: *mut PickleOb
 pub fn enum_field(obj: *const PickleObject, index: usize) -> *mut PickleObject {
     unsafe {
         if index >= enum_field_count(obj) {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         let base = (*obj).payload() as *const *mut PickleObject;
         base.add(1 + index).read()
@@ -110,7 +110,7 @@ pub extern "C" fn pickle_enum_field(obj: *const PickleObject, index: usize) -> *
 /// instances, lists, maps, tuples, options, ...) by pointer identity.
 #[no_mangle]
 pub extern "C" fn pickle_enum_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
-    if std::ptr::eq(a, b) {
+    if core::ptr::eq(a, b) {
         return true;
     }
     if a.is_null() || b.is_null() {
@@ -137,7 +137,7 @@ pub extern "C" fn pickle_enum_eq(a: *const PickleObject, b: *const PickleObject)
 
 /// Equality of a single managed payload slot, used by `pickle_enum_eq`.
 fn enum_field_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
-    if std::ptr::eq(a, b) {
+    if core::ptr::eq(a, b) {
         return true;
     }
     if a.is_null() || b.is_null() {
@@ -199,7 +199,7 @@ mod tests {
             let size = crate::layout::enum_object_size(3);
             let e = gc.alloc(size as u32, PICKLE_CLASS_ENUM);
             let fields = (e as *mut u8).add(ENUM_FIELDS_OFF);
-            std::ptr::write_bytes(fields, 0xAB, size - ENUM_FIELDS_OFF);
+            core::ptr::write_bytes(fields, 0xAB, size - ENUM_FIELDS_OFF);
             enum_init(e, 7, 3);
             assert_eq!(enum_tag_of(e), 7);
             for i in 0..3 {
@@ -334,8 +334,8 @@ mod tests {
         let _guard = setup();
         let gc = crate::gc::gc_mut();
         let e = enum_new(0, 1, gc);
-        assert!(!pickle_enum_eq(e, std::ptr::null_mut()));
-        assert!(!pickle_enum_eq(std::ptr::null_mut(), e));
+        assert!(!pickle_enum_eq(e, core::ptr::null_mut()));
+        assert!(!pickle_enum_eq(core::ptr::null_mut(), e));
         // A non-enum managed object is never equal to an enum.
         let s = crate::strings::pickle_str_from_bytes("x".as_ptr(), 1) as *const PickleObject;
         assert!(!pickle_enum_eq(e, s));

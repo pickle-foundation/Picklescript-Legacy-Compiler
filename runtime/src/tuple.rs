@@ -29,7 +29,7 @@ pub(crate) fn tuple_init(obj: *mut PickleObject, field_count: usize) {
         if field_count > 0 {
             let size = tuple_object_size(field_count);
             let fields = (obj as *mut u8).add(TUPLE_FIELDS_OFF);
-            std::ptr::write_bytes(fields, 0, size - TUPLE_FIELDS_OFF);
+            core::ptr::write_bytes(fields, 0, size - TUPLE_FIELDS_OFF);
         }
     }
 }
@@ -49,7 +49,7 @@ pub fn tuple_set_field(obj: *mut PickleObject, index: usize, value: *mut PickleO
 pub fn tuple_field(obj: *const PickleObject, index: usize) -> *mut PickleObject {
     unsafe {
         if index >= tuple_field_count(obj) {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         let base = (*obj).payload() as *const *mut PickleObject;
         base.add(1 + index).read()
@@ -135,7 +135,7 @@ mod tests {
             let size = crate::layout::tuple_object_size(3);
             let t = gc.alloc(size as u32, PICKLE_CLASS_TUPLE);
             let fields = (t as *mut u8).add(TUPLE_FIELDS_OFF);
-            std::ptr::write_bytes(fields, 0xAB, size - TUPLE_FIELDS_OFF);
+            core::ptr::write_bytes(fields, 0xAB, size - TUPLE_FIELDS_OFF);
             tuple_init(t, 3);
             assert_eq!(tuple_len_of(t), 3);
             for i in 0..3 {

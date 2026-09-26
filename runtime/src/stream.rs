@@ -64,7 +64,7 @@ pub extern "C" fn pickle_stream_open_read(path: *const PickleObject) -> *mut Pic
             closed: false,
             target: Some(StreamTarget::Reader(BufReader::new(file))),
         }),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
@@ -77,7 +77,7 @@ pub extern "C" fn pickle_stream_open_write(path: *const PickleObject) -> *mut Pi
             closed: false,
             target: Some(StreamTarget::Writer(BufWriter::new(file))),
         }),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
@@ -94,7 +94,7 @@ pub extern "C" fn pickle_stream_open_append(path: *const PickleObject) -> *mut P
             closed: false,
             target: Some(StreamTarget::Writer(BufWriter::new(file))),
         }),
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
@@ -123,20 +123,20 @@ pub extern "C" fn pickle_stderr_stream() -> *mut PickleObject {
 #[no_mangle]
 pub extern "C" fn pickle_stream_read(stream: *mut PickleObject, n: i64) -> *mut PickleObject {
     if stream.is_null() {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let inner = unsafe { &mut *inner_of(stream) };
     if inner.closed {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let cap = usize::try_from(n).unwrap_or(0);
     let mut buf = vec![0u8; cap];
     let got = match &mut inner.target {
         Some(StreamTarget::Reader(r)) => r.read(&mut buf).unwrap_or(0),
-        _ => return std::ptr::null_mut(),
+        _ => return core::ptr::null_mut(),
     };
     if got == 0 {
-        return std::ptr::null_mut(); // end of stream
+        return core::ptr::null_mut(); // end of stream
     }
     let gc = crate::gc::gc_mut();
     let l = crate::list::list_new(got, gc);
@@ -256,15 +256,15 @@ pub extern "C" fn pickle_stream_close(stream: *mut PickleObject) -> bool {
 /// when `stream` is not a live process handle.
 pub(crate) fn proc_inner_mut(stream: *mut PickleObject) -> *mut crate::process::ProcInner {
     if stream.is_null() {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let inner = unsafe { &mut *inner_of(stream) };
     if inner.closed {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     match &mut inner.target {
         Some(StreamTarget::Proc(p)) => p.as_mut(),
-        _ => std::ptr::null_mut(),
+        _ => core::ptr::null_mut(),
     }
 }
 

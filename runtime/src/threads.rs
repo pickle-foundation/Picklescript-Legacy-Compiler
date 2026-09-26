@@ -78,7 +78,7 @@ pub(crate) fn call_closure0(closure: *mut PickleObject) {
     // Slot 0 of a closure object is the boxed i64 address of its hoisted body
     // (see `closure_obj` in the emitter).
     let addr = crate::boxscalar::box_bits(crate::class::pickle_obj_slot_get(closure, 0));
-    let entry: TaskFn = unsafe { std::mem::transmute(addr as usize) };
+    let entry: TaskFn = unsafe { core::mem::transmute(addr as usize) };
     unsafe { entry(closure) };
 }
 
@@ -95,7 +95,7 @@ impl TaskFrame {
     fn new(env: *mut PickleObject) -> Self {
         TaskFrame {
             header: ShadowFrame {
-                prev: std::ptr::null_mut(),
+                prev: core::ptr::null_mut(),
                 slot_count: 1,
                 _pad: 0,
             },
@@ -132,7 +132,7 @@ pub extern "C" fn pickle_thread_spawn(body: *mut PickleObject) -> i64 {
         (tasks.len() - 1) as i64
     };
     let addr = crate::boxscalar::box_bits(crate::class::pickle_obj_slot_get(body, 0));
-    let entry: TaskFn = unsafe { std::mem::transmute(addr as usize) };
+    let entry: TaskFn = unsafe { core::mem::transmute(addr as usize) };
     let worker = TaskRunner {
         state,
         entry,
@@ -279,14 +279,14 @@ pub extern "C" fn pickle_thread_finished(handle: i64) -> bool {
 #[no_mangle]
 pub extern "C" fn pickle_thread_panic_message(handle: i64) -> *mut PickleObject {
     let Some(state) = task_state(handle) else {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     };
     let (finished, panicked, message) = state.peek();
     if !finished || !panicked {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let Some(message) = message else {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     };
     crate::strings::string_from_bytes(message.as_bytes().as_ptr(), message.len(), crate::gc::gc_mut())
 }
@@ -369,7 +369,7 @@ pub(crate) fn drain() {
 mod tests {
     use super::*;
     use crate::gc;
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     /// A closure object exactly as the emitter builds one: a one-slot class
     /// instance whose slot 0 is the boxed address of the body. Enough to drive
@@ -383,7 +383,7 @@ mod tests {
                 flags: 0,
                 slot_count: 1,
                 mask_words: 0,
-                managed_mask: std::ptr::null(),
+                managed_mask: core::ptr::null(),
                 finalizer: crate::object::builtin_nop_finalizer,
             })
         };
@@ -475,7 +475,7 @@ mod tests {
             // `assert(false, ...)` in a task: recorded, the body carries on, and
             // `join` reports the failure. The continuation is the point — a
             // task that died mid-body could not be joined at all.
-            crate::test::pickle_test_fail_obj(std::ptr::null());
+            crate::test::pickle_test_fail_obj(core::ptr::null());
             REACHED_END.store(1, Ordering::Release);
         }
 
@@ -489,7 +489,7 @@ mod tests {
         assert!(!message.is_null(), "the failure message survives");
         let bytes = crate::strings::string_bytes_ptr(message);
         let len = crate::strings::string_bytes_len(message);
-        let text = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(bytes, len)) };
+        let text = unsafe { String::from_utf8_lossy(core::slice::from_raw_parts(bytes, len)) };
         assert!(text.contains("assertion failed"), "got {text:?}");
     }
 
@@ -502,7 +502,7 @@ mod tests {
         crate::panic::set_capture_mode(true);
         static FAILED: AtomicUsize = AtomicUsize::new(0);
         extern "C" fn failing(_env: *mut PickleObject) {
-            crate::test::pickle_test_fail_obj(std::ptr::null());
+            crate::test::pickle_test_fail_obj(core::ptr::null());
             FAILED.store(1, Ordering::Release);
         }
         FAILED.store(0, Ordering::Release);

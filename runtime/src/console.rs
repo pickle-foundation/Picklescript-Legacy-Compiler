@@ -2,18 +2,20 @@
 //! simple builtins. The compiler emits calls to these primitives; richer
 //! formatting is left to `std.text` later.
 
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use crate::layout::{enum_tag, list_len, map_len, str_bytes, str_len, tuple_field_count};
 use crate::object::{
     PickleObject, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR, PICKLE_CLASS_BOX_FLOAT,
     PICKLE_CLASS_BOX_INT, PICKLE_CLASS_ENUM, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP,
     PICKLE_CLASS_STRING, PICKLE_CLASS_TUPLE,
 };
-#[cfg(not(test))]
+#[cfg(all(not(test), not(feature = "nostd")))]
 use std::io::Write;
 
 #[cfg(test)]
 pub(crate) mod testio {
-    use std::cell::{Cell, RefCell};
+    use core::cell::{Cell, RefCell};
 
     thread_local! {
         pub static CAPTURE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -33,27 +35,43 @@ pub(crate) fn write_to_con(bytes: &[u8]) {
 }
 
 fn write_stdout(bytes: &[u8]) {
-    use std::io::Write;
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    let _ = lock.write_all(bytes);
-    let _ = lock.flush();
+    #[cfg(feature = "nostd")]
+    {
+        crate::nostd::console_write(bytes);
+    }
+    #[cfg(not(feature = "nostd"))]
+    {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        let _ = lock.write_all(bytes);
+        let _ = lock.flush();
+    }
 }
 
 /// Whether ANSI escapes will be honoured on stdout. Color is enabled for a
-/// real terminal unless `NO_COLOR` (or `PICKLE_NO_COLOR`) is set.
+/// real terminal unless `NO_COLOR` (or `PICKLE_NO_COLOR`) is set. A
+/// freestanding build never emits colors.
 pub(crate) fn terminal_color_enabled() -> bool {
-    use std::io::IsTerminal;
-    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("PICKLE_NO_COLOR").is_some() {
+    #[cfg(feature = "nostd")]
+    {
+        let _ = ();
         return false;
     }
-    std::io::stdout().is_terminal()
+    #[cfg(not(feature = "nostd"))]
+    {
+        use std::io::IsTerminal;
+        if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("PICKLE_NO_COLOR").is_some() {
+            return false;
+        }
+        std::io::stdout().is_terminal()
+    }
 }
 
 /// Print raw bytes (from a string literal or the contents of a string).
 fn print_raw_bytes(ptr: *const u8, len: usize) {
     if !ptr.is_null() && len > 0 {
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
         write_to_con(bytes);
     }
 }
@@ -176,6 +194,7 @@ fn print_obj_raw(obj: *mut PickleObject) {
             b"false\0".as_ptr()
         }),
         PICKLE_CLASS_BOX_CHAR => pickle_print_char(crate::boxscalar::box_bits(obj) as i32),
+        #[cfg(not(feature = "nostd"))]
         _ => {
             let gc = crate::gc::gc_mut();
             let name = gc.class_name(class_id);
@@ -184,6 +203,8 @@ fn print_obj_raw(obj: *mut PickleObject) {
                 None => pickle_print_cstr(b"<object>\0".as_ptr()),
             }
         }
+        #[cfg(feature = "nostd")]
+        _ => pickle_print_cstr(b"<object>\0".as_ptr()),
     }
 }
 
@@ -199,7 +220,7 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
         PICKLE_CLASS_STRING => {
             // SAFETY: pointer/length come straight from the managed string.
             let bytes = unsafe {
-                std::slice::from_raw_parts(
+                core::slice::from_raw_parts(
                     crate::strings::string_bytes_ptr(obj),
                     crate::strings::string_bytes_len(obj),
                 )
@@ -249,7 +270,7 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
                 crate::boxscalar::box_bits(obj) as u64,
             ));
             let bytes = unsafe {
-                std::slice::from_raw_parts(
+                core::slice::from_raw_parts(
                     crate::strings::string_bytes_ptr(s),
                     crate::strings::string_bytes_len(s),
                 )
@@ -262,6 +283,7 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
             b"false"
         }),
         PICKLE_CLASS_BOX_CHAR => buf.push(crate::boxscalar::box_bits(obj) as u8),
+        #[cfg(not(feature = "nostd"))]
         _ => {
             let gc = crate::gc::gc_mut();
             match gc.class_name(class_id) {
@@ -269,6 +291,8 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
                 None => buf.extend_from_slice(b"<object>"),
             }
         }
+        #[cfg(feature = "nostd")]
+        _ => buf.extend_from_slice(b"<object>"),
     }
 }
 
@@ -286,7 +310,7 @@ pub extern "C" fn pickle_print_newline() {
 /// Flush stdout. Kept for explicit checkpointing from compiled code.
 #[no_mangle]
 pub extern "C" fn pickle_flush() {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(feature = "nostd")))]
     {
         let stdout = std::io::stdout();
         let _ = stdout.lock().flush();

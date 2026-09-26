@@ -13,6 +13,8 @@
 //! with `Entry { key, value }` pairs; open addressing with linear probing and
 //! a power-of-two table. The collector scans live entries as managed refs.
 
+use alloc::vec::Vec;
+
 use crate::boxscalar::box_bits;
 use crate::gc::Gc;
 use crate::layout::{
@@ -55,7 +57,7 @@ fn key_hash(key: *const PickleObject) -> u64 {
         // table) is one distinguished identity: its hash matches the fixed
         // constant `deep_hash` already uses for a null slot, so none-as-key
         // and none-nested are interchangeable.
-        if key.is_null() || std::ptr::eq(key, none_key()) {
+        if key.is_null() || core::ptr::eq(key, none_key()) {
             return 0x9e37_79b9_7f4a_7c15;
         }
         let class_id = (*key).class_id;
@@ -96,11 +98,11 @@ fn key_hash(key: *const PickleObject) -> u64 {
 /// keys compare structurally (deep); cyclic keys fall back to *root identity*
 /// — the same strength-safe semantics used by `key_hash` above.
 fn key_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
-    if std::ptr::eq(a, b) {
+    if core::ptr::eq(a, b) {
         return true;
     }
     // A `none` key equals only itself (its identity is null/sentinel).
-    if a.is_null() || std::ptr::eq(a, none_key()) || b.is_null() || std::ptr::eq(b, none_key()) {
+    if a.is_null() || core::ptr::eq(a, none_key()) || b.is_null() || core::ptr::eq(b, none_key()) {
         return false;
     }
     let mut path: Vec<(*const PickleObject, *const PickleObject)> = Vec::new();
@@ -116,7 +118,7 @@ fn key_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
 /// acyclic structures always produce the same hash.
 fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (u64, bool) {
     unsafe {
-        if obj.is_null() || std::ptr::eq(obj, none_key()) {
+        if obj.is_null() || core::ptr::eq(obj, none_key()) {
             return (0x9e37_79b9_7f4a_7c15, false);
         }
         if path.contains(&obj) {
@@ -166,7 +168,7 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
                 while i < cap {
                     let e = entries.add(i).read();
                     let k = e.key;
-                    if k.is_null() || std::ptr::eq(k, crate::object::nil_sentinel()) {
+                    if k.is_null() || core::ptr::eq(k, crate::object::nil_sentinel()) {
                         i += 1;
                         continue;
                     }
@@ -244,18 +246,18 @@ fn deep_eq(
     path: &mut Vec<(*const PickleObject, *const PickleObject)>,
 ) -> Cmp {
     unsafe {
-        if std::ptr::eq(a, b) {
+        if core::ptr::eq(a, b) {
             return Cmp::Equal;
         }
         // A `none` (null or sentinel) equals only itself.
-        if a.is_null() || std::ptr::eq(a, none_key()) {
-            return if b.is_null() || std::ptr::eq(b, none_key()) {
+        if a.is_null() || core::ptr::eq(a, none_key()) {
+            return if b.is_null() || core::ptr::eq(b, none_key()) {
                 Cmp::Equal
             } else {
                 Cmp::Diff
             };
         }
-        if b.is_null() || std::ptr::eq(b, none_key()) {
+        if b.is_null() || core::ptr::eq(b, none_key()) {
             return Cmp::Diff;
         }
         let pair = (a, b);
@@ -322,7 +324,7 @@ fn deep_eq(
                         while i < capa && r == Cmp::Equal {
                             let ka = ea.add(i).read().key;
                             let va = ea.add(i).read().value;
-                            if ka.is_null() || std::ptr::eq(ka, crate::object::nil_sentinel()) {
+                            if ka.is_null() || core::ptr::eq(ka, crate::object::nil_sentinel()) {
                                 i += 1;
                                 continue;
                             }
@@ -333,7 +335,7 @@ fn deep_eq(
                                     let kb = eb.add(j).read().key;
                                     let vb = eb.add(j).read().value;
                                     if !kb.is_null()
-                                        && !std::ptr::eq(kb, crate::object::nil_sentinel())
+                                        && !core::ptr::eq(kb, crate::object::nil_sentinel())
                                     {
                                         match deep_eq(ka, kb, path) {
                                             Cmp::Equal => match deep_eq(va, vb, path) {
@@ -444,7 +446,7 @@ fn find_slot(
     unsafe {
         let mask = cap - 1;
         let mut idx = (key_hash as usize) & mask;
-        let mut first_tomb: *mut MapEntry = std::ptr::null_mut();
+        let mut first_tomb: *mut MapEntry = core::ptr::null_mut();
         let key_str = |e: *mut MapEntry| (*e).key;
         loop {
             let slot = entries.add(idx);
@@ -459,7 +461,7 @@ fn find_slot(
                 return (target, false);
             }
             // Tombstone check (key == the unique tombstone sentinel).
-            if std::ptr::eq(k, crate::object::nil_sentinel()) {
+            if core::ptr::eq(k, crate::object::nil_sentinel()) {
                 if first_tomb.is_null() {
                     first_tomb = slot;
                 }
@@ -481,7 +483,7 @@ fn entries_count(entries: *mut MapEntry, cap: usize) -> usize {
         let mut n = 0usize;
         for i in 0..cap {
             let k = entries.add(i).read().key;
-            if !k.is_null() && !std::ptr::eq(k, crate::object::nil_sentinel()) {
+            if !k.is_null() && !core::ptr::eq(k, crate::object::nil_sentinel()) {
                 n += 1;
             }
         }
@@ -496,15 +498,15 @@ fn rehash(
     gc: &mut Gc,
 ) -> *mut MapEntry {
     unsafe {
-        let fresh = gc.heap.raw_alloc(new_cap * std::mem::size_of::<MapEntry>());
-        std::ptr::write_bytes(fresh, 0, new_cap * std::mem::size_of::<MapEntry>());
+        let fresh = gc.heap.raw_alloc(new_cap * core::mem::size_of::<MapEntry>());
+        core::ptr::write_bytes(fresh, 0, new_cap * core::mem::size_of::<MapEntry>());
         let fresh = fresh as *mut MapEntry;
         for i in 0..old_cap {
             let mut e = old_entries.add(i).read();
-            if !e.key.is_null() && !std::ptr::eq(e.key, crate::object::nil_sentinel()) {
+            if !e.key.is_null() && !core::ptr::eq(e.key, crate::object::nil_sentinel()) {
                 let key_hash = key_hash(e.key);
                 let (slot, _) = find_slot(fresh, new_cap, e.key, key_hash);
-                std::ptr::swap(slot, &mut e);
+                core::ptr::swap(slot, &mut e);
             }
         }
         crate::heap::raw_free(old_entries as *mut u8);
@@ -519,8 +521,8 @@ pub fn map_new(cap: usize, gc: &mut Gc) -> *mut PickleObject {
     unsafe {
         map_set_len(obj, 0);
         map_set_cap(obj, cap);
-        let entries = gc.heap.raw_alloc(cap * std::mem::size_of::<MapEntry>());
-        std::ptr::write_bytes(entries, 0, cap * std::mem::size_of::<MapEntry>());
+        let entries = gc.heap.raw_alloc(cap * core::mem::size_of::<MapEntry>());
+        core::ptr::write_bytes(entries, 0, cap * core::mem::size_of::<MapEntry>());
         map_set_entries(obj, entries as *mut MapEntry);
     }
     obj
@@ -567,14 +569,14 @@ pub fn map_get(map: *const PickleObject, key: *const PickleObject) -> *mut Pickl
             let slot = map_entries(map).add(idx);
             let k = (*slot).key;
             if k.is_null() {
-                return std::ptr::null_mut();
+                return core::ptr::null_mut();
             }
-            if !std::ptr::eq(k, crate::object::nil_sentinel()) && key_eq(k, key) {
+            if !core::ptr::eq(k, crate::object::nil_sentinel()) && key_eq(k, key) {
                 return (*slot).value;
             }
             idx = (idx + 1) & mask;
         }
-        std::ptr::null_mut()
+        core::ptr::null_mut()
     }
 }
 
@@ -590,18 +592,18 @@ pub fn map_remove(map: *mut PickleObject, key: *const PickleObject) -> *mut Pick
             let slot = map_entries(map).add(idx);
             let k = (*slot).key;
             if k.is_null() {
-                return std::ptr::null_mut();
+                return core::ptr::null_mut();
             }
-            if !std::ptr::eq(k, crate::object::nil_sentinel()) && key_eq(k, key) {
+            if !core::ptr::eq(k, crate::object::nil_sentinel()) && key_eq(k, key) {
                 let v = (*slot).value;
                 (*slot).key = crate::object::nil_sentinel() as *mut PickleObject;
-                (*slot).value = std::ptr::null_mut();
+                (*slot).value = core::ptr::null_mut();
                 map_set_len(map, map_len(map) - 1);
                 return v;
             }
             idx = (idx + 1) & mask;
         }
-        std::ptr::null_mut()
+        core::ptr::null_mut()
     }
 }
 
@@ -619,13 +621,13 @@ fn map_snapshot(map: *const PickleObject, want_keys: bool) -> *mut PickleObject 
     unsafe {
         for i in 0..cap {
             let e = &*entries.add(i);
-            if e.key.is_null() || std::ptr::eq(e.key, nil_sentinel()) {
+            if e.key.is_null() || core::ptr::eq(e.key, nil_sentinel()) {
                 continue;
             }
             // A stored `none` key is the sentinel; surface it as null, the
             // runtime representation the compiler expects for `T?`.
-            let val = if want_keys && std::ptr::eq(e.key, none_key()) {
-                std::ptr::null_mut()
+            let val = if want_keys && core::ptr::eq(e.key, none_key()) {
+                core::ptr::null_mut()
             } else if want_keys {
                 e.key
             } else {

@@ -33,7 +33,7 @@ fn cell_bits(class_id: u32, slot: u32) -> usize {
     }
     let mut bits = cells[cid][s];
     if bits == 0 {
-        let fresh: *mut *mut PickleObject = Box::into_raw(Box::new(std::ptr::null_mut()));
+        let fresh: *mut *mut PickleObject = Box::into_raw(Box::new(core::ptr::null_mut()));
         // Register the cell as a static root so its pointee is traced at every
         // collection. The handle is deliberately leaked: the cell lives for the
         // whole program, like a compiler-emitted global.

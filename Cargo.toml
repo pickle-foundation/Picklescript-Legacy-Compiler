@@ -15,6 +15,10 @@ repository = "https://github.com/pickle-foundation/picklescript"
 [profile.release]
 opt-level = 3
 debug = false
+# pickle-runtime is also built without std (--features nostd), which has no
+# unwinding panic machinery; the panic hook still runs before abort.
+panic = "abort"
 
 [profile.dev]
 opt-level = 1
+panic = "abort"

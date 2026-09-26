@@ -213,6 +213,6 @@ mod tests {
         ] {
             assert_eq!(off % 8, 0);
         }
-        assert_eq!(std::mem::size_of::<MapEntry>(), 16);
+        assert_eq!(core::mem::size_of::<MapEntry>(), 16);
     }
 }

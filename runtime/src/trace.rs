@@ -5,6 +5,8 @@
 //! use their known layouts; user objects use their registered class
 //! descriptor's managed-field bitmask.
 
+use alloc::vec::Vec;
+
 use crate::layout::{
     enum_field_count, list_data, list_len, map_cap, map_entries, tuple_field_count,
 };
@@ -112,8 +114,8 @@ fn trace_one(
                     for i in 0..cap {
                         let e = entries.add(i);
                         if !(*e).key.is_null()
-                            && !std::ptr::eq((*e).key, crate::object::nil_sentinel())
-                            && !std::ptr::eq((*e).key, crate::object::none_key())
+                            && !core::ptr::eq((*e).key, crate::object::nil_sentinel())
+                            && !core::ptr::eq((*e).key, crate::object::none_key())
                         {
                             enqueue(worklist, (*e).key);
                         }

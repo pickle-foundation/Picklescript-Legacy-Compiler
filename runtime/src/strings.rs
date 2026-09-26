@@ -1,5 +1,7 @@
 //! Builtin `string` support: allocation, concat, and number-to-text.
 
+use alloc::vec::Vec;
+
 use crate::gc::Gc;
 use crate::layout::{builtin_string_total, str_bytes, str_len, str_set_len};
 use crate::object::{PickleObject, PICKLE_CLASS_STRING};
@@ -11,7 +13,7 @@ pub fn string_from_bytes(bytes: *const u8, len: usize, gc: &mut Gc) -> *mut Pick
     unsafe {
         str_set_len(obj, len);
         if len > 0 {
-            std::ptr::copy_nonoverlapping(bytes, str_bytes(obj) as *mut u8, len);
+            core::ptr::copy_nonoverlapping(bytes, str_bytes(obj) as *mut u8, len);
         }
     }
     obj
@@ -51,10 +53,10 @@ pub fn string_concat(a: *const PickleObject, b: *const PickleObject) -> *mut Pic
     unsafe {
         str_set_len(obj, total);
         if la > 0 {
-            std::ptr::copy_nonoverlapping(str_bytes(a), str_bytes(obj) as *mut u8, la);
+            core::ptr::copy_nonoverlapping(str_bytes(a), str_bytes(obj) as *mut u8, la);
         }
         if lb > 0 {
-            std::ptr::copy_nonoverlapping(str_bytes(b), (str_bytes(obj) as *mut u8).add(la), lb);
+            core::ptr::copy_nonoverlapping(str_bytes(b), (str_bytes(obj) as *mut u8).add(la), lb);
         }
     }
     obj
@@ -181,7 +183,7 @@ pub extern "C" fn pickle_str_set(
     unsafe {
         str_set_len(out, len);
         if len > 0 {
-            std::ptr::copy_nonoverlapping(str_bytes(obj), str_bytes(out) as *mut u8, len);
+            core::ptr::copy_nonoverlapping(str_bytes(obj), str_bytes(out) as *mut u8, len);
         }
         *(str_bytes(out) as *mut u8).add(index as usize) = v as u8;
     }
@@ -272,7 +274,7 @@ pub extern "C" fn pickle_str_from_list(list: *const PickleObject) -> *mut Pickle
     unsafe {
         let len = crate::layout::list_len(list);
         if len == 0 {
-            return string_from_bytes(std::ptr::null(), 0, gc);
+            return string_from_bytes(core::ptr::null(), 0, gc);
         }
         let data = crate::layout::list_data(list);
         let mut buf: Vec<u8> = Vec::with_capacity(len);
@@ -300,7 +302,7 @@ mod tests {
         let _guard = setup();
         let s = string_from_bytes(b"hello".as_ptr(), 5, crate::gc::gc_mut());
         assert_eq!(string_bytes_len(s), 5);
-        let bytes = unsafe { std::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
+        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
         assert_eq!(bytes, b"hello");
     }
 
@@ -310,7 +312,7 @@ mod tests {
         let a = string_from_bytes(b"foo".as_ptr(), 3, crate::gc::gc_mut());
         let b = string_from_bytes(b"bar".as_ptr(), 3, crate::gc::gc_mut());
         let c = string_concat(a, b);
-        let bytes = unsafe { std::slice::from_raw_parts(string_bytes_ptr(c), string_bytes_len(c)) };
+        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(c), string_bytes_len(c)) };
         assert_eq!(bytes, b"foobar");
     }
 
@@ -336,7 +338,7 @@ mod tests {
         ] {
             let s = int64_to_string(v);
             let bytes =
-                unsafe { std::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
+                unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
             assert_eq!(bytes, expect, "int64 {v}");
         }
     }
@@ -345,7 +347,7 @@ mod tests {
     fn float_format() {
         let _guard = setup();
         let s = float64_to_string(1.5);
-        let bytes = unsafe { std::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
+        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
         assert_eq!(bytes, b"1.5");
     }
 }

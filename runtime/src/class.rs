@@ -27,7 +27,7 @@ pub fn class_new(class_id: u64, field_count: usize, gc: &mut Gc) -> *mut PickleO
     let obj = gc.alloc(size as u32, class_id as u32);
     unsafe {
         if field_count > 0 {
-            std::ptr::write_bytes((*obj).payload_mut(), 0, 8 * field_count);
+            core::ptr::write_bytes((*obj).payload_mut(), 0, 8 * field_count);
         }
     }
     obj
@@ -38,16 +38,16 @@ pub fn class_new(class_id: u64, field_count: usize, gc: &mut Gc) -> *mut PickleO
 pub fn class_slot(obj: *const PickleObject, index: i64) -> *mut PickleObject {
     unsafe {
         if obj.is_null() || index < 0 {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         let idx = index as u64;
         let size = (*obj).size as u64;
         if size < (pickle_header_size() as u64 + 8) {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         let slots = (size - pickle_header_size() as u64 - 8) / 8;
         if idx > slots {
-            return std::ptr::null_mut();
+            return core::ptr::null_mut();
         }
         (*obj).slot(idx as usize)
     }
@@ -114,7 +114,7 @@ fn class_register(
     } else {
         // SAFETY: the caller (compiler-emitted code) passes a module string's
         // bytes with a matching length.
-        unsafe { std::slice::from_raw_parts(name_ptr, name_len) }
+        unsafe { core::slice::from_raw_parts(name_ptr, name_len) }
             .to_vec()
             .into_boxed_slice()
     };
@@ -135,7 +135,7 @@ fn class_register(
         // SAFETY: the compiler emits the address of an `extern "C"` function
         // with the `fn(*mut PickleObject)` shape; non-zero means a `deinit`
         // block exists for this class.
-        let f: extern "C" fn(*mut PickleObject) = unsafe { std::mem::transmute(finalizer) };
+        let f: extern "C" fn(*mut PickleObject) = unsafe { core::mem::transmute(finalizer) };
         (PICKLE_CLASS_FLAG_FINALIZER, f)
     };
     let d = ClassDescriptor {
@@ -406,7 +406,7 @@ mod tests {
             flags: 0,
             slot_count: 0,
             mask_words: 0,
-            managed_mask: std::ptr::null(),
+            managed_mask: core::ptr::null(),
             finalizer: builtin_nop_finalizer,
         };
         for _ in 0..(PICKLE_CLASS_USER_BASE) {
@@ -479,7 +479,7 @@ mod tests {
         assert!(class_implements(d, 2));
         assert!(class_implements(a, 1));
         assert!(!class_implements(d, 3), "unregistered interface is absent");
-        assert!(!class_implements(std::ptr::null(), 1));
+        assert!(!class_implements(core::ptr::null(), 1));
         // Resolution walks up: dog overrides method 0, inherits method 1.
         assert_eq!(iface_method(d, 1, 0), 0x3333);
         assert_eq!(iface_method(d, 1, 1), 0x2222);

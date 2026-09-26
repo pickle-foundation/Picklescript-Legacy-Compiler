@@ -29,7 +29,7 @@ use crate::strings::{string_bytes_len, string_bytes_ptr, string_from_bytes};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -75,7 +75,7 @@ impl Drop for ProcInner {
 
 /// The managed string payload of an object (must be a `string` object).
 fn os_arg(obj: *const PickleObject) -> String {
-    let bytes = unsafe { std::slice::from_raw_parts(string_bytes_ptr(obj), string_bytes_len(obj)) };
+    let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(obj), string_bytes_len(obj)) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -120,8 +120,8 @@ fn apply_env(cmd: &mut Command, envs: *mut PickleObject, env_removes: *mut Pickl
         for i in 0..cap {
             let e: MapEntry = unsafe { *entries.add(i) };
             if e.key.is_null()
-                || std::ptr::eq(e.key, nil_sentinel())
-                || std::ptr::eq(e.key, none_key())
+                || core::ptr::eq(e.key, nil_sentinel())
+                || core::ptr::eq(e.key, none_key())
             {
                 continue;
             }
@@ -218,7 +218,7 @@ fn cmd_result(code: Option<i64>, out: &[u8], err: &[u8], timed: bool) -> *mut Pi
     let _lease = gc.temp_lease(t);
     let code_slot = match code {
         Some(c) => crate::boxscalar::pickle_box_i64(c),
-        None => std::ptr::null_mut(),
+        None => core::ptr::null_mut(),
     };
     crate::tuple::tuple_set_field(t, 0, code_slot);
     let out_s = string_from_bytes(out.as_ptr(), out.len(), gc);
@@ -276,7 +276,7 @@ pub extern "C" fn pickle_run_cmd(
     inherit_io: bool,
 ) -> *mut PickleObject {
     let Some(mut cmd) = base_command(argv, cwd, envs, env_removes) else {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     };
     let cap = opt_int(max_out)
         .map(|v| v.max(0) as usize)
@@ -289,7 +289,7 @@ pub extern "C" fn pickle_run_cmd(
             .stderr(Stdio::inherit());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => return core::ptr::null_mut(),
         };
         let (code, timed) = wait_with_timeout(&mut child, timeout);
         return cmd_result(code.map(|c| c as i64), &[], &[], timed);
@@ -304,7 +304,7 @@ pub extern "C" fn pickle_run_cmd(
     .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return core::ptr::null_mut(),
     };
 
     let out = Arc::new(Mutex::new(Vec::new()));
@@ -354,7 +354,7 @@ pub extern "C" fn pickle_run_spawn(
     max_out: *const PickleObject,
 ) -> *mut PickleObject {
     let Some(mut cmd) = base_command(argv, cwd, envs, env_removes) else {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     };
     let cap = opt_int(max_out)
         .map(|v| v.max(0) as usize)
@@ -364,7 +364,7 @@ pub extern "C" fn pickle_run_spawn(
         .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
+        Err(_) => return core::ptr::null_mut(),
     };
     let child_out = child.stdout.take().unwrap();
     let child_err = child.stderr.take().unwrap();
@@ -425,7 +425,7 @@ fn read_available(
         g.drain(..take).collect()
     };
     if got.is_empty() && eof.load(Ordering::SeqCst) {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let gc = crate::gc::gc_mut();
     let l = crate::list::list_new(got.len(), gc);
@@ -513,12 +513,12 @@ pub extern "C" fn pickle_proc_running(h: *mut PickleObject) -> bool {
 pub extern "C" fn pickle_proc_code(h: *mut PickleObject) -> *mut PickleObject {
     let inner = proc_mut(h);
     if inner.is_null() {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let inner = unsafe { &*inner };
     match inner.code {
         Some(c) => crate::boxscalar::pickle_box_i64(c),
-        None => std::ptr::null_mut(),
+        None => core::ptr::null_mut(),
     }
 }
 
@@ -542,7 +542,7 @@ pub extern "C" fn pickle_proc_kill(h: *mut PickleObject) -> bool {
 pub extern "C" fn pickle_proc_out_read(h: *mut PickleObject, n: i64) -> *mut PickleObject {
     let inner = proc_mut(h);
     if inner.is_null() {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let inner = unsafe { &*inner };
     read_available(usize::try_from(n).unwrap_or(0), &inner.out, &inner.out_eof)
@@ -554,7 +554,7 @@ pub extern "C" fn pickle_proc_out_read(h: *mut PickleObject, n: i64) -> *mut Pic
 pub extern "C" fn pickle_proc_err_read(h: *mut PickleObject, n: i64) -> *mut PickleObject {
     let inner = proc_mut(h);
     if inner.is_null() {
-        return std::ptr::null_mut();
+        return core::ptr::null_mut();
     }
     let inner = unsafe { &*inner };
     read_available(usize::try_from(n).unwrap_or(0), &inner.err, &inner.err_eof)
@@ -596,6 +596,6 @@ pub extern "C" fn pickle_current_dir() -> *mut PickleObject {
             let gc = crate::gc::gc_mut();
             string_from_bytes(bytes.as_ptr(), bytes.len(), gc)
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(_) => core::ptr::null_mut(),
     }
 }
