@@ -1,8 +1,22 @@
 diff --git a/compiler-selfhost/x64.pkl b/compiler-selfhost/x64.pkl
-index c31a0aa..6d5e6db 100644
+index c31a0aa..b718128 100644
 --- a/compiler-selfhost/x64.pkl
 +++ b/compiler-selfhost/x64.pkl
-@@ -685,6 +685,14 @@ class X64Emitter {
+@@ -593,7 +593,12 @@ fn analyze(m: IrModule, fun: IrFunc) -> FnPlan {
+         }
+     }
+     let shadowBytes = SHADOW_HEADER_BYTES + CELL_BYTES * ncells
+-    var used = shadowBytes
++    // The shadow frame occupies K in [0, shadowBytes]: `prev` sits at exactly
++    // shadowBytes, so unmanaged slots/temps must start strictly past it. Starting
++    // at shadowBytes would let an alloc whose K is already a multiple of its
++    // alignment (e.g. tyWidth(Int) == 64) land on `prev`, which pickle_shadow_push
++    // then overwrites.
++    var used = shadowBytes + CELL_BYTES
+     i = 0
+     while (i < len(fun.slots)) {
+         if (!isManaged(fun.slots[i])) {
+@@ -685,6 +690,14 @@ class X64Emitter {
                  c = c + 1
              }
              this.cb.stImm(0, 32, this.plan.shadowBytes - 8, this.plan.ncells)
@@ -17,7 +31,7 @@ index c31a0aa..6d5e6db 100644
              this.cb.leaRbp(1, this.plan.shadowBytes)
              this.cb.movabsReloc(10, "pickle_shadow_push")
              this.cb.u8(0x41)
-@@ -1396,6 +1404,7 @@ this.cb.movabsImm(0, i64MinBits())
+@@ -1396,6 +1409,7 @@ this.cb.movabsImm(0, i64MinBits())
      fn emitFunc() -> X64Func? {
          this.prologue()
          this.seedParams()
