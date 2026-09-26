@@ -37,7 +37,15 @@ runtime drains the task pool at exit).
 
 ## Tasks & scheduling
 
-v1 thread model: cooperative threads mapped 1:1 onto OS threads; each OS
+**Implemented (v1):** `thread_spawn(fn(): void)` maps 1:1 onto an OS thread;
+`thread_join` waits and frees the `Task` exactly once. `task { ... }`
+desugars in the parser to `thread_spawn(fn() { ... })`. Channels are bounded
+`i64` FIFOs (`channel_send/try_send/recv/try_recv/close`) with the boxing
+rules at [runtime/sync.rs]; mutex, condvar, semaphore, `AtomicInt`, and
+`once` are the synchronization surface, wrapped in `std.thread`.
+`yieldNow()` voluntarily hands the CPU back.
+
+v2 thread model: cooperative threads mapped 1:1 onto OS threads; each OS
 thread maintains its own shadow stack, GC ids, and heap-affiliated data.
 
 - `task { ... }` spawns an OS thread (or a coroutine on the shared pool,

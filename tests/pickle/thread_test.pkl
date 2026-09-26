@@ -2,158 +2,194 @@
 //
 // Every test here is about the *interaction* of a task with the rest of the
 // program, not about the primitives in isolation: a task runs compiled code on
-// its own OS thread while this thread keeps running, and a task that blocks
-// has to hand the runtime's world lock back for a peer to make progress. That
-// is the property a single-threaded test cannot check, and the reason these
-// tests exist at all.
+// its own OS thread while this thread keeps running, and a task that blocks has
+// to hand the runtime's world lock back for a peer to make progress. That is
+// the property a single-threaded test cannot check, and the reason these tests
+// exist at all.
+//
+// A task records what it did in a shared tally or atomic cell rather than
+// printing: two tasks writing to stdout interleave by OS scheduling, and this
+// file is also compared byte-for-byte against the ported compiler running the
+// same source. Exactly one test prints from a task, and it has a single task,
+// so the ordering is still fixed.
 
-fn worker() {
-    println("worker ran")
+// A task records what it did in a shared tally; the list literal needs a
+// placeholder element, so an empty one is built the same way std.process
+// builds its empty line list.
+fn tally() -> List<int> {
+    var xs = [0]
+    xs.pop()
+    xs
 }
-
-fn counted() {
-    println("counted ran")
-}
-
 test fn spawn_runs_the_body_and_join_returns() {
-    let t = thread_spawn(fn() { worker() })
+    let ran = tally()
+    let t = thread_spawn(fn() { ran.push(1) })
     expect(thread_join(t)).toBe(true)
     expect(thread_finished(t)).toBe(true)
+    expect(len(ran)).toBe(1)
+}
+
+test fn a_task_can_print() {
+    let t = thread_spawn(fn() { println("a task wrote this line") })
+    expect(thread_join(t)).toBe(true)
 }
 
 test fn several_tasks_all_run_before_join_returns() {
-    let a = thread_spawn(fn() { worker() })
-    let b = thread_spawn(fn() { worker() })
-    let c = thread_spawn(fn() { counted() })
+    let ran = tally()
+    let a = thread_spawn(fn() { ran.push(1) })
+    let b = thread_spawn(fn() { ran.push(2) })
+    let c = thread_spawn(fn() { ran.push(3) })
     expect(thread_join(a)).toBe(true)
     expect(thread_join(b)).toBe(true)
     expect(thread_join(c)).toBe(true)
+    expect(len(ran)).toBe(3)
     expect(thread_count() >= 3).toBe(true)
 }
 
 test fn join_waits_for_a_task_that_sleeps() {
-    let t = thread_spawn(fn() { sleep_ms(20) })
-    // The task is running for 20ms; `finished` must say so, and `join` must
+    let ran = tally()
+    let t = thread_spawn(fn() {
+        sleep_ms(20)
+        ran.push(1)
+    })
+    // The task is sleeping for 20ms; `finished` must say so, and `join` must
     // wait for it rather than reporting a task that has not started.
     sleep_ms(1)
     expect(thread_finished(t)).toBe(false)
     expect(thread_join(t)).toBe(true)
     expect(thread_finished(t)).toBe(true)
+    expect(len(ran)).toBe(1)
 }
 
 test fn a_task_can_allocate_while_this_thread_waits() {
     // The heap is shared: a task body is compiled code, so it touches the
     // collector. This is the case the world lock exists for.
+    let made = tally()
     let t = thread_spawn(fn() {
         var xs = [1, 2, 3]
         for (i in 0..10) {
             xs.push(i)
         }
-        println("task allocated " + str(len(xs)))
+        made.push(len(xs))
     })
     expect(thread_join(t)).toBe(true)
+    expect(len(made)).toBe(1)
+    expect(made[0]).toBe(13)
 }
 
 test fn mutex_serialises_two_tasks() {
+    // A read-modify-write of a shared counter under the mutex: without the
+    // mutual exclusion one of the two increments would be lost and the tally
+    // would read 1.
     let m = mutex_new()
+    let counter = atomic_new(0)
     let t = thread_spawn(fn() {
         mutex_lock(m)
+        let was = atomic_load(counter)
         sleep_ms(1)
+        atomic_store(counter, was + 1)
         mutex_unlock(m)
     })
     mutex_lock(m)
+    let was = atomic_load(counter)
     sleep_ms(1)
+    atomic_store(counter, was + 1)
     mutex_unlock(m)
     expect(thread_join(t)).toBe(true)
+    expect(atomic_load(counter)).toBe(2)
 }
 
 test fn cond_signal_wakes_a_waiting_task() {
     let m = mutex_new()
     let c = cond_new()
+    let woke = atomic_new(0)
     let t = thread_spawn(fn() {
         mutex_lock(m)
         cond_wait(c, m)
+        atomic_store(woke, 1)
         mutex_unlock(m)
     })
     sleep_ms(5)
     cond_signal(c)
     expect(thread_join(t)).toBe(true)
+    expect(atomic_load(woke)).toBe(1)
 }
 
 test fn semaphore_counts_down_across_tasks() {
     let s = sem_new(1)
+    let took = atomic_new(0)
     let t = thread_spawn(fn() {
         sem_acquire(s, 1)
+        atomic_store(took, 1)
         sem_release(s, 1)
     })
     expect(thread_join(t)).toBe(true)
+    expect(atomic_load(took)).toBe(1)
     expect(sem_try_acquire(s, 1)).toBe(true)
 }
 
 test fn atomics_are_shared() {
     let a = atomic_new(0)
+    let seen = atomic_new(0)
     let t = thread_spawn(fn() {
         let was = atomic_add(a, 5)
-        println("task added, the cell was " + str(was))
+        atomic_store(seen, was)
     })
     expect(thread_join(t)).toBe(true)
+    expect(atomic_load(seen)).toBe(0)
     expect(atomic_load(a)).toBe(5)
     expect(atomic_cas(a, 5, 9)).toBe(true)
+    expect(atomic_load(a)).toBe(9)
+    expect(atomic_cas(a, 5, 11)).toBe(false)
     expect(atomic_load(a)).toBe(9)
 }
 
 test fn once_runs_the_body_a_single_time() {
-    // Which of the two tasks wins the race is not fixed, so the assertions
-    // only pin down what must hold either way: exactly one caller runs the
-    // body, the loser waits and is told the work already happened, and a
-    // later caller is told the same.
+    // Which of the two tasks wins the race is not fixed, so the assertions only
+    // pin down what must hold either way: exactly one caller runs the body, the
+    // loser waits and is told the work already happened, and a later caller is
+    // told the same.
     let o = once_new()
     let runs = atomic_new(0)
+    let last = atomic_new(0)
     let wins = atomic_new(0)
+    let body = fn() {
+        let was = atomic_add(runs, 1)
+        atomic_store(last, was)
+    }
     let a = thread_spawn(fn() {
-        let won = once_run(o, fn() {
-            let was = atomic_add(runs, 1)
-            println("the body ran; the counter was " + str(was))
-        })
+        let won = once_run(o, body)
         if (won) {
-            let n = atomic_add(wins, 1)
-            println("task a ran the body; wins was " + str(n))
-        } else {
-            println("task a waited for the body")
+            atomic_add(wins, 1)
         }
     })
     let b = thread_spawn(fn() {
-        let won = once_run(o, fn() {
-            let was = atomic_add(runs, 1)
-            println("the body ran again; the counter was " + str(was))
-        })
+        let won = once_run(o, body)
         if (won) {
-            let n = atomic_add(wins, 1)
-            println("task b ran the body; wins was " + str(n))
-        } else {
-            println("task b waited for the body")
+            atomic_add(wins, 1)
         }
     })
     expect(thread_join(a)).toBe(true)
     expect(thread_join(b)).toBe(true)
     expect(atomic_load(runs)).toBe(1)
+    expect(atomic_load(last)).toBe(0)
     expect(atomic_load(wins)).toBe(1)
     expect(once_done(o)).toBe(true)
-    expect(once_run(o, fn() {
-        let was = atomic_add(runs, 1)
-        println("this body must not run; the counter was " + str(was))
-    })).toBe(false)
+    expect(once_run(o, body)).toBe(false)
     expect(atomic_load(runs)).toBe(1)
 }
 
 test fn a_failing_assert_fails_the_task_and_join_says_so() {
-    // A task that fails is a *result*, not a crash: `join` reports it and the
-    // message survives for the program to print.
+    // A task that fails is a *result*, not a crash: `join` reports it, the
+    // message survives for the program to print, and the body carried on past
+    // the failed assertion because only `panic` is fatal.
+    let carried = tally()
     let t = thread_spawn(fn() {
         assert(false, "task assertion")
-        println("the body carried on after the failed assert")
+        carried.push(1)
     })
     expect(thread_join(t)).toBe(false)
+    expect(len(carried)).toBe(1)
     if (let some(msg) = thread_message(t)) {
         expect(msg).toBe("task assertion")
     } else {
@@ -172,6 +208,13 @@ test fn thread_ids_are_distinct_and_stable() {
     let mine = thread_current()
     expect(mine > 0).toBe(true)
     expect(thread_current()).toBe(mine)
-    let t = thread_spawn(fn() { thread_yield() })
+    let seen = atomic_new(0)
+    let t = thread_spawn(fn() {
+        if (thread_current() != mine) {
+            atomic_store(seen, 1)
+        }
+        thread_yield()
+    })
     expect(thread_join(t)).toBe(true)
+    expect(atomic_load(seen)).toBe(1)
 }

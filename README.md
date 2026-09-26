@@ -90,7 +90,9 @@ See `docs/`:
 6. [Compiler architecture](docs/06-compiler.md)
 7. [Runtime architecture](docs/07-runtime.md)
 8. [Standard library plan](docs/08-stdlib.md)
-9. [Implementation roadmap](docs/09-roadmap.md)
+9. [Advanced error reporting](docs/11-advanced-error-reporting.md)
+10. [Compiler history](docs/12-compiler-history.md)
+11. [Error codes](docs/error-codes.md)
 
 ## Repository layout
 

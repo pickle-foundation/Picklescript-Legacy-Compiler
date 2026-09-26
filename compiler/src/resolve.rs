@@ -372,6 +372,13 @@ impl<'a> Resolver<'a> {
             rest: true,
             span,
         };
+        let int = |name: &str| ParamInfo {
+            name: name.to_string(),
+            ty: Ty::Int,
+            has_default: false,
+            rest: false,
+            span,
+        };
         // Variadic `print`/`println` accept any number of args (rest=truthy so
         // the checker treats remaining args as unconstrained).
         let builtins: Vec<CallableInfo> = vec![
@@ -585,6 +592,44 @@ impl<'a> Resolver<'a> {
             mk("once_new", vec![], Ty::Int, false),
             mk("once_done", vec![any("o")], Ty::Bool, false),
             mk("once_run", vec![any("o"), any("body")], Ty::Bool, false),
+
+            // --- Channels ---
+            //
+            // --- Channels ---
+            //
+            // A channel is an `int` handle naming a row in the primitive
+            // table, like every other synchronisation object. A v1 channel
+            // carries raw integers: the runtime stores the scalar bits straight
+            // into the ring (like `atomic_store`) and boxes them only when a
+            // receiver takes one out, so the element type is `int` both ways
+            // and the `value` slot is statically an `int` — a string or list
+            // never reaches the runtime. `channel_recv` is a definite value —
+            // receiving from a closed, empty channel is a loud error — while
+            // `channel_try_recv` is `none` when nothing is buffered.
+            mk("channel_new", vec![any("cap")], Ty::Int, false),
+            mk("channel_cap", vec![any("ch")], Ty::Int, false),
+            mk("channel_len", vec![any("ch")], Ty::Int, false),
+            mk(
+                "channel_send",
+                vec![any("ch"), int("value")],
+                Ty::Empty,
+                false,
+            ),
+            mk(
+                "channel_try_send",
+                vec![any("ch"), int("value")],
+                Ty::Bool,
+                false,
+            ),
+            mk("channel_recv", vec![any("ch")], Ty::Int, false),
+            mk(
+                "channel_try_recv",
+                vec![any("ch")],
+                Ty::Option(Box::new(Ty::Int)),
+                false,
+            ),
+            mk("channel_close", vec![any("ch")], Ty::Empty, false),
+            mk("channel_closed", vec![any("ch")], Ty::Bool, false),
         ];
         for c in builtins {
             self.fns.entry(c.name.clone()).or_default().push(c);

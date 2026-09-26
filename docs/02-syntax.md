@@ -302,6 +302,14 @@ The same words still bind at their declaration slots: `get`/`set` inside a
 and `async task = ...`.
 `await x` lives at the prefix-operator position, reserved there.
 
+`task { ... }` is sugar for `thread_spawn(fn() { ... })`: the block becomes a
+zero-argument closure that runs on a new OS thread, and the checker enforces
+that the closure body returns nothing (an int-producing body must end with a
+voiding form such as `let _ = expr`). `thread_join(task)` blocks until the
+task finishes; `channel_recv` on a channel shared into a task is the typical
+blocking rendezvous. A bare `task` not followed by `{` is still an ordinary
+identifier.
+
 Field names in a class member slot accept the contextual set except
 `constructor`, `operator`, `property`, `static`, `override`, `public`,
 `private`, `protected` — those words bind at the member slot (a field can

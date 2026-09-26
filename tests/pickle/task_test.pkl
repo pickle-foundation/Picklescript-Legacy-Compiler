@@ -1,0 +1,67 @@
+// Tasks through the `task { ... }` sugar, end to end through the JIT.
+//
+// The sugar desugars to `thread_spawn(fn() { body })` in the compiler: a task
+// still runs compiled code on its own OS thread, still hands the world lock
+// back while blocked, and carries its state through ordinary closure captures.
+// Everything else is the same thread_test.pkl contract: tasks record what they
+// did in shared cells rather than printing (this file is also compared
+// byte-for-byte against the ported compiler).
+
+test fn task_sugar_spawns_and_joins() {
+    let ran = [0]
+    ran.pop()
+    let t = task {
+        ran.push(1)
+    }
+    expect(thread_join(t)).toBe(true)
+    expect(len(ran)).toBe(1)
+}
+
+test fn task_sugar_hands_the_lock_back_like_a_spawn() {
+    // The body parks the world lock, so this thread can turn around and make
+    // the value appear from another task; `join` waits for the drain, which is
+    // what makes the read deterministic.
+    let ch = channel_new(1)
+    let seen = atomic_new(0)
+    let t = task {
+        let v = channel_recv(ch)
+        atomic_store(seen, v)
+    }
+    sleep_ms(5)
+    channel_send(ch, 7)
+    expect(thread_join(t)).toBe(true)
+    expect(atomic_load(seen)).toBe(7)
+}
+
+test fn task_sugar_as_a_statement_is_observable() {
+    // A statement-form `task { ... }` drops the handle, so its effect has to
+    // be observable by blocking on it: the receive here waits until the task's
+    // send actually landed instead of racing the task's start.
+    let out = channel_new(1)
+    task {
+        channel_send(out, 42)
+    }
+    expect(channel_recv(out)).toBe(42)
+    expect(channel_len(out)).toBe(0)
+}
+
+test fn task_can_still_be_an_identifier() {
+    let task = 7
+    expect(task).toBe(7)
+}
+
+test fn task_sugar_body_runs_statements() {
+    // A task body is statement-shaped, exactly like a spawn body fed to
+    // `thread_spawn`: captures flow in through the closure, effects go into
+    // shared cells, and `join` waits for it all.
+    let ran = [0]
+    ran.pop()
+    let t = task {
+        ran.push(2)
+        ran.push(3)
+    }
+    expect(thread_join(t)).toBe(true)
+    expect(len(ran)).toBe(2)
+    expect(ran[0]).toBe(2)
+    expect(ran[1]).toBe(3)
+}

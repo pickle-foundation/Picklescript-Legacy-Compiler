@@ -1,0 +1,202 @@
+// std.thread, end to end through the JIT: the class wrappers over the raw
+// task/channel/mutex/cond/semaphore/atomic/once builtins, exercised with the
+// same cross-task interaction tests as tests/pickle/thread_test.pkl and
+// channel_test.pkl.
+//
+// Each test records what a task did in a shared atomic or class handle rather
+// than printing: two tasks writing to stdout interleave by OS scheduling, and
+// this file is also compared byte-for-byte against the ported compiler running
+// the same source. A task never sends or receives on a closed channel here,
+// since those fail loud and end the process.
+
+module std.thread_test
+
+import { Task, Channel, Mutex, CondVar, Semaphore, AtomicInt, Once, spawn, taskCount, currentId, sleep } from std.thread
+
+test fn spawn_join_finished_and_message() {
+    let ran = AtomicInt(0)
+    let t = spawn(fn() { let _ = ran.add(1) })
+    expect(t.join()).toBe(true)
+    expect(t.finished()).toBe(true)
+    expect(ran.load()).toBe(1)
+    if (let some(_) = t.message()) {
+        assert(false, "expected no task failure message")
+    }
+}
+
+test fn task_count_reflects_an_alive_task() {
+    let before = taskCount()
+    expect(before >= 1).toBe(true)
+    let t = spawn(fn() { sleep(15) })
+    expect(taskCount() >= 2).toBe(true)
+    expect(t.join()).toBe(true)
+}
+
+test fn current_id_is_stable() {
+    let mine = currentId()
+    expect(mine > 0).toBe(true)
+    expect(currentId()).toBe(mine)
+}
+
+test fn channel_wrapped_buffers_in_order() {
+    let ch = Channel(8)
+    expect(ch.cap()).toBe(8)
+    expect(ch.len()).toBe(0)
+    ch.send(10)
+    ch.send(20)
+    ch.send(30)
+    expect(ch.len()).toBe(3)
+    expect(ch.recv()).toBe(10)
+    expect(ch.recv()).toBe(20)
+    expect(ch.recv()).toBe(30)
+    expect(ch.len()).toBe(0)
+}
+
+test fn channel_try_ops_never_block() {
+    let ch = Channel(1)
+    expect(ch.trySend(1)).toBe(true)
+    expect(ch.len()).toBe(1)
+    expect(ch.trySend(2)).toBe(false)
+    if (let some(v) = ch.tryRecv()) {
+        expect(v).toBe(1)
+    } else {
+        assert(false, "expected the buffered value")
+    }
+    if (let some(_) = ch.tryRecv()) {
+        assert(false, "expected none on an empty channel")
+    }
+    expect(ch.len()).toBe(0)
+}
+
+test fn channel_blocked_receive_hands_the_lock_back_to_a_sender() {
+    // The receive parks the world lock, so this thread can turn around and
+    // make the value appear from another task. This is the interaction the
+    // lock exists to allow; a single-threaded test cannot see it.
+    let ch = Channel(1)
+    let seen = AtomicInt(0)
+    let t = spawn(fn() {
+        let v = ch.recv()
+        seen.store(v)
+    })
+    sleep(5)
+    ch.send(7)
+    expect(t.join()).toBe(true)
+    expect(seen.load()).toBe(7)
+}
+
+test fn channel_blocked_send_hands_the_lock_back_to_a_reader() {
+    // Mirror image: the buffer is full, so the sender has to wait, and the
+    // hand-over happens back to the task that drains it.
+    let ch = Channel(2)
+    ch.send(1)
+    ch.send(2)
+    let t = spawn(fn() { ch.send(3) })
+    expect(ch.recv()).toBe(1)
+    expect(t.join()).toBe(true)
+    expect(ch.recv()).toBe(2)
+    expect(ch.recv()).toBe(3)
+}
+
+test fn channel_close_keeps_what_is_buffered() {
+    // Close is a shutdown signal, not a flush: the values already in the
+    // buffer stay readable, and once they are gone the channel reads as empty
+    // forever (a further `recv` would fail loud, so only the try form appears).
+    let ch = Channel(4)
+    ch.send(1)
+    ch.send(2)
+    expect(ch.closed()).toBe(false)
+    ch.close()
+    expect(ch.closed()).toBe(true)
+    expect(ch.recv()).toBe(1)
+    expect(ch.recv()).toBe(2)
+    expect(ch.len()).toBe(0)
+    if (let some(_) = ch.tryRecv()) {
+        assert(false, "expected a closed, empty channel to read none")
+    }
+    expect(ch.closed()).toBe(true)
+}
+
+test fn mutex_and_atomic_wrapped_serialise_two_tasks() {
+    // A read-modify-write of a shared counter under the mutex: without the
+    // mutual exclusion one of the two increments would be lost and the counter
+    // would read 1.
+    let m = Mutex()
+    let counter = AtomicInt(0)
+    let t = spawn(fn() {
+        m.lock()
+        let was = counter.load()
+        sleep(1)
+        counter.store(was + 1)
+        m.unlock()
+    })
+    m.lock()
+    let was = counter.load()
+    sleep(1)
+    counter.store(was + 1)
+    m.unlock()
+    expect(t.join()).toBe(true)
+    expect(counter.load()).toBe(2)
+}
+
+test fn cond_wrapped_wakes_a_waiting_task() {
+    let m = Mutex()
+    let c = CondVar()
+    let woke = AtomicInt(0)
+    let t = spawn(fn() {
+        m.lock()
+        c.wait(m)
+        woke.store(1)
+        m.unlock()
+    })
+    sleep(5)
+    c.signal()
+    expect(t.join()).toBe(true)
+    expect(woke.load()).toBe(1)
+    expect(m.tryLock()).toBe(true)
+    m.unlock()
+}
+
+test fn semaphore_wrapped_counts_down_across_tasks() {
+    let s = Semaphore(1)
+    let took = AtomicInt(0)
+    let t = spawn(fn() {
+        s.acquire(1)
+        took.store(1)
+        s.release(1)
+    })
+    expect(t.join()).toBe(true)
+    expect(took.load()).toBe(1)
+    expect(s.tryAcquire(1)).toBe(true)
+    s.release(1)
+}
+
+test fn once_wrapped_runs_the_body_a_single_time() {
+    // Which of the two tasks wins the race is not fixed, so the assertions only
+    // pin down what must hold either way: exactly one caller runs the body, the
+    // loser is told the work already happened, and a later caller too.
+    let o = Once()
+    let runs = AtomicInt(0)
+    let wins = AtomicInt(0)
+    let body = fn() {
+        let _ = runs.add(1)
+    }
+    let a = spawn(fn() {
+        let won = o.run(body)
+        if (won) {
+            wins.add(1)
+        }
+    })
+    let b = spawn(fn() {
+        let won = o.run(body)
+        if (won) {
+            wins.add(1)
+        }
+    })
+    expect(a.join()).toBe(true)
+    expect(b.join()).toBe(true)
+    expect(runs.load()).toBe(1)
+    expect(wins.load()).toBe(1)
+    expect(o.done()).toBe(true)
+    expect(o.run(body)).toBe(false)
+    expect(runs.load()).toBe(1)
+}

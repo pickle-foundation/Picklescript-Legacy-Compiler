@@ -7,19 +7,24 @@ wrapper.
 Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 
 - `text/` — string/byte builder, UTF-8 helpers, format; first seed
-  `text/lexer.pkl` (the compiler lexer's scanner; validated, runs on the whole
-  battery — see `tools/diff/port/`)
+  `text/lexer.pkl` (the compiler lexer's scanner; validated at the time on the
+  battery — see `tools/diff/port/`). The lexer seed is now legacy: the port's
+  flat `compiler-selfhost/{lexer,parser,resolve,check,emit}.pkl` slices took
+  over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
+  seeds live (`text/{utf8,stringbuilder,format}`, `collections/*`, `fs`, `os`,
+  `json`, `io`, `process`, `test`).
 - `collections/` — `List`/`Map` wrappers plus `Set`, `Deque`, `Vec`
 - `fs/`, `os/`, `math/`, `time/`, `test/` — planned (see the plan doc)
 
-Status: first seed written and validated (`text/lexer.pkl`);
-word its canonical token dump matches the Rust lexer byte-for-byte on all
-battery files (44/44), and its battery `main` regenerates `tools/diff/port/`.
+Status (2026-09-26): the whole `stdlib/**/*_test.pkl` tree (14 files) is gated
+by **GATE11** in `tools/battery_full.ps1` — the ported test driver must run
+each file byte-identical (stdout + exit) to Rust `pickle test`.
 The compiler registers builtins (`print`, `println`, `len`, `abs`, ...)
 directly in the resolver, and the runtime ABI ships the foundation layer as
 intrinsics: collection verbs (`List` push/pop/insert/remove/sort, `Map`
 has/get/remove/keys/values/`[]`/entries), whole-file I/O
 (`read_file`/`write_file`/`file_exists`/`delete`/`mkdir`/`list_dir`), the
 buffered `Stream` layer, the `bytes()`/`str(List<byte>)` bridge, and the math
-builtins (`min`/`max`/`clamp`/`range`/`abs`). `std.*` modules will be thin
-pickle wrappers over these plus genuinely new code.
+builtins (`min`/`max`/`clamp`/`range`/`abs`). `std.*` modules are thin
+pickle wrappers over these plus genuinely new code, and every seed's `_test.pkl`
+must keep GATE11 green.

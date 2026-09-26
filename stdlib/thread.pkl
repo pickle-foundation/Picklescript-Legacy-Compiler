@@ -1,0 +1,239 @@
+module std.thread
+
+// Tasks, channels and synchronisation, wrapped over the raw `thread_*`,
+// `channel_*`, `mutex_*`, `cond_*`, `sem_*`, `atomic_*` and `once_*` builtins
+// (the primitives live in one runtime table, so a handle never crosses to the
+// wrong kind silently). A v1 channel is a bounded FIFO of `int` values.
+
+/// A handle to a task running on its own OS thread.
+class Task {
+    var h: int
+
+    constructor(h: int) {
+        this.h = h
+    }
+
+    /// The runtime thread id the task runs on (also `currentId()` inside it).
+    fn id() -> int {
+        this.h
+    }
+
+    /// Wait for the task to finish. `true` when it completed without a failed
+    /// assert; `false` when its body failed and `message()` explains why.
+    fn join() -> bool {
+        thread_join(this.h)
+    }
+
+    /// Whether the task has finished already (coming from inside the task,
+    /// this reports that task's completion — which the task itself caused).
+    fn finished() -> bool {
+        thread_finished(this.h)
+    }
+
+    /// The failure message when the task failed; `none` otherwise.
+    fn message() -> string? {
+        thread_message(this.h)
+    }
+}
+
+/// A bounded channel of `int` values. `send` blocks while the buffer is full,
+/// `recv` blocks while it is empty; the accompanying `trySend`/`tryRecv` never
+/// block. A closed channel keeps its buffered values readable, then rejects
+/// further sends (loud) and reads (loud).
+class Channel {
+    var h: int
+
+    constructor(cap: int) {
+        this.h = channel_new(cap)
+    }
+
+    /// Put `v` in, blocking until a slot frees up.
+    fn send(v: int) {
+        channel_send(this.h, v)
+    }
+
+    /// Put `v` in only when there is room right now.
+    fn trySend(v: int) -> bool {
+        channel_try_send(this.h, v)
+    }
+
+    /// Take a value out, blocking until one is available.
+    fn recv() -> int {
+        channel_recv(this.h)
+    }
+
+    /// Take a value out if one is there; `none` when empty (closed or not).
+    fn tryRecv() -> int? {
+        channel_try_recv(this.h)
+    }
+
+    /// Mark the channel closed.
+    fn close() {
+        channel_close(this.h)
+    }
+
+    /// Whether the channel has been closed.
+    fn closed() -> bool {
+        channel_closed(this.h)
+    }
+
+    /// The capacity (how many values fit before a send blocks).
+    fn cap() -> int {
+        channel_cap(this.h)
+    }
+
+    /// Number of values buffered right now.
+    fn len() -> int {
+        channel_len(this.h)
+    }
+}
+
+/// A mutual-exclusion lock.
+class Mutex {
+    var h: int
+
+    constructor() {
+        this.h = mutex_new()
+    }
+
+    /// Take the lock, blocking until free.
+    fn lock() {
+        mutex_lock(this.h)
+    }
+
+    /// Take the lock without blocking. `true` when it was taken.
+    fn tryLock() -> bool {
+        mutex_trylock(this.h)
+    }
+
+    /// Release the lock.
+    fn unlock() {
+        mutex_unlock(this.h)
+    }
+}
+
+/// A condition variable, always used together with a [`Mutex`].
+class CondVar {
+    var h: int
+
+    constructor() {
+        this.h = cond_new()
+    }
+
+    /// Wake one task parked in `wait`.
+    fn signal() {
+        cond_signal(this.h)
+    }
+
+    /// Wake every task parked in `wait`.
+    fn broadcast() {
+        cond_broadcast(this.h)
+    }
+
+    /// Release `m` and sleep until signalled, then re-take `m`.
+    fn wait(m: Mutex) {
+        cond_wait(this.h, m.h)
+    }
+}
+
+/// A counting semaphore.
+class Semaphore {
+    var h: int
+
+    constructor(permits: int) {
+        this.h = sem_new(permits)
+    }
+
+    /// Take `n` permits, blocking until available.
+    fn acquire(n: int) {
+        sem_acquire(this.h, n)
+    }
+
+    /// Take `n` permits without blocking.
+    fn tryAcquire(n: int) -> bool {
+        sem_try_acquire(this.h, n)
+    }
+
+    /// Give `n` permits back.
+    fn release(n: int) {
+        sem_release(this.h, n)
+    }
+}
+
+/// An atomic integer shared across tasks.
+class AtomicInt {
+    var h: int
+
+    constructor(value: int) {
+        this.h = atomic_new(value)
+    }
+
+    /// Read the current value.
+    fn load() -> int {
+        atomic_load(this.h)
+    }
+
+    /// Overwrite the current value.
+    fn store(value: int) {
+        atomic_store(this.h, value)
+    }
+
+    /// Add `delta`, returning the previous value.
+    fn add(delta: int) -> int {
+        atomic_add(this.h, delta)
+    }
+
+    /// Set to `value` only when it still equals `expected`; `true` when it
+    /// was. Returns the previous value either way.
+    fn cas(expected: int, value: int) -> bool {
+        atomic_cas(this.h, expected, value)
+    }
+}
+
+/// Runs a body exactly once, no matter how many callers race for it.
+class Once {
+    var h: int
+
+    constructor() {
+        this.h = once_new()
+    }
+
+    /// Whether the body has run already.
+    fn done() -> bool {
+        once_done(this.h)
+    }
+
+    /// Run `body` unless this task (or another) already did. `true` when this
+    /// caller ran the body; `false` when the work already happened.
+    fn run(body: fn()) -> bool {
+        once_run(this.h, body)
+    }
+}
+
+/// Start `body` (a zero-argument closure must be `.spawn`ed with a shared
+/// handle, since the closure carries the state) on a fresh OS thread and
+/// return a `Task` for it.
+fn spawn(body: fn()) -> Task {
+    Task(thread_spawn(body))
+}
+
+/// Number of task threads alive right now (at least 1, this one).
+fn taskCount() -> int {
+    thread_count()
+}
+
+/// The runtime thread id the caller is running on.
+fn currentId() -> int {
+    thread_current()
+}
+
+/// Sleep this task for `ms` milliseconds, handing the runtime lock over while
+/// napping so peers can make progress.
+fn sleep(ms: int) {
+    sleep_ms(ms)
+}
+
+/// Hint the scheduler to let another task run.
+fn yieldNow() {
+    thread_yield()
+}

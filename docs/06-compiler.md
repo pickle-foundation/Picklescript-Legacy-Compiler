@@ -590,7 +590,7 @@ the above.
   `isf=`, `int=`, `ch=`, `T("...")`/`E[tok; ...]` string segments, and a
   trailing `doc=` for doc-comment trivia). Newline and Eof tokens are
   included. The format is the serialized contract the self-hosted lexer
-  (`compiler-selfhost/lexer/`) reproduces byte-for-byte, so `pickle lex`
+  (`compiler-selfhost/lexer.pkl`) reproduces byte-for-byte, so `pickle lex`
   output on the Rust and self-hosted compilers diff cleanly.
 - `pickle ir`      — dump typed IR.
 - `pickle test`  — discover test modules under `tests/` (or a given path) and JIT-compile, run, report. Directory targets only pick up `*_test.pkl` / `*.test.pkl` files. Supports `test fn name()` and `test("desc", ...)`/`it` suites with `describe` groups and `beforeAll`/`beforeEach`/`afterEach`/`afterAll` hooks; `--filter` narrows by test-name substring (matches the desugared path, so `describe`/`test` names both filter). `#[tag("name")]` on a test item attaches test tags (repeatable); `--tag name` runs only tests carrying it (repeatable, any-tag match, AND-combined with `--filter`).

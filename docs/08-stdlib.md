@@ -14,7 +14,7 @@ import * from std.collections List, Map, Set, Deque, Vec, Stack, Queue, OrderedM
 import * from std.math        sin, cos, sqrt, abs, min, max, pow, floor, ceil, random, PI, E, TAU
 import * from std.crypto      sha256, md5, aes, hmac, randBytes, base64, hex
 import * from std.process     run, spawn, capture, exit, env
-import * from std.thread      thread, channel, task, parallel, Mutex, Atomic, Semaphore, Once
+import * from std.thread      Task, Channel, Mutex, CondVar, Semaphore, AtomicInt, Once, spawn, taskCount, currentId, sleep, yieldNow
 import * from std.time        now, Instant, Duration, sleep, Timer, DateTime
 import * from std.text        String buffer, Unicode helpers, scan/format, regex
 import * from std.gc          collect, stats, Weak, Arena

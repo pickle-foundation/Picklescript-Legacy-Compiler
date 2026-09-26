@@ -250,4 +250,30 @@ foreach ($l in ($out10 | Select-String "test result:")) {
 }
 Write-Output "GATE10 RUNTIME-SELFHOST SUITE (direct: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10fail -eq 0)"
 
+# ---- GATE 11: stdlib byte-parity -- the ported test driver must reproduce the
+# Rust `pickle test` stdout+exit for every stdlib *_test.pkl at any depth
+# (top-level fs/io/json/os/process, collections/*, text/*). GATE9 covers only
+# tests/pickle, so the stdlib suite (34+ tests incl. std.process) was previously
+# battery-untested; all 17 stdlib sources also port-compile cleanly (exit=0). ----
+$g11tests = @(Get-ChildItem "stdlib" -Recurse -Filter *_test.pkl)
+$g11ok = 0; $g11fail = 0; $g11dir = "tools\diff\g11"
+New-Item -ItemType Directory -Path $g11dir -Force | Out-Null
+foreach ($m in $g11tests) {
+    $target = $m.FullName.Substring((Resolve-Path ".").Path.Length + 1)
+    cmd /c "`"$cli`" test `"$target`" > `"$g11dir\rust.txt`" 2>nul"
+    $rc = $LASTEXITCODE
+    & $pklcTest $target 2>&1 | Out-Null
+    $harness = "tools\diff\port\$($m.BaseName)_harness.irx"
+    if (-not (Test-Path -LiteralPath $harness)) {
+        $g11fail++; Write-Output "GATE11 $($m.BaseName): harness not produced"; continue
+    }
+    cmd /c "`"$cli`" irx-run `"$harness`" > `"$g11dir\port.txt`" 2>nul"
+    $ic = $LASTEXITCODE
+    $r = [System.IO.File]::ReadAllText((Resolve-Path "$g11dir\rust.txt"))
+    $p = [System.IO.File]::ReadAllText((Resolve-Path "$g11dir\port.txt"))
+    if ($rc -eq $ic -and $r -eq $p) { $g11ok++ }
+    else { $g11fail++; Write-Output "GATE11 $($m.BaseName): exit=$rc/$ic stdout_match=$($r -eq $p)" }
+}
+Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files): PASS=$g11ok FAIL=$g11fail"
+
 Write-Output "===== BATTERY COMPLETE ====="

@@ -1,0 +1,95 @@
+// Channels, end to end through the JIT.
+//
+// A channel is a bounded buffer shared across tasks: a send blocks when the
+// buffer is full, a receive blocks when it is empty, and the runtime hands the
+// world lock back while a task waits, so a peer can make progress. Sending on a
+// closed channel or receiving from a closed, empty one fails loud and ends the
+// process, so this file never does either — only the drain-and-flag part of
+// `close` is reachable from safe code.
+//
+// Nothing here prints from a task: the interesting moves are the hand-offs
+// themselves, which an interleaved print would only make flaky. The file is
+// also compiled by the ported compiler and compared byte-for-byte against the
+// native run, so the output order has to be fixed.
+
+test fn channels_buffer_values_in_order() {
+    // A channel is a FIFO of arbitrary values; nothing is reordered, nothing
+    // is lost, and the metadata answers agrees.
+    let ch = channel_new(8)
+    expect(channel_cap(ch)).toBe(8)
+    expect(channel_len(ch)).toBe(0)
+    channel_send(ch, 10)
+    channel_send(ch, 20)
+    channel_send(ch, 30)
+    expect(channel_len(ch)).toBe(3)
+    expect(channel_recv(ch)).toBe(10)
+    expect(channel_recv(ch)).toBe(20)
+    expect(channel_recv(ch)).toBe(30)
+    expect(channel_len(ch)).toBe(0)
+}
+
+test fn try_ops_never_block() {
+    // The whole point of the try variants is that they return instead of
+    // pausing: a full `try_send` says no, an empty `try_recv` is none.
+    let ch = channel_new(1)
+    expect(channel_try_send(ch, 1)).toBe(true)
+    expect(channel_len(ch)).toBe(1)
+    expect(channel_try_send(ch, 2)).toBe(false)
+    if (let some(v) = channel_try_recv(ch)) {
+        expect(v).toBe(1)
+    } else {
+        assert(false, "expected the buffered value")
+    }
+    if (let some(v) = channel_try_recv(ch)) {
+        assert(false, "expected none on an empty channel")
+    }
+    expect(channel_len(ch)).toBe(0)
+}
+
+test fn a_blocked_receive_hands_the_lock_back_to_a_sender() {
+    // The receive parks the world lock, so this thread can turn around and
+    // make the value appear from another task. This is the interaction the
+    // lock exists to allow; a single-threaded test cannot see it.
+    let ch = channel_new(1)
+    let seen = atomic_new(0)
+    let t = thread_spawn(fn() {
+        let v = channel_recv(ch)
+        atomic_store(seen, v)
+    })
+    sleep_ms(5)
+    channel_send(ch, 7)
+    expect(thread_join(t)).toBe(true)
+    expect(atomic_load(seen)).toBe(7)
+}
+
+test fn a_blocked_send_hands_the_lock_back_to_a_reader() {
+    // Mirror image: the transfer is full, so the sender has to wait, and the
+    // hand-over happens back to the task that drains the buffer.
+    let ch = channel_new(2)
+    channel_send(ch, 1)
+    channel_send(ch, 2)
+    let t = thread_spawn(fn() { channel_send(ch, 3) })
+    expect(channel_recv(ch)).toBe(1)
+    expect(thread_join(t)).toBe(true)
+    expect(channel_recv(ch)).toBe(2)
+    expect(channel_recv(ch)).toBe(3)
+}
+
+test fn close_marks_the_channel_but_keeps_what_is_buffered() {
+    // Close is a shutdown signal, not a flush: the values already in the
+    // buffer stay readable, and once they are gone the channel reads as empty
+    // forever (a further `recv` would fail loud, so only the try form appears).
+    let ch = channel_new(4)
+    channel_send(ch, 1)
+    channel_send(ch, 2)
+    expect(channel_closed(ch)).toBe(false)
+    channel_close(ch)
+    expect(channel_closed(ch)).toBe(true)
+    expect(channel_recv(ch)).toBe(1)
+    expect(channel_recv(ch)).toBe(2)
+    expect(channel_len(ch)).toBe(0)
+    if (let some(_) = channel_try_recv(ch)) {
+        assert(false, "expected a closed, empty channel to read none")
+    }
+    expect(channel_closed(ch)).toBe(true)
+}

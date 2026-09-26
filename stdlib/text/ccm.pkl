@@ -1,0 +1,4 @@
+import { countChars } from std.text.format
+fn main() {
+    println(countChars("a¢€😀"))
+}

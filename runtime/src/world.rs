@@ -207,17 +207,26 @@ mod tests {
         let inside = AtomicUsize::new(0);
         let overlap = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
+        let arrived = AtomicUsize::new(0);
+        let blocked = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
         let inside_ref = &inside;
         let overlap_ref = &overlap;
         let peak_ref = &peak;
+        let arrived_ref = &arrived;
         let done_ref = &done;
+        // Hold the world lock, then spawn the workers: every one of them has to
+        // park on `acquire` until this thread hands the lock back. That makes
+        // the contention this test exists to observe deterministic instead of
+        // depending on how the OS happens to schedule four short critical
+        // sections.
+        acquire();
         std::thread::scope(|s| {
             for _ in 0..4 {
                 s.spawn(move || {
-                    // Take the lock for a session, exactly as a task does: the
-                    // peers must serialise, and each must be able to leave it
-                    // again (the session ends at `release`, or at thread exit).
+                    // Peer has reached the lock; it cannot be inside the
+                    // critical section until this thread releases.
+                    arrived_ref.fetch_add(1, Ordering::AcqRel);
                     acquire();
                     let now = inside_ref.fetch_add(1, Ordering::AcqRel) + 1;
                     peak_ref.fetch_max(now, Ordering::AcqRel);
@@ -233,10 +242,28 @@ mod tests {
                     done_ref.fetch_add(1, Ordering::AcqRel);
                 });
             }
+            // Every worker is queued behind the lock this thread is holding.
+            for _ in 0..5000 {
+                if arrived.load(Ordering::Acquire) == 4 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(arrived.load(Ordering::Acquire), 4, "all workers reached the lock");
+            // None of them may be inside the critical section: the lock this
+            // thread holds must have excluded them.
+            assert_eq!(
+                inside.load(Ordering::Acquire),
+                0,
+                "a worker ran while the world lock was held elsewhere"
+            );
+            blocked.fetch_add(1, Ordering::AcqRel);
+            release();
         });
         assert_eq!(done.load(Ordering::Acquire), 4);
         assert_eq!(overlap.load(Ordering::Acquire), 0, "two owners at once");
         assert_eq!(peak.load(Ordering::Acquire), 1);
+        assert!(blocked.load(Ordering::Acquire) > 0, "the workers had to wait");
         // A session that ends at thread exit (no `release`) must not wedge the
         // next thread either.
         std::thread::spawn(|| {
@@ -244,7 +271,6 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(contended(), "the workers should have had to wait");
     }
 
     #[test]

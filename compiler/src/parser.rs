@@ -2105,6 +2105,54 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Await(Box::new(inner)),
                 })
             }
+            Tok::Task => {
+                // `task { body }` — sugar for `thread_spawn(fn() { body })`,
+                // desugared here so check and emit see an ordinary spawn call
+                // and the task carries its state exactly as a hand-written
+                // closure does (the block becomes the closure body, captures
+                // and all). The `{` may sit on the next line, but a bare
+                // `task` that is not followed by a block stays the contextual
+                // keyword used as a plain identifier.
+                if self.peek_non_nl(1) == Some(Tok::LBrace) {
+                    self.bump();
+                    self.newlines();
+                    let body = self.parse_block()?;
+                    let end = self.prev_span();
+                    // Distinct spans so the checker's per-span type map keeps
+                    // the closure's `Fn` entry separate from the call's:
+                    // the lambda spans its own `{...}` block, the callee the
+                    // bare `task` token, and the call the whole expression.
+                    let closure = Expr {
+                        span: body.span.clone(),
+                        kind: ExprKind::Lambda {
+                            params: Vec::new(),
+                            return_ty: None,
+                            is_async: false,
+                            body: FnBody::Block(Box::new(body)),
+                        },
+                    };
+                    return Ok(Expr {
+                        span: start.to(end),
+                        kind: ExprKind::Call {
+                            callee: Box::new(Expr {
+                                span: start,
+                                kind: ExprKind::Ident("thread_spawn".to_string()),
+                            }),
+                            args: vec![CallArg {
+                                name: None,
+                                value: closure,
+                                spread: false,
+                                span: end,
+                            }],
+                        },
+                    });
+                }
+                self.bump();
+                Ok(Expr {
+                    span: start.to(self.prev_span()),
+                    kind: ExprKind::Ident("task".to_string()),
+                })
+            }
             Tok::Ident(_) => {
                 if matches!(
                     self.generic_call_flavor(),

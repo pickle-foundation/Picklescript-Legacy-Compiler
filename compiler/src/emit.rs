@@ -10127,6 +10127,18 @@ impl<'a> Emitter<'a> {
             "once_new" => ("pickle_once_new", vec![], Some(Int), &[]),
             "once_done" => ("pickle_once_done", INT.to_vec(), Some(Bool), &["o"]),
             "once_run" => ("pickle_once_run", vec![Int, Ptr], Some(Bool), &["o", "body"]),
+            // Channels. Values cross the ABI as raw integers, boxed only by the
+            // runtime when a receiver takes one out; a `try_recv` may come back
+            // null (`none`).
+            "channel_new" => ("pickle_channel_new", INT.to_vec(), Some(Int), &["cap"]),
+            "channel_cap" => ("pickle_channel_cap", INT.to_vec(), Some(Int), &["ch"]),
+            "channel_len" => ("pickle_channel_len", INT.to_vec(), Some(Int), &["ch"]),
+            "channel_send" => ("pickle_channel_send", vec![Int, Int], NONE, &["ch", "value"]),
+            "channel_try_send" => ("pickle_channel_try_send", vec![Int, Int], Some(Bool), &["ch", "value"]),
+            "channel_recv" => ("pickle_channel_recv", INT.to_vec(), Some(Int), &["ch"]),
+            "channel_try_recv" => ("pickle_channel_try_recv", INT.to_vec(), Some(Ptr), &["ch"]),
+            "channel_close" => ("pickle_channel_close", INT.to_vec(), NONE, &["ch"]),
+            "channel_closed" => ("pickle_channel_closed", INT.to_vec(), Some(Bool), &["ch"]),
             _ => return None,
         })
     }

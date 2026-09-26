@@ -339,6 +339,12 @@ fn run() -> Result<()> {
             jit::register_runtime_symbols();
             // Compiled pickle_* calls need the heap etc. alive while we run.
             pickle_runtime::abi::pickle_runtime_init();
+            // Initialising the runtime grabs the world lock for this thread as
+            // a side effect of `gc_mut()`. Hand it back before spawning the run
+            // thread: the vm thread acquires it the moment it touches the heap,
+            // and this thread only sits in `.join()`, so holding it here would
+            // deadlock.
+            pickle_runtime::world::release();
             forward_program_args(args);
             let program = runner
                 .compile(&module)
@@ -373,6 +379,12 @@ fn run() -> Result<()> {
             jit::register_runtime_symbols();
             // Compiled pickle_* calls need the heap etc. alive while we run.
             pickle_runtime::abi::pickle_runtime_init();
+            // Initialising the runtime grabs the world lock for this thread as
+            // a side effect of `gc_mut()`. Hand it back before spawning the run
+            // thread: the vm thread acquires it the moment it touches the heap,
+            // and this thread only sits in `.join()`, so holding it here would
+            // deadlock.
+            pickle_runtime::world::release();
             forward_program_args(args);
             let program = runner
                 .compile(&module)

@@ -269,6 +269,142 @@ impl POnce {
     }
 }
 
+/// A bounded integer channel: a fixed-capacity ring buffer with blocking
+/// send/receive, a non-blocking pair, and close semantics. One monitor guards
+/// the buffer and the two condition variables, so a wake can never be lost
+/// between a waiter's check and its park: `world::parked_wait` re-checks under
+/// the same mutex it waits on, exactly as an ordinary `Condvar` wait does.
+///
+/// The buffer holds raw `i64` bits — the values are scratch integers, boxed
+/// into managed `IntObject`s only when a receiver takes them out, exactly like
+/// the compiler's other scalar-returning builtins (`atomic_load`). Nothing in
+/// the buffer is a GC object, so no per-slot roots are needed and the ring is
+/// trivially `Sync`.
+pub struct Channel {
+    state: Mutex<ChanState>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+struct ChanState {
+    /// The ring slots. Never resized, so the buffer stays stable for the
+    /// channel's whole lifetime.
+    buf: Vec<i64>,
+    head: usize,
+    count: usize,
+    closed: bool,
+}
+
+impl Channel {
+    fn new(cap: usize) -> Self {
+        Channel {
+            state: Mutex::new(ChanState {
+                buf: vec![0; cap],
+                head: 0,
+                count: 0,
+                closed: false,
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+        }
+    }
+
+    fn cap(&self) -> usize {
+        state_lock(&self.state).buf.len()
+    }
+
+    fn len(&self) -> usize {
+        state_lock(&self.state).count
+    }
+
+    fn closed(&self) -> bool {
+        state_lock(&self.state).closed
+    }
+
+    /// Block until a slot is free, then store `value`. The value is a raw
+    /// scalar, copied into the buffer, so no ownership moves here. A
+    /// subsequent send on a closed channel fails loud.
+    fn send(&self, value: i64) {
+        let mut s = state_lock(&self.state);
+        while !s.closed && s.count == s.buf.len() {
+            s = world::parked_wait(&self.not_full, s);
+        }
+        if s.closed {
+            crate::panic::fatal("pickle: send on closed channel");
+        }
+        let i = (s.head + s.count) % s.buf.len();
+        s.buf[i] = value;
+        s.count += 1;
+        drop(s);
+        self.not_empty.notify_one();
+    }
+
+    /// Store `value` only when a slot is free right now. Never blocks.
+    fn try_send(&self, value: i64) -> bool {
+        let mut s = state_lock(&self.state);
+        if s.closed {
+            crate::panic::fatal("pickle: send on closed channel");
+        }
+        if s.count == s.buf.len() {
+            return false;
+        }
+        let i = (s.head + s.count) % s.buf.len();
+        s.buf[i] = value;
+        s.count += 1;
+        drop(s);
+        self.not_empty.notify_one();
+        true
+    }
+
+    /// Block until a value is available and take it out of the buffer. A
+    /// receive on a closed, empty channel fails loud: draining a closed
+    /// channel is how a worker shuts down, but asking again afterwards is a
+    /// bug.
+    fn recv(&self) -> i64 {
+        let mut s = state_lock(&self.state);
+        while !s.closed && s.count == 0 {
+            s = world::parked_wait(&self.not_empty, s);
+        }
+        if s.count == 0 {
+            crate::panic::fatal("pickle: receive on a closed, empty channel");
+        }
+        let i = s.head;
+        let v = s.buf[i];
+        s.head = (s.head + 1) % s.buf.len();
+        s.count -= 1;
+        drop(s);
+        self.not_full.notify_one();
+        v
+    }
+
+    /// Take a value if one is there. `None` (`none`) when the buffer is
+    /// empty, whether or not the channel is closed.
+    fn try_recv(&self) -> Option<i64> {
+        let mut s = state_lock(&self.state);
+        if s.count == 0 {
+            return None;
+        }
+        let i = s.head;
+        let v = s.buf[i];
+        s.head = (s.head + 1) % s.buf.len();
+        s.count -= 1;
+        drop(s);
+        self.not_full.notify_one();
+        Some(v)
+    }
+
+    /// Mark the channel closed. Senders parked on a full buffer wake into a
+    /// loud failure; receivers parked on an empty buffer wake and drain the
+    /// remainder, then fail on the first empty receive.
+    fn close(&self) {
+        let mut s = state_lock(&self.state);
+        s.closed = true;
+        drop(s);
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+}
+
 /// The registered primitives. A handle is a one-based index, so 0 is the
 /// "null handle" a Pickle `none` lowers to. Entries are leaked: a handle can
 /// outlive the value it names (a `Mutex` may be stored in a struct that
@@ -281,6 +417,7 @@ enum Primitive {
     Sem(PSem),
     Atomic(PAtomic),
     Once(POnce),
+    Channel(Channel),
 }
 
 static OBJECTS: Mutex<Vec<&'static Primitive>> = Mutex::new(Vec::new());
@@ -334,6 +471,13 @@ fn atomic_of(handle: i64) -> Option<&'static PAtomic> {
 fn once_of(handle: i64) -> Option<&'static POnce> {
     match entry(handle) {
         Some(Primitive::Once(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn channel_of(handle: i64) -> Option<&'static Channel> {
+    match entry(handle) {
+        Some(Primitive::Channel(c)) => Some(c),
         _ => None,
     }
 }
@@ -525,6 +669,96 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
     crate::threads::call_closure0(body);
     once.finish();
     true
+}
+
+/// ABI: a new bounded channel with room for `cap` values. Returns a handle.
+#[no_mangle]
+pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
+    let cap = if cap < 1 {
+        crate::panic::fatal(&format!("pickle: channel capacity must be at least 1, got {cap}"));
+    } else {
+        cap as usize
+    };
+    register(Primitive::Channel(Channel::new(cap)))
+}
+
+/// ABI: how many values the channel can hold before a send blocks.
+#[no_mangle]
+pub extern "C" fn pickle_channel_cap(handle: i64) -> i64 {
+    match channel_of(handle) {
+        Some(c) => c.cap() as i64,
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: how many values are buffered right now.
+#[no_mangle]
+pub extern "C" fn pickle_channel_len(handle: i64) -> i64 {
+    match channel_of(handle) {
+        Some(c) => c.len() as i64,
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: block until a slot is free, then store `value` (a raw scalar).
+#[no_mangle]
+pub extern "C" fn pickle_channel_send(handle: i64, value: i64) {
+    match channel_of(handle) {
+        Some(c) => c.send(value),
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: store `value` (a raw scalar) without blocking. Returns 1 on success,
+/// 0 when full.
+#[no_mangle]
+pub extern "C" fn pickle_channel_try_send(handle: i64, value: i64) -> bool {
+    match channel_of(handle) {
+        Some(c) => c.try_send(value),
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: block until a value is available. Returns the raw scalar, like
+/// `atomic_load`; the call site boxes it if it ever lands in an object slot.
+#[no_mangle]
+pub extern "C" fn pickle_channel_recv(handle: i64) -> i64 {
+    match channel_of(handle) {
+        Some(c) => c.recv(),
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: take a value if one is buffered, boxing it (an `Option<int>` carries
+/// boxed objects, and `none` is the null pointer); returns null when empty.
+#[no_mangle]
+pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::PickleObject {
+    match channel_of(handle) {
+        Some(c) => match c.try_recv() {
+            Some(v) => crate::boxscalar::pickle_box_i64(v),
+            None => std::ptr::null_mut(),
+        },
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: mark the channel closed. Sends after this point fail loud; buffered
+/// values can still be received.
+#[no_mangle]
+pub extern "C" fn pickle_channel_close(handle: i64) {
+    match channel_of(handle) {
+        Some(c) => c.close(),
+        None => not_a(handle, "a channel"),
+    }
+}
+
+/// ABI: whether the channel has been closed.
+#[no_mangle]
+pub extern "C" fn pickle_channel_closed(handle: i64) -> bool {
+    match channel_of(handle) {
+        Some(c) => c.closed(),
+        None => not_a(handle, "a channel"),
+    }
 }
 
 #[cfg(test)]
@@ -723,5 +957,96 @@ mod tests {
         // A handle of the wrong kind is a loud error, not a silent confusion.
         assert!(cond_of(m).is_none());
         assert_eq!(pickle_atomic_load(a), 3);
+    }
+
+    #[test]
+    fn channel_forwards_values_in_order() {
+        let _guard = crate::gc::test_begin();
+        let ch = pickle_channel_new(3);
+        assert_eq!(pickle_channel_cap(ch), 3);
+        assert!(pickle_channel_try_recv(ch).is_null(), "empty channel reads null");
+        assert!(pickle_channel_try_send(ch, 0x2A));
+        assert_eq!(pickle_channel_len(ch), 1);
+        assert_eq!(crate::boxscalar::pickle_unbox_i64(pickle_channel_try_recv(ch)), 0x2A);
+        assert_eq!(pickle_channel_len(ch), 0);
+        pickle_channel_send(ch, 0x2B);
+        pickle_channel_send(ch, 0x2C);
+        assert_eq!(pickle_channel_recv(ch), 0x2B);
+        assert_eq!(pickle_channel_recv(ch), 0x2C);
+    }
+
+    #[test]
+    fn channel_is_bounded() {
+        let _guard = crate::gc::test_begin();
+        let ch = pickle_channel_new(1);
+        assert!(pickle_channel_try_send(ch, 0x31));
+        assert!(!pickle_channel_try_send(ch, 0x32), "full channel refuses");
+        assert_eq!(pickle_channel_recv(ch), 0x31);
+        assert!(pickle_channel_try_send(ch, 0x33));
+    }
+
+    #[test]
+    fn channel_close_drains_then_starts_failing() {
+        let _guard = crate::gc::test_begin();
+        let ch = pickle_channel_new(2);
+        pickle_channel_send(ch, 0x41);
+        let stopped = AtomicUsize::new(0);
+        let ch_ref = ch;
+        let stopped_ref = &stopped;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let mut picked = Vec::new();
+                while let Some(v) = {
+                    let v = pickle_channel_try_recv(ch_ref);
+                    if v.is_null() { None } else { Some(crate::boxscalar::pickle_unbox_i64(v)) }
+                } {
+                    picked.push(v);
+                }
+                // Once the channel is closed and drained, receives must fail.
+                for _ in 0..500 {
+                    if pickle_channel_closed(ch) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(pickle_channel_closed(ch_ref));
+                stopped_ref.store(
+                    if picked == vec![0x41] { 1 } else { 2 },
+                    Ordering::Release,
+                );
+            });
+            // Give the reader a moment, then close: it must still see the
+            // buffered value before the next receive fails.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            pickle_channel_close(ch);
+        });
+        assert_eq!(stopped.load(Ordering::Acquire), 1, "buffer drained before close failure");
+    }
+
+    #[test]
+    fn channel_send_hands_over_while_waiting() {
+        // A blocked send must release the world lock so the draining reader can
+        // run; the reader then unblocks the sender, which completes.
+        let _guard = crate::gc::test_begin();
+        let ch = pickle_channel_new(1);
+        pickle_channel_send(ch, 0x51);
+        let delivered = AtomicUsize::new(0);
+        let delivered_ref = &delivered;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                pickle_channel_send(ch, 0x52);
+                delivered_ref.store(1, Ordering::Release);
+            });
+            for _ in 0..200 {
+                if delivered.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                world::parked(std::thread::yield_now);
+            }
+            // The sender is parked on a full buffer; drain it so it can finish.
+            assert_eq!(pickle_channel_recv(ch), 0x51);
+            assert_eq!(pickle_channel_recv(ch), 0x52);
+        });
+        assert_eq!(delivered.load(Ordering::Acquire), 1);
     }
 }
