@@ -97,13 +97,15 @@ fn main() {
 '@ | Set-Content -Encoding utf8 $shim
 
     $exePath = $exe
-    & rustc $shim --edition 2021 -C opt-level=2 -C panic=abort "--extern=pickle_runtime=$rlib" "-C" "link-arg=$(Join-Path $Probe 'funcs.obj')" -o $exePath *> $null
+    & rustc $shim --edition 2021 -C opt-level=2 -C panic=abort "--extern=pickle_runtime=$rlib" "-C" "link-arg=$(Join-Path $Probe 'funcs.obj')" -o $exe *> $null
     if ($LASTEXITCODE -ne 0) { Write-Output "LINK FAIL exit=$LASTEXITCODE"; exit 1 }
 }
 
 # ---- 6. run the probe and compare to the oracle ----
-Push-Location $Probe
-try { $selfOut = (& .\probe.exe 2>$null) } finally { Pop-Location }
+# Run with the same working directory the oracle used, so that programs relying
+# on relative paths (file/stream builtins) are not compared across two CWDs.
+Push-Location $Root
+try { $selfOut = (& $exe 2>$null) } finally { Pop-Location }
 [System.IO.File]::WriteAllBytes((Join-Path $Probe "self.txt"), [System.Text.Encoding]::UTF8.GetBytes(($selfOut -join "`n")))
 $self = [System.IO.File]::ReadAllBytes((Join-Path $Probe "self.txt"))
 $orch = [System.IO.File]::ReadAllBytes((Join-Path $Probe "oracle.txt"))
