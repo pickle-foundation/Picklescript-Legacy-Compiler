@@ -29,6 +29,9 @@ extern "system" {
     ) -> i32;
     pub fn ExitProcess(code: u32) -> !;
 
+    // ---- timing, used by the `nostd` `thread_sleep_ms` backing
+    pub fn Sleep(ms: u32);
+
     // ---- file / directory access, used by the `nostd` `fs` + `stream` backends
     pub fn CreateFileW(
         name: *const u16,
@@ -116,6 +119,15 @@ pub const fn invalid_handle() -> WinHandle {
 /// `FILE_APPEND_DATA`: the write-only access right that forces every write to
 /// land at the end of the file, without an explicit seek.
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+
+/// Pause the current thread for at least `ms` milliseconds.
+///
+/// `Sleep` is a kernel call with no CRT involvement, so it works in a
+/// CRT-less image; the caller clamps the value, since `Sleep` takes an unsigned
+/// count and a negative request would otherwise read as an enormous one.
+pub fn sleep_ms(ms: u32) {
+    unsafe { Sleep(ms) }
+}
 
 /// Buffer size for [`BufferedFile`]. Matches the `BufReader`/`BufWriter`
 /// capacity the `std` build of `stream` uses, so both builds issue the same
@@ -281,7 +293,7 @@ impl Drop for BufferedFile {
 /// write call fails. Never panics.
 pub fn console_write(buf: &[u8]) -> bool {
     let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    if h.is_null() || h == core::ptr::null_mut::<c_void>() as WinHandle {
+    if h.is_null() || core::ptr::eq(h, core::ptr::null_mut::<c_void>()) {
         return false;
     }
     if !buf.is_empty() {
@@ -332,7 +344,7 @@ static GLOBAL: PfHeap = PfHeap;
 /// The mangled names embed the `___rustc` shim-crate disambiguator, which is
 /// stable for a given toolchain; the relevant objects are all produced by the
 /// same `stable-x86_64-pc-windows-msvc` rustc this crate is built with.
-
+///
 /// Marker that proves an allocator shim is linked. `alloc` emits a `call` to
 /// it (rust-lang/rust#141061 turned the marker static into a function), so it
 /// must be real code, not a data static.
@@ -401,8 +413,8 @@ core::arch::global_asm!(
 macro_rules! println {
     ($($arg:tt)*) => {{
         let s = alloc::format!($($arg)*);
-        crate::nostd::console_write(s.as_bytes());
-        crate::nostd::console_write(b"\n");
+        $crate::nostd::console_write(s.as_bytes());
+        $crate::nostd::console_write(b"\n");
     }};
 }
 
@@ -411,8 +423,8 @@ macro_rules! println {
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         let s = alloc::format!($($arg)*);
-        crate::nostd::console_write(s.as_bytes());
-        crate::nostd::console_write(b"\n");
+        $crate::nostd::console_write(s.as_bytes());
+        $crate::nostd::console_write(b"\n");
     }};
 }
 
@@ -440,14 +452,17 @@ unsafe impl<T> Sync for Tls<T> {}
 /// runtime actually uses; anything else fails to compile loudly.
 #[macro_export]
 macro_rules! thread_local {
-    ($( $(#[$attr:meta])* static $name:ident : RefCell<$ty:ty> = const { $e:expr };)+) => {
-        $( $(#[$attr])* static $name: crate::nostd::Tls<core::cell::RefCell<$ty>> = crate::nostd::Tls::new($e);)+
+    ($( $(#[$attr:meta])* $vis:vis static $name:ident : RefCell<$ty:ty> = const { $e:expr };)+) => {
+        $( $(#[$attr])* $vis static $name: $crate::nostd::Tls<core::cell::RefCell<$ty>> = $crate::nostd::Tls::new($e);)+
     };
-    ($( $(#[$attr:meta])* static $name:ident : $ty:ty = const { $e:expr };)+) => {
-        $( $(#[$attr])* static $name: crate::nostd::Tls<$ty> = crate::nostd::Tls::new($e);)+
+    ($( $(#[$attr:meta])* $vis:vis static $name:ident : $ty:ty = const { $e:expr };)+) => {
+        $( $(#[$attr])* $vis static $name: $crate::nostd::Tls<$ty> = $crate::nostd::Tls::new($e);)+
     };
-    ($( $(#[$attr:meta])* static $name:ident : RefCell<$ty:ty> = $e:expr ;)+) => {
-        $( $(#[$attr])* static $name: crate::nostd::Tls<core::cell::RefCell<$ty>> = crate::nostd::Tls::new($e);)+
+    ($( $(#[$attr:meta])* $vis:vis static $name:ident : RefCell<$ty:ty> = $e:expr ;)+) => {
+        $( $(#[$attr])* $vis static $name: $crate::nostd::Tls<core::cell::RefCell<$ty>> = $crate::nostd::Tls::new($e);)+
+    };
+    ($( $(#[$attr:meta])* $vis:vis static $name:ident : $ty:ty = $e:expr ;)+) => {
+        $( $(#[$attr])* $vis static $name: $crate::nostd::Tls<$ty> = $crate::nostd::Tls::new($e);)+
     };
 }
 
@@ -559,7 +574,7 @@ pub fn getenv_present(_name: &str) -> bool {
 /// Defined here (rather than pulling the gigantic `compiler_builtins` rlib
 /// into the flat link) because the full set the objects actually reference is
 /// exactly these seven names plus `memcpy`/`memmove`/`memset`.
-
+///
 /// MSVC uses this sentinel to know that floating point code is referenced;
 /// the object files reference it symbolically, so any definition satisfies it.
 #[no_mangle]
@@ -594,7 +609,7 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
         if x != y {
             return x as i32 - y as i32;
         }
-        i = i + 1;
+        i += 1;
     }
     0
 }
@@ -603,7 +618,7 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 pub unsafe extern "C" fn strlen(s: *const i8) -> usize {
     let mut i = 0;
     while *s.add(i) != 0 {
-        i = i + 1;
+        i += 1;
     }
     i
 }
@@ -619,12 +634,12 @@ pub unsafe extern "C" fn __udivti3(a: u128, b: u128) -> u128 {
     let mut r: u128 = 0;
     let mut i = 128;
     while i > 0 {
-        i = i - 1;
+        i -= 1;
         let bit = (a >> i) & 1;
         r = (r << 1) | bit;
         if r >= b {
-            r = r - b;
-            q = q | (1 << i);
+            r -= b;
+            q |= 1 << i;
         }
     }
     q
@@ -643,8 +658,8 @@ pub unsafe extern "C" fn __extendhfsf2(h: u16) -> f32 {
         let mut m = mant;
         let mut e: i32 = 113;
         while (m & 0x400) == 0 {
-            m = m << 1;
-            e = e - 1;
+            m <<= 1;
+            e -= 1;
         }
         f32::from_bits(sign | ((e as u32) << 23) | ((m & 0x3ff) << 13))
     } else if exp == 0x1f {
@@ -668,9 +683,9 @@ pub unsafe extern "C" fn __truncsfhf2(f: f32) -> u16 {
     let mant = bits & 0x7f_ffff;
     if exp == 0xff {
         if mant == 0 {
-            out = out | 0x7c00;
+            out |= 0x7c00;
         } else {
-            out = out | 0x7c00 | ((mant >> 13) | 0x200);
+            out |= 0x7c00 | ((mant >> 13) | 0x200);
         }
         return out as u16;
     }
@@ -697,14 +712,14 @@ pub unsafe extern "C" fn __truncsfhf2(f: f32) -> u16 {
     let rem = mant & 0x1fff;
     let mut m10 = m10;
     if (rem > 0x1000) || (rem == 0x1000 && (m10 & 1) != 0) {
-        m10 = m10 + 1;
+        m10 += 1;
     }
     if m10 == 0x400 {
         let e2 = e + 1;
         if e2 >= 31 {
             return (out | 0x7c00) as u16;
         }
-        out = out | (((e2 as u32) << 10) & 0x7c00);
+        out |= ((e2 as u32) << 10) & 0x7c00;
         return out as u16;
     }
     out = out | (((e as u32) << 10) & 0x7c00) | m10;

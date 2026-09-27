@@ -1,0 +1,74 @@
+// Exercises the part of the `thread_*` group that a one-thread program can
+// still use.
+//
+// `thread_spawn` and `thread_join` are the two symbols this build does not
+// have: running a body on its own OS thread is exactly what the freestanding
+// slice cannot do, so they stay unavailable and a program that spawns is
+// rejected at compile time rather than failing later. Everything else has a
+// single-threaded answer and is exercised here.
+//
+// The answers are the ones the standard build gives for the same situation
+// rather than invented ones:
+//
+// - a task handle cannot name a task that was never spawned, so `thread_finished`
+//   is false and `thread_message` is none - which is what the standard build
+//   reports for a handle it does not know.
+// - `thread_count` counts spawned tasks, and nothing can be spawned, so it is 0.
+// - `thread_current` is the collector's id for this thread, not a task handle,
+//   and the main thread is registered by GC init in this build too - so it is a
+//   real id, not the 0 that means "not registered".
+// - `thread_yield` hands the world lock to a runnable peer, and there is no
+//   peer, so it is a no-op rather than a wait.
+// - `sleep_ms` is a real pause in both builds, and both clamp the request so a
+//   negative or absurd argument cannot turn into an unbounded wait.
+//
+// This is the check that the group is reachable through a selfhost link rather
+// than merely compiling.
+
+fn main() {
+    // --- the collector's view of this thread --------------------------------
+    let me = thread_current()
+    expect(me > 0)
+
+    // It is an id and not a task handle, so it is stable for the life of the
+    // thread rather than counting anything.
+    expect(thread_current() == me)
+
+    // --- no tasks can exist here --------------------------------------------
+    expect(thread_count() == 0)
+
+    // Nothing was spawned, so no handle names a running task. 0 is the null
+    // handle, and asking about it is how a program probes before it has a real
+    // one; the answer has to be "not finished" either way.
+    expect(thread_finished(0) == false)
+    if (let some(m) = thread_message(0)) {
+        assert(false, "expected no task failure message")
+    }
+
+    // --- sleeping is real in both builds ------------------------------------
+    // A pause long enough to be measurable but short enough not to matter, so
+    // the probe stays quick while still being a genuine wait rather than a
+    // compiled-away call.
+    sleep_ms(20)
+    sleep_ms(0)
+
+    // A negative request is clamped rather than taken literally, matching the
+    // standard build, and so it returns at once. The upper end of the same clamp
+    // is deliberately not exercised here: the runtime caps a sleep at a minute,
+    // so asking for more than that would put a minute of dead time into every
+    // run of this file to prove a `clamp` returns. The cap lives in the two
+    // `pickle_thread_sleep_ms` arms, and both are the same expression.
+    sleep_ms(-1)
+
+    // --- yielding is a no-op with no peer -----------------------------------
+    // Nothing else is runnable, so this returns at once. The point is that it
+    // returns at all: a yield that waited for a peer would hang here.
+    thread_yield()
+    thread_yield()
+
+    // The thread is still the same thread, and still no tasks.
+    expect(thread_current() == me)
+    expect(thread_count() == 0)
+
+    println("thread ok")
+}

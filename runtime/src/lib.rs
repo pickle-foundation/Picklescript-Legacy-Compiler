@@ -43,7 +43,6 @@ mod statics;
 mod stream;
 pub(crate) mod strings;
 mod test;
-#[cfg(not(feature = "nostd"))]
 mod threads;
 mod trace;
 mod r#tuple;
@@ -472,21 +471,15 @@ declare_abi! {
     pickle_test_capture_begin => crate::panic::pickle_test_capture_begin,
     pickle_test_capture_take => crate::panic::pickle_test_capture_take,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_count => crate::threads::pickle_thread_count,
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_current => crate::threads::pickle_thread_current,
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_finished => crate::threads::pickle_thread_finished,
     #[cfg(not(feature = "nostd"))]
     pickle_thread_join => crate::threads::pickle_thread_join,
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_panic_message => crate::threads::pickle_thread_panic_message,
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_sleep_ms => crate::threads::pickle_thread_sleep_ms,
     #[cfg(not(feature = "nostd"))]
     pickle_thread_spawn => crate::threads::pickle_thread_spawn,
-    #[cfg(not(feature = "nostd"))]
     pickle_thread_yield => crate::threads::pickle_thread_yield,
 
     pickle_atomic_add => crate::sync::pickle_atomic_add,

@@ -22,10 +22,15 @@
 //!    aborts the process.
 
 use crate::object::PickleObject;
-use crate::shadow::{self, ShadowFrame};
+use crate::shadow;
+#[cfg(not(feature = "nostd"))]
+use crate::shadow::ShadowFrame;
+#[cfg(not(feature = "nostd"))]
 use crate::world;
+#[cfg(not(feature = "nostd"))]
 use std::sync::{Condvar, Mutex};
 
+#[cfg(not(feature = "nostd"))]
 /// A task's terminal state. `finished` is the join predicate; `panicked` is set
 /// when the body recorded a failure, so `join` can report it and the drain at
 /// exit can surface it rather than running to completion as if nothing had
@@ -44,6 +49,7 @@ struct Outcome {
     parked: u32,
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Per-task state: the join predicate and the parking queue behind it. Handles
 /// are indexes into [`TASKS`], so a task handle is a plain `int` in compiled
 /// code with no GC representation.
@@ -53,22 +59,27 @@ struct TaskState {
     done_cv: Condvar,
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Every task spawned in this process, in handle order. Entries are never
 /// removed: a `Task` value can outlive the task it names, and handles stay valid
 /// for the life of the process.
 static TASKS: Mutex<Vec<std::sync::Arc<TaskState>>> = Mutex::new(Vec::new());
 
+#[cfg(not(feature = "nostd"))]
 /// A managed pointer that is safe to hand to a fresh OS thread. The pointee is
 /// protected by the world lock, not by this wrapper, and the spawning thread
 /// holds that lock until the task takes its own session.
 struct SendPtr(*mut PickleObject);
+#[cfg(not(feature = "nostd"))]
 unsafe impl Send for SendPtr {}
 
+#[cfg(not(feature = "nostd"))]
 /// A zero-argument Pickle closure body: the hoisted `fn` the compiler pointed a
 /// closure object at, called with the closure object as its hidden environment
 /// argument. This is the `CallInd` shape `fn_value_call` emits.
 type TaskFn = unsafe extern "C" fn(*mut PickleObject);
 
+#[cfg(not(feature = "nostd"))]
 /// The task's own shadow frame: a `ShadowFrame` header with one inline slot, so
 /// the frame the collector walks and the slot that roots the closure live in
 /// one object.
@@ -78,6 +89,7 @@ struct TaskFrame {
     slots: [*mut PickleObject; 1],
 }
 
+#[cfg(not(feature = "nostd"))]
 impl TaskFrame {
     fn new(env: *mut PickleObject) -> Self {
         TaskFrame {
@@ -95,15 +107,18 @@ impl TaskFrame {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Pops a shadow frame however the body ends.
 struct FramePop(*mut ShadowFrame);
 
+#[cfg(not(feature = "nostd"))]
 impl Drop for FramePop {
     fn drop(&mut self) {
         shadow::pickle_shadow_pop(self.0);
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// ABI: run `body` (a zero-argument closure object) on a new OS thread and
 /// return its task handle. Called from compiled code with the world lock held;
 /// the task takes the lock for its own session once it gets there.
@@ -137,6 +152,7 @@ pub extern "C" fn pickle_thread_spawn(body: *mut PickleObject) -> i64 {
     handle
 }
 
+#[cfg(not(feature = "nostd"))]
 /// What the spawned OS thread needs: the shared state to report into, the
 /// body's code address (read while the world lock is still the caller's) and
 /// the closure object itself.
@@ -146,6 +162,7 @@ struct TaskRunner {
     env: SendPtr,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl TaskRunner {
     /// The body proper: on a fresh OS thread, registered with the collector,
     /// holding the world lock for its session.
@@ -184,6 +201,7 @@ impl TaskRunner {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 impl TaskState {
     fn finish(&self, panicked: bool, message: Option<String>) {
         let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
@@ -240,6 +258,7 @@ impl TaskState {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// ABI: wait for task `handle` to finish. Returns 1 when the body ran without
 /// recording a failure, 0 when it panicked (the message is then available from
 /// `pickle_thread_panic_message`). An unknown handle reports success.
@@ -256,13 +275,24 @@ pub extern "C" fn pickle_thread_join(handle: i64) -> bool {
 }
 
 /// ABI: whether task `handle` has finished. Never blocks.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_thread_finished(handle: i64) -> bool {
     task_state(handle).is_some_and(|s| s.peek().0)
 }
 
+/// The freestanding slice has no tasks, so no handle can name one and nothing is
+/// ever running: answer "not finished" for every handle, which is also the
+/// answer the standard build gives for a handle it does not know.
+#[cfg(feature = "nostd")]
+#[no_mangle]
+pub extern "C" fn pickle_thread_finished(_handle: i64) -> bool {
+    false
+}
+
 /// ABI: the failure message task `handle` recorded, as a `string` object, or
 /// null when the task is still running or finished cleanly.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_thread_panic_message(handle: i64) -> *mut PickleObject {
     let Some(state) = task_state(handle) else {
@@ -276,6 +306,15 @@ pub extern "C" fn pickle_thread_panic_message(handle: i64) -> *mut PickleObject 
         return core::ptr::null_mut();
     };
     crate::strings::string_from_bytes(message.as_bytes().as_ptr(), message.len(), crate::gc::gc_mut())
+}
+
+/// A task body cannot record a failure here, so there is never a message to
+/// report. Null is the same answer the standard build gives for a task that is
+/// still running or finished cleanly.
+#[cfg(feature = "nostd")]
+#[no_mangle]
+pub extern "C" fn pickle_thread_panic_message(_handle: i64) -> *mut PickleObject {
+    core::ptr::null_mut()
 }
 
 /// ABI: this thread's id in the collector's registry: stable for the life of
@@ -292,23 +331,44 @@ pub extern "C" fn pickle_thread_current() -> i64 {
 }
 
 /// ABI: how many tasks have been spawned in this process.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_thread_count() -> i64 {
     TASKS.lock().unwrap_or_else(|p| p.into_inner()).len() as i64
 }
 
+/// `spawn` is the one entry point this build does not have, so the count of
+/// spawned tasks is always zero.
+#[cfg(feature = "nostd")]
+#[no_mangle]
+pub extern "C" fn pickle_thread_count() -> i64 {
+    0
+}
+
 /// ABI: pause this task for `ms` milliseconds, handing the world lock to a
 /// runnable peer while it sleeps.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_thread_sleep_ms(ms: i64) {
     let ms = ms.clamp(0, 60_000) as u64;
     world::parked(|| std::thread::sleep(std::time::Duration::from_millis(ms)));
 }
 
+/// The clamp is the same, so a program cannot turn a sleep into an unbounded
+/// wait by passing a negative or absurd value. There is no world lock to hand
+/// back: this build has no peer to hand it to.
+#[cfg(feature = "nostd")]
+#[no_mangle]
+pub extern "C" fn pickle_thread_sleep_ms(ms: i64) {
+    let ms = ms.clamp(0, 60_000) as u32;
+    crate::nostd::sleep_ms(ms);
+}
+
 /// ABI: hand the world lock to a runnable peer, then take it back. A bare
 /// `yield_now` is a scheduler hint rather than a hand-off, so this also parks
 /// briefly: a peer that has not been scheduled yet would otherwise find the
 /// lock free and take it straight back.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_thread_yield() {
     world::parked(|| {
@@ -317,6 +377,13 @@ pub extern "C" fn pickle_thread_yield() {
     });
 }
 
+/// Nothing else is runnable, so there is nothing to hand the world lock to and
+/// nothing to wait for. The single thread continues as soon as this returns.
+#[cfg(feature = "nostd")]
+#[no_mangle]
+pub extern "C" fn pickle_thread_yield() {}
+
+#[cfg(not(feature = "nostd"))]
 fn task_state(handle: i64) -> Option<std::sync::Arc<TaskState>> {
     if handle < 0 {
         return None;
@@ -328,6 +395,7 @@ fn task_state(handle: i64) -> Option<std::sync::Arc<TaskState>> {
         .cloned()
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Wait for every spawned task to finish, parking between waits so the tasks
 /// can run. Called from `pickle_runtime_shutdown`: a program's tasks outlive
 /// its `main`, and the heap they touch is about to be torn down. A task that
@@ -352,6 +420,7 @@ pub(crate) fn drain() {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 #[cfg(test)]
 mod tests {
     use super::*;
