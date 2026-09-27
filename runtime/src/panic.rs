@@ -9,7 +9,7 @@
 //!
 //! - *Recoverable*: `assert` (and the test hook) records a message and the
 //!   compiled body carries on, which is already how [`crate::test`] works. A
-//!   task body is in this class too — a task's failure is recorded on the
+//!   task body is in this class too â€” a task's failure is recorded on the
 //!   thread ([`take_task_panic`]) so `join` can report it, and the task is
 //!   checked for that first, before the test harness' global capture mode.
 //! - *Fatal*: `panic`, a `none` unwrap, a non-exhaustive `match`, a bad spread
@@ -61,7 +61,6 @@ pub fn take_captured_panic() -> Option<String> {
 /// a failing test body records a message instead of killing the process. Does
 /// not clear a pending message: a failure recorded before the begin (e.g. by
 /// a hook) must survive until the harness' `captureTake()`.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_test_capture_begin() {
     set_capture_mode(true);
@@ -70,7 +69,6 @@ pub extern "C" fn pickle_test_capture_begin() {
 /// ABI: `captureTake()` from the ported test harness. Exits nothing and
 /// returns the message of the most recent captured failure as a `string?`
 /// object (null when none), or null if capture is off.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_test_capture_take() -> *mut crate::object::PickleObject {
     if is_capturing() {
@@ -117,7 +115,7 @@ pub(crate) fn take_task_panic() -> Option<String> {
     TASK_PANIC.with(|p| p.borrow_mut().take())
 }
 
-/// Record a *recoverable* failure — one whose compiled call site is allowed to
+/// Record a *recoverable* failure â€” one whose compiled call site is allowed to
 /// return and carry on (`assert`, the test hook). Returns whether it was
 /// recorded, i.e. whether the caller should return instead of failing hard.
 ///

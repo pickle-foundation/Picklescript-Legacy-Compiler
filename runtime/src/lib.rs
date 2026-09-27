@@ -338,7 +338,7 @@ macro_rules! declare_abi {
 
         /// The address of ABI symbol `name`, or `None` when it is not part of
         /// the runtime ABI. (Symbols supplied by the host rather than the
-        /// runtime Ã¢â‚¬â€ `pickle_fmod` Ã¢â‚¬â€ are not listed here.)
+        /// runtime ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â `pickle_fmod` ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â are not listed here.)
         pub fn runtime_addr(name: &str) -> Option<usize> {
             match name {
                 $( $( #[$meta] )? stringify!($name) => Some($path as *const () as usize), )*
@@ -470,9 +470,7 @@ declare_abi! {
     pickle_panic_no_iface_method => crate::panic::pickle_panic_no_iface_method,
     pickle_panic_no_match => crate::panic::pickle_panic_no_match,
     pickle_panic_none_unwrap => crate::panic::pickle_panic_none_unwrap,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_capture_begin => crate::panic::pickle_test_capture_begin,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_capture_take => crate::panic::pickle_test_capture_take,
 
     #[cfg(not(feature = "nostd"))]
@@ -577,14 +575,10 @@ declare_abi! {
     pickle_expect_list_contains => crate::test::pickle_expect_list_contains,
     pickle_expect_obj_eq => crate::test::pickle_expect_obj_eq,
     pickle_expect_str_contains => crate::test::pickle_expect_str_contains,
-    #[cfg(not(feature = "nostd"))]
     pickle_runtime_run_tests => crate::test::pickle_runtime_run_tests,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_clear => crate::test::pickle_test_clear,
     pickle_test_fail_obj => crate::test::pickle_test_fail_obj,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_register_hooks => crate::test::pickle_test_register_hooks,
-    #[cfg(not(feature = "nostd"))]
     pickle_test_register_table => crate::test::pickle_test_register_table,
 }
 
