@@ -675,7 +675,11 @@ pub(crate) fn reset() {
 /// allocations. Returns the guard; hold it for the test's duration.
 #[cfg(test)]
 pub(crate) fn test_begin() -> std::sync::MutexGuard<'static, ()> {
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Deliberately `std`'s `Mutex` and not the one imported above: that import
+    // is the freestanding shim under `nostd`, whose guard is a different type,
+    // and every caller here names `std::sync::MutexGuard`. A test target links
+    // `std` whichever build it is testing, so the test lock can too.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

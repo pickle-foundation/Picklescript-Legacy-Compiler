@@ -368,6 +368,10 @@ fn rdl_alloc_error_handler(_size: usize, _align: usize) -> ! {
     }
 }
 
+// A test target links `std`, which brings its own `#[panic_handler]`; two of
+// those in one crate is a duplicate lang item. Ours is for the freestanding
+// image only, where nothing else provides one.
+#[cfg(not(test))]
 #[panic_handler]
 fn on_panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {

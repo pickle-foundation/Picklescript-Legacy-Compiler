@@ -1135,6 +1135,11 @@ mod tests {
         assert!(once.done());
     }
 
+    // Both of these hand the world lock to a peer OS thread, and the world lock
+    // only exists in the standard build. The freestanding build has one thread
+    // and nothing to hand the lock to, so there is no property here for it to
+    // have; the single-threaded answers are covered by the tests above.
+    #[cfg(not(feature = "nostd"))]
     #[test]
     fn a_blocking_op_lets_a_peer_run() {
         // The property the stdlib's channels depend on: parking must hand the
@@ -1241,6 +1246,7 @@ mod tests {
         assert_eq!(stopped.load(Ordering::Acquire), 1, "buffer drained before close failure");
     }
 
+    #[cfg(not(feature = "nostd"))]
     #[test]
     fn channel_send_hands_over_while_waiting() {
         // A blocked send must release the world lock so the draining reader can

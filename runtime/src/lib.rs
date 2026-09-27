@@ -10,7 +10,12 @@
 
 #![allow(dead_code)]
 #![allow(clippy::manual_c_str_literals)]
-#![cfg_attr(feature = "nostd", no_std)]
+// The freestanding image is `no_std`, but a test target needs `std` for the
+// harness and for the tests themselves (they use `std::fs`, `std::thread`,
+// `std::panic::catch_unwind`). So `no_std` stops at `test`: building the test
+// target of this crate links `std` and the `#[cfg(test)]` code compiles
+// normally, while every non-test build is still `no_std`.
+#![cfg_attr(all(feature = "nostd", not(test)), no_std)]
 
 extern crate alloc;
 
