@@ -1,0 +1,37 @@
+// Exercises the whole `pickle_once_*` group. The freestanding (nostd) build
+// runs a single OS thread, so a `once` there is one byte of state behind the
+// same non-blocking primitive the runtime's handle table uses: the first
+// `once_run` wins, the second is refused, and `once_done` latches. That is
+// exactly the part of the contract a single-threaded build can observe.
+//
+// This is the end-to-end check that the group is actually reachable through a
+// selfhost link rather than merely compiling.
+
+fn bump() {
+    println("init ran")
+}
+
+fn main() {
+    let o = once_new()
+
+    // a fresh once has not run yet
+    expect(once_done(o)).toBe(false)
+
+    // the first run wins and reports that it ran
+    expect(once_run(o, bump)).toBe(true)
+    expect(once_done(o)).toBe(true)
+
+    // every later run is refused, and the body is not run a second time
+    expect(once_run(o, bump)).toBe(false)
+    expect(once_run(o, bump)).toBe(false)
+    expect(once_done(o)).toBe(true)
+
+    // a second once is independent of the first
+    let p = once_new()
+    expect(once_done(p)).toBe(false)
+    expect(once_run(p, bump)).toBe(true)
+    expect(once_done(p)).toBe(true)
+    expect(once_done(o)).toBe(true)
+
+    println("once ok")
+}

@@ -483,7 +483,6 @@ enum Primitive {
 #[cfg(not(feature = "nostd"))]
     Sem(PSem),
     Atomic(PAtomic),
-#[cfg(not(feature = "nostd"))]
     Once(POnce),
 #[cfg(not(feature = "nostd"))]
     Channel(Channel),
@@ -539,7 +538,6 @@ fn atomic_of(handle: i64) -> Option<&'static PAtomic> {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 fn once_of(handle: i64) -> Option<&'static POnce> {
     match entry(handle) {
         Some(Primitive::Once(o)) => Some(o),
@@ -552,6 +550,47 @@ fn channel_of(handle: i64) -> Option<&'static Channel> {
     match entry(handle) {
         Some(Primitive::Channel(c)) => Some(c),
         _ => None,
+    }
+}
+
+#[cfg(feature = "nostd")]
+/// Once: 0 = untouched, 1 = a caller is running the initialiser, 2 = done.
+///
+/// The freestanding slice runs a single OS thread, so the state is one byte
+/// behind the same non-blocking `Mutex` the handle table uses: `enter` is a
+/// compare-and-set on the state and nobody can ever be found waiting in the
+/// 1 state, so there is nothing to spin on.
+pub struct POnce {
+    state: Mutex<u8>,
+}
+
+#[cfg(feature = "nostd")]
+impl POnce {
+    fn new() -> Self {
+        POnce {
+            state: Mutex::new(0),
+        }
+    }
+
+    /// Try to become the initialiser. Returns true for the caller that got
+    /// there first (which must then call [`POnce::finish`]), false for a caller
+    /// that found the initialiser already run.
+    fn enter(&self) -> bool {
+        let mut s = state_lock(&self.state);
+        if *s != 0 {
+            return false;
+        }
+        *s = 1;
+        true
+    }
+
+    /// Mark the initialiser done.
+    fn finish(&self) {
+        *state_lock(&self.state) = 2;
+    }
+
+    fn done(&self) -> bool {
+        *state_lock(&self.state) == 2
     }
 }
 
@@ -717,14 +756,12 @@ pub extern "C" fn pickle_atomic_cas(handle: i64, expected: i64, value: i64) -> b
 }
 
 /// ABI: a new `once`. Returns a handle.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_new() -> i64 {
     register(Primitive::Once(POnce::new()))
 }
 
 /// ABI: whether the initialiser has already run.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_done(handle: i64) -> bool {
     match once_of(handle) {
@@ -736,7 +773,6 @@ pub extern "C" fn pickle_once_done(handle: i64) -> bool {
 /// ABI: run `body` (a zero-argument closure object) exactly once across all
 /// tasks. Returns true for the caller that ran it, false for the ones that
 /// waited for it.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleObject) -> bool {
     let Some(once) = once_of(handle) else {
@@ -745,12 +781,12 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
     if !once.enter() {
         return false;
     }
-    // The winner runs the body with the world lock held, like any other call
-    // from compiled code. A body that fails leaves the once "running" and
-    // every other task parked forever: the same contract as a `Once` whose
-    // initialiser aborted, and the honest one ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â silently running the
-    // initialiser twice would be worse than a visible hang.
-    crate::threads::call_closure0(body);
+    // The winner runs the body, like any other call from compiled code. A body
+    // that fails leaves the once "running" and every other task parked forever:
+    // the same contract as a `Once` whose initialiser aborted, and the honest
+    // one - silently running the initialiser twice would be worse than a
+    // visible hang.
+    crate::class::call_closure0(body);
     once.finish();
     true
 }

@@ -69,19 +69,6 @@ unsafe impl Send for SendPtr {}
 /// argument. This is the `CallInd` shape `fn_value_call` emits.
 type TaskFn = unsafe extern "C" fn(*mut PickleObject);
 
-/// Call a zero-argument closure object, with the world lock held. Used by
-/// `task` bodies and by the `once` initialiser.
-pub(crate) fn call_closure0(closure: *mut PickleObject) {
-    if closure.is_null() {
-        return;
-    }
-    // Slot 0 of a closure object is the boxed i64 address of its hoisted body
-    // (see `closure_obj` in the emitter).
-    let addr = crate::boxscalar::box_bits(crate::class::pickle_obj_slot_get(closure, 0));
-    let entry: TaskFn = unsafe { core::mem::transmute(addr as usize) };
-    unsafe { entry(closure) };
-}
-
 /// The task's own shadow frame: a `ShadowFrame` header with one inline slot, so
 /// the frame the collector walks and the slot that roots the closure live in
 /// one object.

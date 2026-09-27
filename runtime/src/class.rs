@@ -199,6 +199,28 @@ pub extern "C" fn pickle_obj_slot_get(obj: *const PickleObject, slot: i64) -> *m
     class_slot(obj, slot)
 }
 
+/// A zero-argument Pickle closure body: the hoisted `fn` the compiler pointed a
+/// closure object at, called with the closure object as its hidden environment
+/// argument. This is the `CallInd` shape `fn_value_call` emits.
+type Closure0Fn = unsafe extern "C" fn(*mut PickleObject);
+
+/// Call a zero-argument closure object. Used by `task` bodies and by the `once`
+/// initialiser.
+///
+/// This lives here rather than in `threads` because `threads` is gated out of
+/// the freestanding build while `once` is not, and reading a closure's entry
+/// point is a property of the object layout.
+pub(crate) fn call_closure0(closure: *mut PickleObject) {
+    if closure.is_null() {
+        return;
+    }
+    // Slot 0 of a closure object is the boxed i64 address of its hoisted body
+    // (see `closure_obj` in the emitter).
+    let addr = crate::boxscalar::box_bits(pickle_obj_slot_get(closure, 0));
+    let entry: Closure0Fn = unsafe { core::mem::transmute(addr as usize) };
+    unsafe { entry(closure) };
+}
+
 /// Write a field slot.
 #[no_mangle]
 pub extern "C" fn pickle_obj_slot_set(obj: *mut PickleObject, slot: i64, value: *mut PickleObject) {

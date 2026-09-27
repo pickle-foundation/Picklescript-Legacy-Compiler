@@ -337,7 +337,7 @@ macro_rules! declare_abi {
 
         /// The address of ABI symbol `name`, or `None` when it is not part of
         /// the runtime ABI. (Symbols supplied by the host rather than the
-        /// runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â `pickle_fmod` ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â are not listed here.)
+        /// runtime ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â `pickle_fmod` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â are not listed here.)
         pub fn runtime_addr(name: &str) -> Option<usize> {
             match name {
                 $( $( #[$meta] )? stringify!($name) => Some($path as *const () as usize), )*
@@ -524,11 +524,8 @@ declare_abi! {
     pickle_mutex_new => crate::sync::pickle_mutex_new,
     pickle_mutex_trylock => crate::sync::pickle_mutex_trylock,
     pickle_mutex_unlock => crate::sync::pickle_mutex_unlock,
-    #[cfg(not(feature = "nostd"))]
     pickle_once_done => crate::sync::pickle_once_done,
-    #[cfg(not(feature = "nostd"))]
     pickle_once_new => crate::sync::pickle_once_new,
-    #[cfg(not(feature = "nostd"))]
     pickle_once_run => crate::sync::pickle_once_run,
     #[cfg(not(feature = "nostd"))]
     pickle_sem_acquire => crate::sync::pickle_sem_acquire,
