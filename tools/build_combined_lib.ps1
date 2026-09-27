@@ -19,7 +19,18 @@ if (-not (Test-Path $Ar)) { throw "ar not found: $Ar" }
 Push-Location $Root
 try {
     $env:RUSTFLAGS = ""
-    cargo build -p pickle-runtime --features nostd --target-dir $TargetDir | Out-Null
+    # cargo writes progress and warnings to stderr. With
+    # $ErrorActionPreference="Stop" PowerShell turns those native stderr
+    # lines into terminating NativeCommandError records, so a mere warning
+    # would abort the build. Relax the preference for the call and rely on
+    # the exit code instead.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        cargo build -p pickle-runtime --features nostd --target-dir $TargetDir 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo build -p pickle-runtime --features nostd failed" }
 } finally {
     Pop-Location
