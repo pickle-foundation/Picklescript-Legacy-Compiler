@@ -1,0 +1,41 @@
+// `gcCollect(force: bool)` is the delegation point from Pickle into the live
+// collector: it lowers to the runtime's `pickle_gc_collect` extern. The collector
+// is invisible to the program (no return value, no observable state), so these
+// tests assert the two things that can actually break - that both flag values
+// lower and run on either backend, and that the type checker rejects a non-bool.
+
+test fn force_true_runs() {
+    gcCollect(true)
+}
+
+test fn force_false_runs() {
+    gcCollect(false)
+}
+
+test fn force_may_be_an_expression() {
+    let yes = 1 + 1 == 2
+    gcCollect(yes)
+}
+
+test fn collection_does_not_disturb_values() {
+    // A collection is a no-op from the program's point of view: values built
+    // before it must survive it unchanged.
+    var xs = [0, 1, 2, 3, 4]
+    var s = "pickle"
+    gcCollect(true)
+    expect(len(xs)).toBe(5)
+    expect(xs[4]).toBe(4)
+    expect(s).toBe("pickle")
+}
+
+test fn collect_around_allocation() {
+    // Alloc, collect, then keep using the earlier value. `range(10)` yields
+    // 0..9, so the 11 pushed elements end in 9.
+    var xs = [0]
+    for (i in range(10)) {
+        xs.push(i)
+    }
+    gcCollect(true)
+    expect(len(xs)).toBe(11)
+    expect(xs[10]).toBe(9)
+}

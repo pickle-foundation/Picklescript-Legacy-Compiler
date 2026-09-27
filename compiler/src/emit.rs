@@ -8540,6 +8540,7 @@ impl<'a> Emitter<'a> {
                         | "current_dir"
                         | "captureBegin"
                         | "captureTake"
+                        | "gcCollect"
                 ) {
                     return false;
                 }
@@ -10150,6 +10151,9 @@ impl<'a> Emitter<'a> {
             "channel_try_recv" => ("pickle_channel_try_recv", INT.to_vec(), Some(Ptr), &["ch"]),
             "channel_close" => ("pickle_channel_close", INT.to_vec(), NONE, &["ch"]),
             "channel_closed" => ("pickle_channel_closed", INT.to_vec(), Some(Bool), &["ch"]),
+            // Garbage collection. `bool` crosses the ABI as the C `bool` the
+            // runtime extern takes, so it needs no boxing.
+            "gcCollect" => ("pickle_gc_collect", vec![Bool], NONE, &["force"]),
             _ => return None,
         })
     }

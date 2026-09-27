@@ -430,6 +430,11 @@ declare_abi! {
     pickle_read_file => crate::fs::pickle_read_file,
     pickle_write_file => crate::fs::pickle_write_file,
 
+    // Garbage collection. `gcCollect` lowers to `pickle_gc_collect`, so without this
+    // row the JIT bails with "unresolved symbol" on the first call.
+    pickle_gc_collect => crate::gc::pickle_gc_collect,
+    pickle_gc_collection_count => crate::gc::pickle_gc_collection_count,
+
     pickle_args => crate::os::pickle_args,
     pickle_args_set => crate::os::pickle_args_set,
     pickle_exit => crate::os::pickle_exit,

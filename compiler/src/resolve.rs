@@ -379,6 +379,13 @@ impl<'a> Resolver<'a> {
             rest: false,
             span,
         };
+        let boolean = |name: &str| ParamInfo {
+            name: name.to_string(),
+            ty: Ty::Bool,
+            has_default: false,
+            rest: false,
+            span,
+        };
         // Variadic `print`/`println` accept any number of args (rest=truthy so
         // the checker treats remaining args as unconstrained).
         let builtins: Vec<CallableInfo> = vec![
@@ -560,6 +567,14 @@ impl<'a> Resolver<'a> {
             mk("thread_current", vec![], Ty::Int, false),
             mk("sleep_ms", vec![any("ms")], Ty::Empty, false),
             mk("thread_yield", vec![], Ty::Empty, false),
+
+            // --- Garbage collection ---
+            //
+            // The delegation point from Pickle into the live collector. Named
+            // `gcCollect`, not `collect`, because `runtime.collector` and
+            // `runtime.gc` already define their own `collect` and an overload
+            // candidate by that name would be ambiguous at every call site.
+            mk("gcCollect", vec![boolean("force")], Ty::Empty, false),
 
             // --- Synchronisation ---
             //

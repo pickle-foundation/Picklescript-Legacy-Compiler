@@ -1,0 +1,23 @@
+// Program-level coverage for `gcCollect`, the Pickle delegation point into the
+// live collector. The `*_test.pkl` suite cannot carry a `main` (the GATE9
+// harness synthesizes its own and a second one collides), so the program path
+// lives here and is covered by GATE4 (AOT lex parity), GATE5 (AOT gen2) and
+// GATE6 (Rust `run` vs the port's own IRX, byte-equal stdout).
+
+fn build() -> List<int> {
+    var xs = [0]
+    for (i in range(8)) {
+        xs.push(i * i)
+    }
+    xs
+}
+
+fn main() {
+    gcCollect(true)
+    var xs = build()
+    gcCollect(false)
+    println("len=" + str(len(xs)))
+    println("sum=" + str(xs[1] + xs[2] + xs[3]))
+    gcCollect(true)
+    println("after=" + str(xs[8]))
+}
