@@ -1,0 +1,80 @@
+// Exercises the whole `pickle_sem_*` and `pickle_cond_*` groups.
+//
+// The freestanding (nostd) build runs a single OS thread, so a semaphore
+// there is a permit counter and `take` spins instead of parking. The contract
+// is unchanged for everything a one-thread program can observe: a permit that
+// is already available is taken, a permit that is not there is refused, and a
+// signal that arrives before the wait is still found by it.
+//
+// Every blocking call below is deliberately one that cannot block: each
+// `sem_acquire` and each `cond_wait` is preceded by enough permits, so the
+// test never depends on a second thread to release them.
+//
+// This is the end-to-end check that the groups are actually reachable through
+// a selfhost link rather than merely compiling.
+
+fn main() {
+    // --- semaphore ---------------------------------------------------------
+    let s = sem_new(2)
+
+    // permits are taken from the front of the budget
+    expect(sem_try_acquire(s, 1)).toBe(true)
+    expect(sem_try_acquire(s, 1)).toBe(true)
+
+    // ...and once the budget is gone, taking is refused rather than parked
+    expect(sem_try_acquire(s, 1)).toBe(false)
+    expect(sem_try_acquire(s, 2)).toBe(false)
+
+    // a permit given back is immediately available again
+    sem_release(s, 1)
+    expect(sem_try_acquire(s, 1)).toBe(true)
+    expect(sem_try_acquire(s, 1)).toBe(false)
+
+    // acquire takes what is there; here two permits are released first, so the
+    // blocking call has them and returns instead of waiting
+    sem_release(s, 2)
+    sem_acquire(s, 2)
+    expect(sem_try_acquire(s, 1)).toBe(false)
+
+    // a request for more than the whole budget is refused even when the
+    // semaphore is completely empty
+    sem_release(s, 5)
+    expect(sem_try_acquire(s, 5)).toBe(true)
+    expect(sem_try_acquire(s, 1)).toBe(false)
+
+    // --- condition variable -----------------------------------------------
+    let c = cond_new()
+
+    // a signal left waiting is found by the next wait
+    cond_signal(c)
+    cond_wait(c, 0)
+
+    // `broadcast` releases the waiters that are already parked, and a parked
+    // waiter is one that gave up its permit and is spinning. With a single
+    // thread there is never one, so a broadcast here is a no-op: it must not
+    // manufacture a permit out of nothing.
+    cond_broadcast(c)
+
+    // ...which is why the next wait has to be given its own signal
+    cond_signal(c)
+    cond_wait(c, 0)
+
+    // two condvars stay independent: signalling one does not wake the other
+    let d = cond_new()
+    cond_signal(d)
+    cond_wait(d, 0)
+
+    // --- cond_wait around a mutex -----------------------------------------
+    // The Go/Java contract: release the mutex, wait, come back holding it.
+    // The mutex is taken again afterwards, so try_lock fails and only the
+    // unlock in between let it be free.
+    let m = mutex_new()
+    cond_signal(c)
+    cond_wait(c, m)
+    expect(mutex_trylock(m)).toBe(false)
+    mutex_unlock(m)
+    expect(mutex_trylock(m)).toBe(true)
+    mutex_unlock(m)
+
+    println("sem_cond ok")
+}

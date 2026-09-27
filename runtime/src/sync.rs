@@ -1,8 +1,8 @@
 //! Blocking synchronisation primitives for tasks: mutex, condition, semaphore,
 //! atomics and once.
 //!
-//! All the blocking primitives are the same shape ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a count of permits plus a
-//! parking queue ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â because the interesting part is not what they mean to a
+//! All the blocking primitives are the same shape ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â a count of permits plus a
+//! parking queue ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â because the interesting part is not what they mean to a
 //! Pickle program but *where* they are allowed to block. A task that waits must
 //! hand the world lock ([`crate::world`]) to a runnable peer, and it must not
 //! hold a Rust mutex while it parks: a peer that holds the world lock and needs
@@ -17,13 +17,14 @@
 //! impossible to lose: a waiter between "no permits" and "parked" is already
 //! counted, and a waiter that has not counted itself yet re-checks the permits
 //! under the same mutex before parking. There is deliberately no
-//! predicate-plus-signal API here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a bare `Condvar` handoff cannot be made
-//! atomic from user code ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â so `condWait`/`condSignal` are a one-permit
+//! predicate-plus-signal API here ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â a bare `Condvar` handoff cannot be made
+//! atomic from user code ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â so `condWait`/`condSignal` are a one-permit
 //! semaphore, where the permit is the thing that cannot be dropped.
 
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(feature = "nostd"))]
 use crate::world;
 #[cfg(not(feature = "nostd"))]
@@ -38,7 +39,6 @@ use crate::nostd::sync::{Mutex, MutexGuard};
 /// Permits plus parked-waiter bookkeeping. One mutex, so the check and the
 /// count cannot be observed out of order.
 #[derive(Default)]
-#[cfg(not(feature = "nostd"))]
 struct SemState {
     permits: i64,
     parked: u32,
@@ -118,75 +118,123 @@ impl PSemaphore {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
-/// A non-recursive mutex: one permit, so locking twice on a thread that
-/// already holds it parks forever, exactly as a real mutex would deadlock.
-pub struct PMutex {
-    sem: PSemaphore,
+#[cfg(feature = "nostd")]
+/// A counting semaphore: the one blocking primitive the rest are built from.
+///
+/// The freestanding slice runs a single OS thread, so no other task can ever
+/// hand a permit over: `take` spins instead of parking. The contract is the
+/// same either way (a caller waits until the permits exist), and a program
+/// that waits for a permit nobody will release still hangs visibly rather than
+/// quietly taking the permit.
+pub struct PSemaphore {
+    state: Mutex<SemState>,
 }
 
-#[cfg(not(feature = "nostd"))]
+#[cfg(feature = "nostd")]
+impl PSemaphore {
+    fn new(permits: i64) -> Self {
+        PSemaphore {
+            state: Mutex::new(SemState {
+                permits,
+                parked: 0,
+            }),
+        }
+    }
+
+    /// Take `n` permits, waiting until they exist.
+    fn take(&self, n: i64) {
+        loop {
+            {
+                let mut s = state_lock(&self.state);
+                if s.permits >= n {
+                    s.permits -= n;
+                    return;
+                }
+                // Count ourselves so `broadcast` can tell how many permits to
+                // hand out, exactly as the parking build does.
+                s.parked += 1;
+            }
+            core::hint::spin_loop();
+            state_lock(&self.state).parked -= 1;
+        }
+    }
+
+    /// Take `n` permits if they are free right now. Never blocks.
+    fn try_take(&self, n: i64) -> bool {
+        let mut s = state_lock(&self.state);
+        if s.permits < n {
+            return false;
+        }
+        s.permits -= n;
+        true
+    }
+
+    /// Return `n` permits, waking a waiter if there is one.
+    fn give(&self, n: i64) {
+        state_lock(&self.state).permits += n;
+    }
+
+    /// Return `n` permits, waking every waiter parked right now. A waiter that
+    /// parks after this call finds the permits waiting for it instead, so no
+    /// wakeup is lost either way.
+    fn give_all(&self, n: i64) {
+        self.give(n);
+    }
+
+    /// How many threads are waiting for a permit.
+    fn parked(&self) -> u32 {
+        state_lock(&self.state).parked
+    }
+}
+
+/// A non-recursive mutex: one permit, so locking twice on a thread that
+/// already holds it parks forever, exactly as a real mutex would deadlock.
+///
+/// `held` mirrors whether a caller currently holds the lock, and exists only
+/// so that `unlock` is idempotent. A semaphore cannot tell "held" from "free
+/// with a surplus permit", so without it a stray `unlock` would hand out a
+/// second permit and leave the budget inflated: the next `lock` would then
+/// succeed without excluding anybody, and `condWait` (which releases the mutex
+/// around its wait) would silently return with the mutex unlocked.
+pub struct PMutex {
+    sem: PSemaphore,
+    held: AtomicBool,
+}
+
 impl PMutex {
     fn new() -> Self {
         PMutex {
             sem: PSemaphore::new(1),
+            held: AtomicBool::new(false),
         }
     }
 
     fn lock(&self) {
         self.sem.take(1);
+        self.held.store(true, Ordering::Release);
     }
 
     fn try_lock(&self) -> bool {
-        self.sem.try_take(1)
-    }
-
-    fn unlock(&self) {
-        self.sem.give(1);
-    }
-}
-
-#[cfg(feature = "nostd")]
-/// A non-recursive mutex.
-///
-/// The freestanding slice runs a single OS thread, so the same non-blocking
-/// `Mutex` the primitive handle table uses is enough: it still admits one
-/// holder at a time, and re-locking without unlocking trips the `RefCell`
-/// borrow check and panics rather than parking. When real threads land this
-/// has to become a parking lock.
-pub struct PMutex {
-    held: Mutex<bool>,
-}
-
-#[cfg(feature = "nostd")]
-impl PMutex {
-    fn new() -> Self {
-        PMutex {
-            held: Mutex::new(false),
-        }
-    }
-
-    fn lock(&self) {
-        *state_lock(&self.held) = true;
-    }
-
-    fn try_lock(&self) -> bool {
-        let Ok(mut h) = self.held.try_lock() else {
-            return false;
-        };
-        if *h {
+        if self.held.load(Ordering::Acquire) {
             return false;
         }
-        *h = true;
+        if !self.sem.try_take(1) {
+            return false;
+        }
+        self.held.store(true, Ordering::Release);
         true
     }
 
     fn unlock(&self) {
-        *state_lock(&self.held) = false;
+        // A mutex this thread does not hold stays free: handing the permit
+        // back anyway is what inflates the budget.
+        if !self.held.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.sem.give(1);
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 /// A condition variable, modelled as a permit counter rather than a bare
 /// `Condvar` so a `signal` cannot be lost between a waiter's check and its
 /// park: a permit is either handed to a parked waiter or left for the next one.
@@ -194,7 +242,6 @@ pub struct PCond {
     sem: PSemaphore,
 }
 
-#[cfg(not(feature = "nostd"))]
 impl PCond {
     fn new() -> Self {
         PCond {
@@ -218,13 +265,11 @@ impl PCond {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 /// A counting semaphore with `permits` initially available.
 pub struct PSem {
     sem: PSemaphore,
 }
 
-#[cfg(not(feature = "nostd"))]
 impl PSem {
     fn new(permits: i64) -> Self {
         PSem {
@@ -338,7 +383,7 @@ impl POnce {
 /// between a waiter's check and its park: `world::parked_wait` re-checks under
 /// the same mutex it waits on, exactly as an ordinary `Condvar` wait does.
 ///
-/// The buffer holds raw `i64` bits ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the values are scratch integers, boxed
+/// The buffer holds raw `i64` bits ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the values are scratch integers, boxed
 /// into managed `IntObject`s only when a receiver takes them out, exactly like
 /// the compiler's other scalar-returning builtins (`atomic_load`). Nothing in
 /// the buffer is a GC object, so no per-slot roots are needed and the ring is
@@ -478,9 +523,7 @@ impl Channel {
 /// value a stable address.
 enum Primitive {
     Mutex(PMutex),
-#[cfg(not(feature = "nostd"))]
     Cond(PCond),
-#[cfg(not(feature = "nostd"))]
     Sem(PSem),
     Atomic(PAtomic),
     Once(POnce),
@@ -515,7 +558,6 @@ fn mutex_of(handle: i64) -> Option<&'static PMutex> {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 fn cond_of(handle: i64) -> Option<&'static PCond> {
     match entry(handle) {
         Some(Primitive::Cond(c)) => Some(c),
@@ -523,7 +565,6 @@ fn cond_of(handle: i64) -> Option<&'static PCond> {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 fn sem_of(handle: i64) -> Option<&'static PSem> {
     match entry(handle) {
         Some(Primitive::Sem(s)) => Some(s),
@@ -630,7 +671,6 @@ pub extern "C" fn pickle_mutex_unlock(handle: i64) {
 }
 
 /// ABI: a new condition variable. Returns a handle.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_new() -> i64 {
     register(Primitive::Cond(PCond::new()))
@@ -638,7 +678,6 @@ pub extern "C" fn pickle_cond_new() -> i64 {
 
 /// ABI: wake one waiter. A signal with no waiter parked yet is remembered, so
 /// the next `condWait` returns immediately.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_signal(handle: i64) {
     match cond_of(handle) {
@@ -648,7 +687,6 @@ pub extern "C" fn pickle_cond_signal(handle: i64) {
 }
 
 /// ABI: wake every waiter parked right now.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_broadcast(handle: i64) {
     match cond_of(handle) {
@@ -659,7 +697,6 @@ pub extern "C" fn pickle_cond_broadcast(handle: i64) {
 
 /// ABI: release `mutex`, wait on `cond`, and return with `mutex` held again (the
 /// Go/Java condition-variable contract). A null `mutex` waits without one.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_wait(cond: i64, mutex: i64) {
     let Some(c) = cond_of(cond) else {
@@ -676,14 +713,12 @@ pub extern "C" fn pickle_cond_wait(cond: i64, mutex: i64) {
 }
 
 /// ABI: a new semaphore with `permits` available. Returns a handle.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_new(permits: i64) -> i64 {
     register(Primitive::Sem(PSem::new(permits)))
 }
 
 /// ABI: take `n` permits, parking until they are available.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_acquire(handle: i64, n: i64) {
     match sem_of(handle) {
@@ -693,7 +728,6 @@ pub extern "C" fn pickle_sem_acquire(handle: i64, n: i64) {
 }
 
 /// ABI: take `n` permits without blocking. Returns 1 on success.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_try_acquire(handle: i64, n: i64) -> bool {
     match sem_of(handle) {
@@ -703,7 +737,6 @@ pub extern "C" fn pickle_sem_try_acquire(handle: i64, n: i64) -> bool {
 }
 
 /// ABI: return `n` permits, waking a waiter.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_release(handle: i64, n: i64) {
     match sem_of(handle) {
