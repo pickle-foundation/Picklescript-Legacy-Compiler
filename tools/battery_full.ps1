@@ -17,6 +17,13 @@ function ByteEq([string]$a, [string]$b) {
 $cli = (Resolve-Path "target\debug\pickle-cli.exe").Path
 $repoAbs = (Resolve-Path ".").Path
 
+# tools/diff/ is gitignored, so a clean checkout has none of these. Only main.pkl mkdirs
+# its own output dir; the gen2 drivers write_file into tools/diff/gen2 unconditionally,
+# which is a silent no-op when the dir is missing (GATE2/5 then report all-mismatch).
+foreach ($d in @("tools\diff\oracle", "tools\diff\port", "tools\diff\gen2")) {
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+}
+
 # ---- Battery targets: 13 self targets (12 compiler-selfhost + cli-selfhost/main) ----
 # Genuine oracles already regenerated for all 13 (tools/diff/oracle/<t>.pkl_gen.{ir,irx}).
 # NOTE (path-collision): the JIT refuses to re-compile a target whose path string is exactly
@@ -90,7 +97,11 @@ if (-not (Test-Path -LiteralPath $pklc)) {
 } else {
     $battery = @(Get-ChildItem "tests\pickle\*_main.pkl") + @(Get-ChildItem "tests\pickle\*_test.pkl")
     $aotNames = @($battery | ForEach-Object { $_.BaseName })
-    & $pklc $aotNames 2>&1 | Out-Null
+    # The driver read_file()s each argv entry verbatim (it only falls back to
+    # list_dir("tests/pickle") when argv is empty), so it needs real paths. Passing
+    # basenames makes every target fail with "cannot read" and no .lex is produced.
+    $aotPaths = @($battery | ForEach-Object { "tests\pickle\$($_.Name)" })
+    & $pklc $aotPaths 2>&1 | Out-Null
     $gate4ok = 0; $gate4fail = 0; $gate4skip = 0
     foreach ($n in $aotNames) {
         $portLex = "tools\diff\port\$n.pkl.lex"
