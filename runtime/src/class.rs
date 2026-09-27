@@ -14,6 +14,7 @@ use crate::object::{
     builtin_nop_finalizer, ClassDescriptor, PickleObject, PICKLE_CLASS_FLAG_FINALIZER,
     PICKLE_CLASS_USER_BASE,
 };
+use alloc::boxed::Box;
 
 /// Total byte size of a class instance with `field_count` managed slots.
 pub fn class_object_size(field_count: usize) -> usize {

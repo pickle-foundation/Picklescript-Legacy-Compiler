@@ -8,7 +8,11 @@
 
 use crate::object::PickleObject;
 use crate::strings::string_from_bytes;
+use alloc::vec::Vec;
+#[cfg(not(feature = "nostd"))]
 use std::sync::Mutex;
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::Mutex;
 
 /// Owned copy of the program's arguments, excluding the program name.
 static PROGRAM_ARGS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -76,5 +80,8 @@ pub extern "C" fn pickle_args() -> *mut PickleObject {
 #[no_mangle]
 pub extern "C" fn pickle_exit(code: i64) -> ! {
     crate::console::pickle_flush();
+    #[cfg(not(feature = "nostd"))]
     std::process::exit(code.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    #[cfg(feature = "nostd")]
+    unsafe { crate::nostd::ExitProcess(code.clamp(0, u32::MAX as i64) as u32) }
 }

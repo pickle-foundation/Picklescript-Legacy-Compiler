@@ -23,7 +23,6 @@ extern crate alloc as alloc_macros;
 mod nostd;
 
 mod boxscalar;
-#[cfg(not(feature = "nostd"))]
 mod class;
 pub(crate) mod console;
 mod r#enum;
@@ -34,7 +33,6 @@ mod layout;
 mod list;
 mod map;
 mod object;
-#[cfg(not(feature = "nostd"))]
 mod os;
 mod panic;
 #[cfg(not(feature = "nostd"))]
@@ -356,27 +354,16 @@ declare_abi! {
     pickle_runtime_reset => crate::pickle_runtime_reset,
     pickle_runtime_shutdown => crate::pickle_runtime_shutdown,
 
-#[cfg(not(feature = "nostd"))]
     pickle_class_add_iface_method => crate::class::pickle_class_add_iface_method,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_add_interface => crate::class::pickle_class_add_interface,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_cast => crate::class::pickle_class_cast,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_implements => crate::class::pickle_class_implements,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_is => crate::class::pickle_class_is,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_new => crate::class::pickle_class_new,
-    #[cfg(not(feature = "nostd"))]
     pickle_class_register => crate::class::pickle_class_register,
-    #[cfg(not(feature = "nostd"))]
     pickle_iface_cast => crate::class::pickle_iface_cast,
-    #[cfg(not(feature = "nostd"))]
     pickle_iface_method => crate::class::pickle_iface_method,
-    #[cfg(not(feature = "nostd"))]
     pickle_obj_slot_get => crate::class::pickle_obj_slot_get,
-    #[cfg(not(feature = "nostd"))]
     pickle_obj_slot_set => crate::class::pickle_obj_slot_set,
 
     #[cfg(not(feature = "nostd"))]
@@ -443,11 +430,8 @@ declare_abi! {
     pickle_read_file => crate::fs::pickle_read_file,
     pickle_write_file => crate::fs::pickle_write_file,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_args => crate::os::pickle_args,
-    #[cfg(not(feature = "nostd"))]
     pickle_args_set => crate::os::pickle_args_set,
-    #[cfg(not(feature = "nostd"))]
     pickle_exit => crate::os::pickle_exit,
 
     #[cfg(not(feature = "nostd"))]

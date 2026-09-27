@@ -208,7 +208,7 @@ mod backend {
                     let d = data.assume_init_ref();
                     let name = &d.c_file_name;
                     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-                    let is_dot = len == 1 && (name[0] == '.' as u16 || name[0] == '.' as u16);
+                    let is_dot = len == 1 && name[0] == '.' as u16;
                     let is_dotdot = len == 2 && name[0] == '.' as u16 && name[1] == '.' as u16;
                     if !is_dot && !is_dotdot {
                         let mut child: Vec<u16> = w[..w.len() - 1].to_vec();
