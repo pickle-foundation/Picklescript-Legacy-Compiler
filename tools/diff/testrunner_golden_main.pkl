@@ -1,0 +1,77 @@
+module difftest.golden
+
+import { TestCase, Hook, runTests } from std.test
+
+class LogSink {
+    static var entries: List<int> = [0]
+}
+
+fn logClear() {
+    var fresh: List<int> = [0]
+    fresh.pop()
+    LogSink.entries = fresh
+}
+
+fn logPush(v: int) {
+    LogSink.entries.push(v)
+}
+
+fn noop() {}
+
+fn pass() -> string? {
+    none
+}
+
+fn failMsg() -> string? {
+    "nope"
+}
+
+fn failAssert() -> string? {
+    "assertion failed"
+}
+
+fn emptyHooks() -> List<Hook> {
+    var l = [Hook("", 0, noop)]
+    l.pop()
+    l
+}
+
+fn main() {
+    // Scenario 1: two passing tests. Report format pinned by the Rust runner's
+    // own unit test at runtime/src/test.rs:496.
+    let c1 = runTests([TestCase("pass_a", pass), TestCase("pass_b", pass)], emptyHooks())
+    if (c1 != 0) {
+        println("GOLDEN FAIL: 2-pass scenario returned " + str(c1))
+        exit(1)
+    }
+
+    // Scenario 2: mixed pass/fail, both failure spellings. Pinned by
+    // runtime/src/test.rs:528.
+    let c2 = runTests([TestCase("ok", pass), TestCase("bad", failMsg), TestCase("boom", failAssert)], emptyHooks())
+    if (c2 != 1) {
+        println("GOLDEN FAIL: mixed scenario returned " + str(c2))
+        exit(1)
+    }
+
+    // Scenario 3: hook scheduling. Hooks are registered on the root group, so no
+    // `describe` header is printed and the report matches the same format the two
+    // Rust-pinned scenarios use. The recorded order is the proof that
+    // beforeAll/beforeEach/afterEach/afterAll fire in that sequence.
+    logClear()
+    let hooks = [
+        Hook("", 0, () => { logPush(0) }),
+        Hook("", 1, () => { logPush(1) }),
+        Hook("", 2, () => { logPush(2) }),
+        Hook("", 3, () => { logPush(3) }),
+    ]
+    let c3 = runTests([TestCase("hook_order", pass)], hooks)
+    if (c3 != 0) {
+        println("GOLDEN FAIL: hook scenario returned " + str(c3))
+        exit(1)
+    }
+    let e = LogSink.entries
+    if (len(e) != 4 || e[0] != 0 || e[1] != 1 || e[2] != 2 || e[3] != 3) {
+        println("GOLDEN FAIL: hook order was not beforeAll,beforeEach,afterEach,afterAll")
+        exit(1)
+    }
+}

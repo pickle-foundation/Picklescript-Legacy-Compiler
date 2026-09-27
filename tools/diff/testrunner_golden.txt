@@ -1,0 +1,9 @@
+test pass_a ... ok
+test pass_b ... ok
+test result: 2 passed; 0 failed
+test ok ... ok
+test bad ... FAILED (nope)
+test boom ... FAILED (assertion failed)
+test result: 1 passed; 2 failed
+test hook_order ... ok
+test result: 1 passed; 0 failed
