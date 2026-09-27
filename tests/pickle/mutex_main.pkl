@@ -1,0 +1,54 @@
+// Exercises the whole `pickle_mutex_*` group. The freestanding (nostd) build
+// runs a single OS thread, so the mutex there is the same non-blocking
+// primitive the runtime's own handle table uses: it still admits one holder at
+// a time, which is all the observable behaviour this test can check. Real
+// contention is the threads group's problem.
+//
+// This is the end-to-end check that the group is actually reachable through a
+// selfhost link rather than merely compiling.
+
+fn main() {
+    // a fresh mutex is unlocked, so the first try_lock wins
+    let m = mutex_new()
+    expect(mutex_trylock(m)).toBe(true)
+
+    // while it is held, a second attempt is refused rather than parked
+    expect(mutex_trylock(m)).toBe(false)
+
+    // ...and it stays refused however many times we ask
+    expect(mutex_trylock(m)).toBe(false)
+
+    // unlocking hands it to the next caller
+    mutex_unlock(m)
+    expect(mutex_trylock(m)).toBe(true)
+    mutex_unlock(m)
+
+    // lock/unlock is repeatable, and two mutexes never interfere
+    let n = mutex_new()
+    mutex_lock(m)
+    mutex_lock(n)
+    mutex_unlock(n)
+    mutex_unlock(m)
+    expect(mutex_trylock(m)).toBe(true)
+    expect(mutex_trylock(n)).toBe(true)
+    mutex_unlock(m)
+    mutex_unlock(n)
+
+    // handles are independent: locking one leaves the other free
+    let a = mutex_new()
+    let b = mutex_new()
+    expect(mutex_trylock(a)).toBe(true)
+    expect(mutex_trylock(b)).toBe(true)
+    expect(mutex_trylock(a)).toBe(false)
+    mutex_unlock(a)
+    mutex_unlock(b)
+
+    // a mutex held by nobody can be taken again after an extra unlock, which
+    // keeps `unlock` idempotent enough not to wedge a later lock
+    let c = mutex_new()
+    mutex_unlock(c)
+    expect(mutex_trylock(c)).toBe(true)
+    mutex_unlock(c)
+
+    println("mutex ok")
+}

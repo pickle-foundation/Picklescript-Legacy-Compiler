@@ -520,13 +520,9 @@ declare_abi! {
     pickle_cond_signal => crate::sync::pickle_cond_signal,
     #[cfg(not(feature = "nostd"))]
     pickle_cond_wait => crate::sync::pickle_cond_wait,
-    #[cfg(not(feature = "nostd"))]
     pickle_mutex_lock => crate::sync::pickle_mutex_lock,
-    #[cfg(not(feature = "nostd"))]
     pickle_mutex_new => crate::sync::pickle_mutex_new,
-    #[cfg(not(feature = "nostd"))]
     pickle_mutex_trylock => crate::sync::pickle_mutex_trylock,
-    #[cfg(not(feature = "nostd"))]
     pickle_mutex_unlock => crate::sync::pickle_mutex_unlock,
     #[cfg(not(feature = "nostd"))]
     pickle_once_done => crate::sync::pickle_once_done,

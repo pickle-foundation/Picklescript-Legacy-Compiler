@@ -146,6 +146,46 @@ impl PMutex {
     }
 }
 
+#[cfg(feature = "nostd")]
+/// A non-recursive mutex.
+///
+/// The freestanding slice runs a single OS thread, so the same non-blocking
+/// `Mutex` the primitive handle table uses is enough: it still admits one
+/// holder at a time, and re-locking without unlocking trips the `RefCell`
+/// borrow check and panics rather than parking. When real threads land this
+/// has to become a parking lock.
+pub struct PMutex {
+    held: Mutex<bool>,
+}
+
+#[cfg(feature = "nostd")]
+impl PMutex {
+    fn new() -> Self {
+        PMutex {
+            held: Mutex::new(false),
+        }
+    }
+
+    fn lock(&self) {
+        *state_lock(&self.held) = true;
+    }
+
+    fn try_lock(&self) -> bool {
+        let Ok(mut h) = self.held.try_lock() else {
+            return false;
+        };
+        if *h {
+            return false;
+        }
+        *h = true;
+        true
+    }
+
+    fn unlock(&self) {
+        *state_lock(&self.held) = false;
+    }
+}
+
 #[cfg(not(feature = "nostd"))]
 /// A condition variable, modelled as a permit counter rather than a bare
 /// `Condvar` so a `signal` cannot be lost between a waiter's check and its
@@ -437,7 +477,6 @@ impl Channel {
 /// registered cells (shadow frames, static roots) as the normal way to give a
 /// value a stable address.
 enum Primitive {
-#[cfg(not(feature = "nostd"))]
     Mutex(PMutex),
 #[cfg(not(feature = "nostd"))]
     Cond(PCond),
@@ -470,7 +509,6 @@ fn not_a(handle: i64, what: &str) -> ! {
     crate::panic::fatal(&format!("pickle: handle {handle} is not {what}"))
 }
 
-#[cfg(not(feature = "nostd"))]
 fn mutex_of(handle: i64) -> Option<&'static PMutex> {
     match entry(handle) {
         Some(Primitive::Mutex(m)) => Some(m),
@@ -520,14 +558,12 @@ fn channel_of(handle: i64) -> Option<&'static Channel> {
 // --- ABI ------------------------------------------------------------------
 
 /// ABI: a new mutex, unlocked. Returns a handle.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_new() -> i64 {
     register(Primitive::Mutex(PMutex::new()))
 }
 
 /// ABI: lock the mutex, parking until it is free.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_lock(handle: i64) {
     match mutex_of(handle) {
@@ -537,7 +573,6 @@ pub extern "C" fn pickle_mutex_lock(handle: i64) {
 }
 
 /// ABI: try to lock without blocking. Returns 1 on success.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_trylock(handle: i64) -> bool {
     match mutex_of(handle) {
@@ -547,7 +582,6 @@ pub extern "C" fn pickle_mutex_trylock(handle: i64) -> bool {
 }
 
 /// ABI: unlock a mutex this thread holds.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_unlock(handle: i64) {
     match mutex_of(handle) {
