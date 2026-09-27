@@ -2123,7 +2123,7 @@ impl<'a> Parser<'a> {
                     // the lambda spans its own `{...}` block, the callee the
                     // bare `task` token, and the call the whole expression.
                     let closure = Expr {
-                        span: body.span.clone(),
+                        span: body.span,
                         kind: ExprKind::Lambda {
                             params: Vec::new(),
                             return_ty: None,

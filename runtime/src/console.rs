@@ -55,8 +55,7 @@ fn write_stdout(bytes: &[u8]) {
 pub(crate) fn terminal_color_enabled() -> bool {
     #[cfg(feature = "nostd")]
     {
-        let _ = ();
-        return false;
+        false
     }
     #[cfg(not(feature = "nostd"))]
     {

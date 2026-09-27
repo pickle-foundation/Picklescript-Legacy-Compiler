@@ -659,7 +659,8 @@ const SLOT_BYTES: i64 = 8;
 /// Returns `Ok(true)` when the call was lowered inline (including `dst`
 /// bookkeeping), `Ok(false)` when the caller should fall through to the
 /// generic indirect-call path.
-fn try_inline_extern_call(
+#[allow(clippy::too_many_arguments)]
+  fn try_inline_extern_call(
     plan: &Plan,
     builder: &mut FunctionBuilder,
     frame: Option<StackSlot>,
@@ -801,7 +802,8 @@ fn try_inline_extern_call(
 /// Shared tail of the guarded-load inline paths: branch on `valid`; the fast
 /// case loads via `addr` and the cold case calls the original native. Returns
 /// the merge block whose first parameter is the result.
-fn emit_guarded_load(
+#[allow(clippy::too_many_arguments)]
+  fn emit_guarded_load(
     builder: &mut FunctionBuilder,
     call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
     symbol: &str,
@@ -825,7 +827,8 @@ fn emit_guarded_load(
 
 /// Shared tail of the guarded-store inline paths: store through `addr` on the
 /// fast path, call the original native on the cold path.
-fn emit_guarded_store(
+#[allow(clippy::too_many_arguments)]
+  fn emit_guarded_store(
     builder: &mut FunctionBuilder,
     call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
     symbol: &str,
@@ -849,7 +852,8 @@ fn emit_guarded_store(
     builder.switch_to_block(done);
 }
 
-fn lower_instr(
+#[allow(clippy::too_many_arguments)]
+  fn lower_instr(
     module: &IrModule,
     func: &IrFunc,
     plan: &Plan,

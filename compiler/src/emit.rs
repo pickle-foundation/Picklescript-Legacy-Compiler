@@ -397,6 +397,17 @@ fn static_field_info(table: &ClassTable, name: &str) -> Option<FieldInfo> {
         .cloned()
 }
 
+/// One entry of the flat (task and synchronisation) builtin table: the runtime
+/// symbol to call, the IR type of each argument, the IR type of the result (`None`
+/// for a call that returns nothing), and the argument names used only in
+/// diagnostics.
+type FlatBuiltin = (
+    &'static str,
+    Vec<IrTy>,
+    Option<IrTy>,
+    &'static [&'static str],
+);
+
 /// Runtime representation of a `List<T>` element.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ElemRep {
@@ -10022,7 +10033,7 @@ impl<'a> Emitter<'a> {
                 // lowering, described by a table rather than two dozen
                 // near-identical arms.
                 let (sym, params, ret, names) = self.flat_builtin(name).unwrap();
-                let args = self.positional_args(e, name, args, &names)?;
+                let args = self.positional_args(e, name, args, names)?;
                 match ret {
                     Some(ret) => self.extern_call_t1(sym, params, ret, args),
                     None => {
@@ -10085,7 +10096,7 @@ impl<'a> Emitter<'a> {
     /// object as its hidden environment argument. Nothing in this table needs a
     /// closure conversion or a boxing step, which is why it can be a table: the
     /// work is all in the runtime.
-    fn flat_builtin(&self, name: &str) -> Option<(&'static str, Vec<IrTy>, Option<IrTy>, &'static [&'static str])> {
+    fn flat_builtin(&self, name: &str) -> Option<FlatBuiltin> {
         use IrTy::{Bool, Int, Ptr};
         const INT: &[IrTy] = &[Int];
         const NONE: Option<IrTy> = None;

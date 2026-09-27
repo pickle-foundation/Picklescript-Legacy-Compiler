@@ -192,11 +192,7 @@ where
 {
     std::thread::spawn(move || {
         let mut tmp = [0u8; 8192];
-        loop {
-            let n = match r.read(&mut tmp) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+        while let Ok(n) = r.read(&mut tmp) {
             if n == 0 {
                 break;
             }

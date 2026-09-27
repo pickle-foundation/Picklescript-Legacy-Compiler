@@ -16,7 +16,7 @@ const ALIGN: usize = 8;
 
 // ptr -> allocation size, so `free` can rebuild the exact `Layout`.
 thread_local! {
-    static LIVE: RefCell<BTreeMap<usize, usize>> = RefCell::new(BTreeMap::new());
+    static LIVE: RefCell<BTreeMap<usize, usize>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 /// Allocate `size` raw bytes. Returns the block address (a `*T` in Pk code).
