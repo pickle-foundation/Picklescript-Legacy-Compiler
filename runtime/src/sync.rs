@@ -376,12 +376,16 @@ impl POnce {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
 /// A bounded integer channel: a fixed-capacity ring buffer with blocking
 /// send/receive, a non-blocking pair, and close semantics. One monitor guards
 /// the buffer and the two condition variables, so a wake can never be lost
-/// between a waiter's check and its park: `world::parked_wait` re-checks under
-/// the same mutex it waits on, exactly as an ordinary `Condvar` wait does.
+/// between a waiter's check and its park: the wait re-checks under the same
+/// mutex it waits on, exactly as an ordinary `Condvar` wait does.
+///
+/// The parking build hands the world lock to a runnable peer while it waits;
+/// the freestanding slice runs one thread, so it spins instead. Only the
+/// `wait_not_*`/`wake_*` helpers depend on that, which keeps the ring itself a
+/// single implementation that cannot drift between the two builds.
 ///
 /// The buffer holds raw `i64` bits: the values are scratch integers, boxed
 /// into managed `IntObject`s only when a receiver takes them out, exactly like
@@ -390,11 +394,12 @@ impl POnce {
 /// trivially `Sync`.
 pub struct Channel {
     state: Mutex<ChanState>,
+    #[cfg(not(feature = "nostd"))]
     not_empty: Condvar,
+    #[cfg(not(feature = "nostd"))]
     not_full: Condvar,
 }
 
-#[cfg(not(feature = "nostd"))]
 struct ChanState {
     /// The ring slots. Never resized, so the buffer stays stable for the
     /// channel's whole lifetime.
@@ -404,7 +409,6 @@ struct ChanState {
     closed: bool,
 }
 
-#[cfg(not(feature = "nostd"))]
 impl Channel {
     fn new(cap: usize) -> Self {
         Channel {
@@ -414,10 +418,74 @@ impl Channel {
                 count: 0,
                 closed: false,
             }),
+            #[cfg(not(feature = "nostd"))]
             not_empty: Condvar::new(),
+            #[cfg(not(feature = "nostd"))]
             not_full: Condvar::new(),
         }
     }
+
+    /// Give up the state lock until a value arrives, then take it back.
+    #[cfg(not(feature = "nostd"))]
+    fn wait_not_empty<'a>(&'a self, s: MutexGuard<'a, ChanState>) -> MutexGuard<'a, ChanState> {
+        world::parked_wait(&self.not_empty, s)
+    }
+
+    /// Give up the state lock until a slot frees up, then take it back.
+    #[cfg(not(feature = "nostd"))]
+    fn wait_not_full<'a>(&'a self, s: MutexGuard<'a, ChanState>) -> MutexGuard<'a, ChanState> {
+        world::parked_wait(&self.not_full, s)
+    }
+
+    /// The freestanding slice runs one thread, so there is no peer that could
+    /// make the predicate true: release the lock, pause, and take it back. The
+    /// caller's loop re-tests the predicate and, if it is still false, parks
+    /// again - which is exactly the deadlock the parking build would also have
+    /// reached.
+    #[cfg(feature = "nostd")]
+    fn wait_not_empty<'a>(&'a self, s: MutexGuard<'a, ChanState>) -> MutexGuard<'a, ChanState> {
+        drop(s);
+        core::hint::spin_loop();
+        state_lock(&self.state)
+    }
+
+    #[cfg(feature = "nostd")]
+    fn wait_not_full<'a>(&'a self, s: MutexGuard<'a, ChanState>) -> MutexGuard<'a, ChanState> {
+        drop(s);
+        core::hint::spin_loop();
+        state_lock(&self.state)
+    }
+
+    /// Wake a receiver parked on an empty buffer.
+    #[cfg(not(feature = "nostd"))]
+    fn wake_not_empty(&self) {
+        self.not_empty.notify_one();
+    }
+
+    #[cfg(feature = "nostd")]
+    fn wake_not_empty(&self) {}
+
+    /// Wake a sender parked on a full buffer.
+    #[cfg(not(feature = "nostd"))]
+    fn wake_not_full(&self) {
+        self.not_full.notify_one();
+    }
+
+    #[cfg(feature = "nostd")]
+    fn wake_not_full(&self) {}
+
+    /// Wake *every* waiter of each kind. Only `close` needs this: one `send` on
+    /// a closed channel fails loud, and one `recv` would only fail again once
+    /// the buffer drained, so waking a single peer would let the rest hang on a
+    /// channel that will never take another value.
+    #[cfg(not(feature = "nostd"))]
+    fn wake_all(&self) {
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+
+    #[cfg(feature = "nostd")]
+    fn wake_all(&self) {}
 
     fn cap(&self) -> usize {
         state_lock(&self.state).buf.len()
@@ -437,7 +505,7 @@ impl Channel {
     fn send(&self, value: i64) {
         let mut s = state_lock(&self.state);
         while !s.closed && s.count == s.buf.len() {
-            s = world::parked_wait(&self.not_full, s);
+            s = self.wait_not_full(s);
         }
         if s.closed {
             crate::panic::fatal("pickle: send on closed channel");
@@ -446,7 +514,7 @@ impl Channel {
         s.buf[i] = value;
         s.count += 1;
         drop(s);
-        self.not_empty.notify_one();
+        self.wake_not_empty();
     }
 
     /// Store `value` only when a slot is free right now. Never blocks.
@@ -462,7 +530,7 @@ impl Channel {
         s.buf[i] = value;
         s.count += 1;
         drop(s);
-        self.not_empty.notify_one();
+        self.wake_not_empty();
         true
     }
 
@@ -473,7 +541,7 @@ impl Channel {
     fn recv(&self) -> i64 {
         let mut s = state_lock(&self.state);
         while !s.closed && s.count == 0 {
-            s = world::parked_wait(&self.not_empty, s);
+            s = self.wait_not_empty(s);
         }
         if s.count == 0 {
             crate::panic::fatal("pickle: receive on a closed, empty channel");
@@ -483,7 +551,7 @@ impl Channel {
         s.head = (s.head + 1) % s.buf.len();
         s.count -= 1;
         drop(s);
-        self.not_full.notify_one();
+        self.wake_not_full();
         v
     }
 
@@ -499,7 +567,7 @@ impl Channel {
         s.head = (s.head + 1) % s.buf.len();
         s.count -= 1;
         drop(s);
-        self.not_full.notify_one();
+        self.wake_not_full();
         Some(v)
     }
 
@@ -510,8 +578,7 @@ impl Channel {
         let mut s = state_lock(&self.state);
         s.closed = true;
         drop(s);
-        self.not_empty.notify_all();
-        self.not_full.notify_all();
+        self.wake_all();
     }
 }
 
@@ -527,7 +594,6 @@ enum Primitive {
     Sem(PSem),
     Atomic(PAtomic),
     Once(POnce),
-#[cfg(not(feature = "nostd"))]
     Channel(Channel),
 }
 
@@ -586,8 +652,7 @@ fn once_of(handle: i64) -> Option<&'static POnce> {
     }
 }
 
-#[cfg(not(feature = "nostd"))]
-fn channel_of(handle: i64) -> Option<&'static Channel> {
+    fn channel_of(handle: i64) -> Option<&'static Channel> {
     match entry(handle) {
         Some(Primitive::Channel(c)) => Some(c),
         _ => None,
@@ -825,7 +890,6 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
 }
 
 /// ABI: a new bounded channel with room for `cap` values. Returns a handle.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
     let cap = if cap < 1 {
@@ -837,7 +901,6 @@ pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
 }
 
 /// ABI: how many values the channel can hold before a send blocks.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_cap(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -847,7 +910,6 @@ pub extern "C" fn pickle_channel_cap(handle: i64) -> i64 {
 }
 
 /// ABI: how many values are buffered right now.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_len(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -857,7 +919,6 @@ pub extern "C" fn pickle_channel_len(handle: i64) -> i64 {
 }
 
 /// ABI: block until a slot is free, then store `value` (a raw scalar).
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_send(handle: i64, value: i64) {
     match channel_of(handle) {
@@ -868,7 +929,6 @@ pub extern "C" fn pickle_channel_send(handle: i64, value: i64) {
 
 /// ABI: store `value` (a raw scalar) without blocking. Returns 1 on success,
 /// 0 when full.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_try_send(handle: i64, value: i64) -> bool {
     match channel_of(handle) {
@@ -879,7 +939,6 @@ pub extern "C" fn pickle_channel_try_send(handle: i64, value: i64) -> bool {
 
 /// ABI: block until a value is available. Returns the raw scalar, like
 /// `atomic_load`; the call site boxes it if it ever lands in an object slot.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_recv(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -890,7 +949,6 @@ pub extern "C" fn pickle_channel_recv(handle: i64) -> i64 {
 
 /// ABI: take a value if one is buffered, boxing it (an `Option<int>` carries
 /// boxed objects, and `none` is the null pointer); returns null when empty.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::PickleObject {
     match channel_of(handle) {
@@ -904,7 +962,6 @@ pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::Pi
 
 /// ABI: mark the channel closed. Sends after this point fail loud; buffered
 /// values can still be received.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_close(handle: i64) {
     match channel_of(handle) {
@@ -914,7 +971,6 @@ pub extern "C" fn pickle_channel_close(handle: i64) {
 }
 
 /// ABI: whether the channel has been closed.
-#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_closed(handle: i64) -> bool {
     match channel_of(handle) {

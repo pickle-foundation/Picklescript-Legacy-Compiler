@@ -1,0 +1,111 @@
+// Exercises the whole `pickle_channel_*` group end to end.
+//
+// The freestanding (nostd) build runs a single OS thread, so `channel_send` and
+// `channel_recv` on a channel with no room or no value would wait for a peer
+// that cannot exist. Every blocking call below is therefore one that cannot
+// block: a send always has a free slot and a receive always has a buffered
+// value. That still leaves the whole ring to exercise - ordering, the capacity
+// and length answers, the non-blocking pair, and close-and-drain - because none
+// of those need a second thread.
+//
+// The threaded behaviour (a send parking on a full buffer handing the world
+// lock back to a reader, and the reverse) is covered separately by
+// `channel_test.pkl`, which runs tasks and so needs the standard build.
+//
+// This is the check that the group is reachable through a selfhost link rather
+// than merely compiling.
+
+fn main() {
+    // --- ordering and metadata ---------------------------------------------
+    let ch = channel_new(3)
+    expect(channel_cap(ch)).toBe(3)
+    expect(channel_len(ch)).toBe(0)
+    expect(channel_closed(ch)).toBe(false)
+
+    channel_send(ch, 10)
+    channel_send(ch, 20)
+    channel_send(ch, 30)
+    expect(channel_len(ch)).toBe(3)
+
+    // a channel is a FIFO: what went in first comes out first, nothing is
+    // reordered and nothing is lost
+    expect(channel_recv(ch)).toBe(10)
+    expect(channel_recv(ch)).toBe(20)
+    expect(channel_recv(ch)).toBe(30)
+    expect(channel_len(ch)).toBe(0)
+
+    // --- the try forms never block -----------------------------------------
+    // the point of the try pair is that it answers instead of pausing: a full
+    // channel refuses a send, an empty one reads as none
+    expect(channel_try_recv(ch)).toBe(none)
+    expect(channel_try_send(ch, 1)).toBe(true)
+    expect(channel_try_send(ch, 2)).toBe(true)
+    expect(channel_try_send(ch, 3)).toBe(true)
+    expect(channel_try_send(ch, 4)).toBe(false)
+    expect(channel_len(ch)).toBe(3)
+
+    // draining still comes out in order, and the room a receive frees is
+    // handed straight back to the next send
+    expect(channel_recv(ch)).toBe(1)
+    expect(channel_try_send(ch, 4)).toBe(true)
+    expect(channel_recv(ch)).toBe(2)
+    expect(channel_recv(ch)).toBe(3)
+    expect(channel_recv(ch)).toBe(4)
+    expect(channel_len(ch)).toBe(0)
+
+    // --- the ring wraps -----------------------------------------------------
+    // `head` is an index modulo the capacity, so a buffer that is drained and
+    // refilled has to keep producing values in order rather than reading past
+    // the start of the allocation.
+    for (round in 0..2) {
+        channel_send(ch, 5)
+        channel_send(ch, 6)
+        channel_send(ch, 7)
+        expect(channel_recv(ch)).toBe(5)
+        channel_send(ch, 8)
+        expect(channel_recv(ch)).toBe(6)
+        expect(channel_recv(ch)).toBe(7)
+        expect(channel_recv(ch)).toBe(8)
+        expect(channel_len(ch)).toBe(0)
+    }
+
+    // --- close --------------------------------------------------------------
+    // Close is a shutdown signal, not a flush: what is already buffered stays
+    // readable, and once it is gone the channel reads as empty forever. A
+    // blocking `recv` on a closed, empty channel fails loud, so only the try
+    // form appears here.
+    let c2 = channel_new(4)
+    channel_send(c2, 100)
+    channel_send(c2, 200)
+    expect(channel_closed(c2)).toBe(false)
+    channel_close(c2)
+    expect(channel_closed(c2)).toBe(true)
+    expect(channel_len(c2)).toBe(2)
+    expect(channel_recv(c2)).toBe(100)
+    expect(channel_recv(c2)).toBe(200)
+    expect(channel_len(c2)).toBe(0)
+    expect(channel_try_recv(c2)).toBe(none)
+    expect(channel_closed(c2)).toBe(true)
+
+    // --- two channels stay independent --------------------------------------
+    // a send or a close on one channel must not be visible through another,
+    // which is the property that would break if the handle table handed out a
+    // shared row by mistake.
+    let a = channel_new(1)
+    let b = channel_new(1)
+    channel_send(a, 1)
+    expect(channel_len(a)).toBe(1)
+    expect(channel_len(b)).toBe(0)
+    expect(channel_try_recv(b)).toBe(none)
+    channel_close(b)
+    expect(channel_closed(b)).toBe(true)
+    expect(channel_closed(a)).toBe(false)
+    // `a` still holds its one value in a capacity-one buffer, so it is full and
+    // only a receive can make room for the next send
+    expect(channel_try_send(a, 2)).toBe(false)
+    expect(channel_recv(a)).toBe(1)
+    expect(channel_try_send(a, 2)).toBe(true)
+    expect(channel_recv(a)).toBe(2)
+
+    println("channel ok")
+}
