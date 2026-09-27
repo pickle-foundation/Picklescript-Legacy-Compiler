@@ -39,7 +39,6 @@ mod panic;
 mod process;
 mod raw;
 pub(crate) mod shadow;
-#[cfg(not(feature = "nostd"))]
 mod statics;
 mod stream;
 pub(crate) mod strings;
@@ -339,7 +338,7 @@ macro_rules! declare_abi {
 
         /// The address of ABI symbol `name`, or `None` when it is not part of
         /// the runtime ABI. (Symbols supplied by the host rather than the
-        /// runtime — `pickle_fmod` — are not listed here.)
+        /// runtime Ã¢â‚¬â€ `pickle_fmod` Ã¢â‚¬â€ are not listed here.)
         pub fn runtime_addr(name: &str) -> Option<usize> {
             match name {
                 $( $( #[$meta] )? stringify!($name) => Some($path as *const () as usize), )*
@@ -366,9 +365,7 @@ declare_abi! {
     pickle_obj_slot_get => crate::class::pickle_obj_slot_get,
     pickle_obj_slot_set => crate::class::pickle_obj_slot_set,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_static_get => crate::statics::pickle_static_get,
-    #[cfg(not(feature = "nostd"))]
     pickle_static_set => crate::statics::pickle_static_set,
 
     pickle_print_bool => crate::console::pickle_print_bool,

@@ -7,10 +7,15 @@
 //! same representation rules as class instance slots and list elements: every
 //! cell holds a managed pointer (boxed scalars, strings, class instances…).
 
+#[cfg(not(feature = "nostd"))]
 use std::sync::Mutex;
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::Mutex;
 
 use crate::gc::pickle_gc_root_add;
 use crate::object::PickleObject;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// `(class_id, slot) -> cell` as a raw pointer stored as `usize` bits (0 means
 /// "no cell yet"). `usize` keeps the table `Send`; the pointers themselves are
