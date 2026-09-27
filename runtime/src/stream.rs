@@ -9,23 +9,42 @@
 //! unclosed `Stream` closes its file handle when the object is swept; a
 //! script-level `close()` drops the handle immediately.
 
+#[cfg(not(feature = "nostd"))]
 use crate::fs::path_of;
 use crate::layout::{list_data, list_len, STREAM_INNER_OFF, STREAM_OBJECT_SIZE};
 use crate::object::{PickleObject, PICKLE_CLASS_STREAM};
+#[cfg(feature = "nostd")]
+use alloc::{boxed::Box, vec::Vec};
+#[cfg(not(feature = "nostd"))]
 use std::fs::File;
+#[cfg(not(feature = "nostd"))]
 use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(feature = "nostd")]
+use crate::nostd::BufferedFile;
 
 /// A buffered stream target held by a `Stream` value.
 ///
-/// `Reader`/`Writer` wrap `File` directly, so dropping a target closes the
-/// underlying handle; `Proc` overlays a running subprocess handle (see
-/// `process::ProcInner`), whose `Drop` kills and reaps an un-waited child.
+/// `Reader`/`Writer` wrap a file handle, so dropping a target closes the
+/// underlying handle. In the `std` build that is a `File` behind a
+/// `BufReader`/`BufWriter`, and `Proc` overlays a running subprocess handle
+/// (see `process::ProcInner`), whose `Drop` kills and reaps an un-waited child.
+/// A `nostd` build has no `process` support, so it has no `Proc` variant and
+/// uses the Win32-backed [`BufferedFile`] in place of the `std` buffer types.
+#[cfg(not(feature = "nostd"))]
 pub(crate) enum StreamTarget {
     Reader(BufReader<File>),
     Writer(BufWriter<File>),
     Stdout,
     Stderr,
     Proc(Box<crate::process::ProcInner>),
+}
+
+#[cfg(feature = "nostd")]
+pub(crate) enum StreamTarget {
+    Reader(BufferedFile),
+    Writer(BufferedFile),
+    Stdout,
+    Stderr,
 }
 
 /// The boxed state behind a `PStream` object.
@@ -56,45 +75,82 @@ fn inner_of(stream: *mut PickleObject) -> *mut StreamInner {
     unsafe { *((stream as *mut u8).add(STREAM_INNER_OFF) as *mut *mut StreamInner) }
 }
 
-/// Open `path` for reading. `none` when the path cannot be opened.
+/// Open `path` for reading, or `none` when the path cannot be opened.
+///
+/// The object marshalling is shared; only the handle acquisition differs, so
+/// each build's `open` lives in a same-signature helper rather than repeating
+/// the wrapper (and risking a second `#[no_mangle]` that the linker ignores).
+#[cfg(not(feature = "nostd"))]
+fn open_reader(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Reader(BufReader::new(
+        File::open(path_of(path)).ok()?,
+    )))
+}
+
+#[cfg(feature = "nostd")]
+fn open_reader(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Reader(BufferedFile::open_read(
+        crate::fs::path_bytes(path),
+    )?))
+}
+
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_read(path: *const PickleObject) -> *mut PickleObject {
-    match File::open(path_of(path)) {
-        Ok(file) => stream_new(StreamInner {
-            closed: false,
-            target: Some(StreamTarget::Reader(BufReader::new(file))),
-        }),
-        Err(_) => core::ptr::null_mut(),
+    match open_reader(path) {
+        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        None => core::ptr::null_mut(),
     }
 }
 
-/// Open `path` for writing, truncating any existing content. `none` when the
-/// path cannot be opened.
+/// Open `path` for writing, truncating any existing content, or `none` when
+/// the path cannot be opened.
+#[cfg(not(feature = "nostd"))]
+fn open_writer_create(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Writer(BufWriter::new(
+        File::create(path_of(path)).ok()?,
+    )))
+}
+
+#[cfg(feature = "nostd")]
+fn open_writer_create(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Writer(BufferedFile::open_write(
+        crate::fs::path_bytes(path),
+    )?))
+}
+
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_write(path: *const PickleObject) -> *mut PickleObject {
-    match File::create(path_of(path)) {
-        Ok(file) => stream_new(StreamInner {
-            closed: false,
-            target: Some(StreamTarget::Writer(BufWriter::new(file))),
-        }),
-        Err(_) => core::ptr::null_mut(),
+    match open_writer_create(path) {
+        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        None => core::ptr::null_mut(),
     }
 }
 
-/// Open `path` for appending, creating it if absent. `none` when the path
+/// Open `path` for appending, creating it if absent, or `none` when the path
 /// cannot be opened.
+#[cfg(not(feature = "nostd"))]
+fn open_writer_append(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Writer(BufWriter::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path_of(path))
+            .ok()?,
+    )))
+}
+
+#[cfg(feature = "nostd")]
+fn open_writer_append(path: *const PickleObject) -> Option<StreamTarget> {
+    Some(StreamTarget::Writer(BufferedFile::open_append(
+        crate::fs::path_bytes(path),
+    )?))
+}
+
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_append(path: *const PickleObject) -> *mut PickleObject {
-    match std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path_of(path))
-    {
-        Ok(file) => stream_new(StreamInner {
-            closed: false,
-            target: Some(StreamTarget::Writer(BufWriter::new(file))),
-        }),
-        Err(_) => core::ptr::null_mut(),
+    match open_writer_append(path) {
+        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        None => core::ptr::null_mut(),
     }
 }
 
@@ -132,7 +188,7 @@ pub extern "C" fn pickle_stream_read(stream: *mut PickleObject, n: i64) -> *mut 
     let cap = usize::try_from(n).unwrap_or(0);
     let mut buf = vec![0u8; cap];
     let got = match &mut inner.target {
-        Some(StreamTarget::Reader(r)) => r.read(&mut buf).unwrap_or(0),
+        Some(StreamTarget::Reader(r)) => read_into(r, &mut buf),
         _ => return core::ptr::null_mut(),
     };
     if got == 0 {
@@ -147,10 +203,25 @@ pub extern "C" fn pickle_stream_read(stream: *mut PickleObject, n: i64) -> *mut 
     l
 }
 
-/// Append the raw payloads of the slots in `bytes` (a `List<byte>`) to `w`,
-/// stopping cleanly at the first slot that fails or is null. Returns the
-/// number of bytes written.
-fn write_slots<W: Write>(w: &mut W, bytes: *mut PickleObject) -> i64 {
+/// Fill `buf` from a reader target, returning how many bytes were read.
+///
+/// The two builds read through different types (`BufReader<File>` in `std`,
+/// `BufferedFile` in `nostd`); this keeps that difference in one place so
+/// `pickle_stream_read` stays build-agnostic.
+#[cfg(not(feature = "nostd"))]
+fn read_into(r: &mut BufReader<File>, buf: &mut [u8]) -> usize {
+    r.read(buf).unwrap_or(0)
+}
+
+#[cfg(feature = "nostd")]
+fn read_into(r: &mut BufferedFile, buf: &mut [u8]) -> usize {
+    r.read_some(buf)
+}
+
+/// Append the raw payloads of the slots in `bytes` (a `List<byte>`) through
+/// `put`, stopping cleanly at the first slot that fails or is null. `put`
+/// reports whether it accepted the byte. Returns the number of bytes written.
+fn write_slots(bytes: *mut PickleObject, mut put: impl FnMut(&[u8]) -> bool) -> i64 {
     let n = list_len(bytes);
     let data = list_data(bytes);
     let mut written = 0i64;
@@ -160,7 +231,7 @@ fn write_slots<W: Write>(w: &mut W, bytes: *mut PickleObject) -> i64 {
             break;
         }
         let byte = [crate::boxscalar::box_bits(e) as u8];
-        if w.write_all(&byte).is_ok() {
+        if put(&byte) {
             written += 1;
         } else {
             break;
@@ -182,20 +253,47 @@ pub extern "C" fn pickle_stream_write(stream: *mut PickleObject, bytes: *mut Pic
         return 0;
     }
     match &mut inner.target {
-        Some(StreamTarget::Writer(w)) => write_slots(w, bytes),
+        Some(StreamTarget::Writer(w)) => write_slots(bytes, |b| writer_write(w, b)),
         Some(StreamTarget::Stdout) => {
             // Route through the console bridge so `stdout_stream().write(...)`
             // is captured by the test harness exactly like `print`.
             let mut buf = Vec::new();
-            let n = write_slots(&mut buf, bytes);
+            let n = write_slots(bytes, |b| {
+                buf.extend_from_slice(b);
+                true
+            });
             if n > 0 {
                 crate::console::write_to_con(&buf);
             }
             n
         }
-        Some(StreamTarget::Stderr) => write_slots(&mut std::io::stderr(), bytes),
+        Some(StreamTarget::Stderr) => stderr_write(bytes),
         _ => 0,
     }
+}
+
+/// Write `bytes` to the process's stderr.
+///
+/// The `std` build writes straight to `std::io::stderr()`. A `nostd` build has
+/// no separate stderr handle yet and mirrors `eprintln!`, which also folds
+/// stderr into the console bridge — so both builds stay consistent and the
+/// test harness still captures the bytes.
+#[cfg(not(feature = "nostd"))]
+fn stderr_write(bytes: *mut PickleObject) -> i64 {
+    write_slots(bytes, |b| std::io::stderr().write_all(b).is_ok())
+}
+
+#[cfg(feature = "nostd")]
+fn stderr_write(bytes: *mut PickleObject) -> i64 {
+    let mut buf = Vec::new();
+    let n = write_slots(bytes, |b| {
+        buf.extend_from_slice(b);
+        true
+    });
+    if n > 0 {
+        crate::console::write_to_con(&buf);
+    }
+    n
 }
 
 /// Push buffered writer bytes (or console bytes) out to the host. `true` when
@@ -211,18 +309,56 @@ pub extern "C" fn pickle_stream_flush(stream: *mut PickleObject) -> bool {
         return false;
     }
     match &mut inner.target {
-        Some(StreamTarget::Writer(w)) => w.flush().is_ok(),
+        Some(StreamTarget::Writer(w)) => writer_flush(w),
         Some(StreamTarget::Stdout) => {
             // Pushes the console bridge (which flushes real stdout) then
             // reports success; nothing to flush in test capture mode.
             crate::console::write_to_con(&[]);
             true
         }
-        Some(StreamTarget::Stderr) => std::io::stderr().flush().is_ok(),
+        Some(StreamTarget::Stderr) => stderr_flush(),
         Some(StreamTarget::Reader(_)) => true,
+        #[cfg(not(feature = "nostd"))]
         Some(StreamTarget::Proc(_)) => true,
         None => false,
     }
+}
+
+/// `std::io::stderr()` is unbuffered, so there is nothing to push; the
+/// `nostd` build has no stderr handle and shares the console bridge.
+#[cfg(not(feature = "nostd"))]
+fn stderr_flush() -> bool {
+    std::io::stderr().flush().is_ok()
+}
+
+#[cfg(feature = "nostd")]
+fn stderr_flush() -> bool {
+    crate::console::write_to_con(&[]);
+    true
+}
+
+/// Push a file writer's buffered bytes out. `BufWriter::flush` returns
+/// `io::Result`; `BufferedFile::flush` already reports success as a `bool`.
+#[cfg(not(feature = "nostd"))]
+fn writer_flush<W: Write>(w: &mut W) -> bool {
+    w.flush().is_ok()
+}
+
+#[cfg(feature = "nostd")]
+fn writer_flush(w: &mut BufferedFile) -> bool {
+    w.flush()
+}
+
+/// Append `b` to a file writer. `Write::write_all` returns `io::Result`, while
+/// `BufferedFile::write_all` already reports success as a `bool`.
+#[cfg(not(feature = "nostd"))]
+fn writer_write<W: Write>(w: &mut W, b: &[u8]) -> bool {
+    w.write_all(b).is_ok()
+}
+
+#[cfg(feature = "nostd")]
+fn writer_write(w: &mut BufferedFile, b: &[u8]) -> bool {
+    w.write_all(b)
 }
 
 /// Close `stream`, flushing any buffered output and releasing the handle.
@@ -240,13 +376,14 @@ pub extern "C" fn pickle_stream_close(stream: *mut PickleObject) -> bool {
     }
     inner.closed = true;
     match inner.target.take() {
-        Some(StreamTarget::Writer(mut w)) => w.flush().is_ok(),
+        Some(StreamTarget::Writer(mut w)) => writer_flush(&mut w),
         Some(StreamTarget::Stdout) => {
             crate::console::write_to_con(&[]);
             true
         }
-        Some(StreamTarget::Stderr) => std::io::stderr().flush().is_ok(),
+        Some(StreamTarget::Stderr) => stderr_flush(),
         Some(StreamTarget::Reader(_)) => true,
+        #[cfg(not(feature = "nostd"))]
         Some(StreamTarget::Proc(_)) => true,
         None => false,
     }
@@ -254,6 +391,10 @@ pub extern "C" fn pickle_stream_close(stream: *mut PickleObject) -> bool {
 
 /// The `process::ProcInner` behind a process-handle `Stream`, or dangling
 /// when `stream` is not a live process handle.
+///
+/// Only the `std` build has process handles; `process` is host-only, so a
+/// `nostd` build has no `Proc` target to hand back.
+#[cfg(not(feature = "nostd"))]
 pub(crate) fn proc_inner_mut(stream: *mut PickleObject) -> *mut crate::process::ProcInner {
     if stream.is_null() {
         return core::ptr::null_mut();

@@ -27,7 +27,6 @@ mod boxscalar;
 mod class;
 pub(crate) mod console;
 mod r#enum;
-#[cfg(not(feature = "nostd"))]
 mod fs;
 mod gc;
 mod heap;
@@ -44,7 +43,6 @@ mod raw;
 pub(crate) mod shadow;
 #[cfg(not(feature = "nostd"))]
 mod statics;
-#[cfg(not(feature = "nostd"))]
 mod stream;
 pub(crate) mod strings;
 mod test;
@@ -75,8 +73,10 @@ const BUILTIN_DESCRIPTORS: &[object::ClassDescriptor] = &[
     stream_desc(),
 ];
 
-/// The freestanding build has no `stream` module, so class id 9 is left
-/// unclaimed and `PICKLE_CLASS_USER_BASE` still starts at 10.
+/// The freestanding build has the `stream` module but no `process` support, so
+/// `Proc` streams are absent. `stream_desc` still occupies class id 9 to keep
+/// every builtin id identical to the `std` build, leaving `PICKLE_CLASS_USER_BASE`
+/// at 10.
 #[cfg(feature = "nostd")]
 const BUILTIN_DESCRIPTORS: &[object::ClassDescriptor] = &[
     string_desc(),
@@ -88,6 +88,7 @@ const BUILTIN_DESCRIPTORS: &[object::ClassDescriptor] = &[
     box_char_desc(),
     enum_desc(),
     tuple_desc(),
+    stream_desc(),
 ];
 
 const fn string_desc() -> object::ClassDescriptor {
@@ -205,7 +206,6 @@ const fn tuple_desc() -> object::ClassDescriptor {
 // The stream slot 0 holds a raw `*mut StreamInner` that the collector must
 // never chase, so this descriptor only reserves class id 9 for `PStream`; the
 // finalizer drops the boxed inner state when the object is swept.
-#[cfg(not(feature = "nostd"))]
 const fn stream_desc() -> object::ClassDescriptor {
     object::ClassDescriptor {
         name_ptr: b"stream\0".as_ptr(),
@@ -436,17 +436,11 @@ declare_abi! {
     pickle_tuple_new => crate::r#tuple::pickle_tuple_new,
     pickle_tuple_set_field => crate::r#tuple::pickle_tuple_set_field,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_delete => crate::fs::pickle_delete,
-    #[cfg(not(feature = "nostd"))]
     pickle_file_exists => crate::fs::pickle_file_exists,
-    #[cfg(not(feature = "nostd"))]
     pickle_list_dir => crate::fs::pickle_list_dir,
-    #[cfg(not(feature = "nostd"))]
     pickle_mkdir => crate::fs::pickle_mkdir,
-    #[cfg(not(feature = "nostd"))]
     pickle_read_file => crate::fs::pickle_read_file,
-    #[cfg(not(feature = "nostd"))]
     pickle_write_file => crate::fs::pickle_write_file,
 
     #[cfg(not(feature = "nostd"))]
@@ -479,23 +473,14 @@ declare_abi! {
     #[cfg(not(feature = "nostd"))]
     pickle_run_spawn => crate::process::pickle_run_spawn,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_stderr_stream => crate::stream::pickle_stderr_stream,
-    #[cfg(not(feature = "nostd"))]
     pickle_stdout_stream => crate::stream::pickle_stdout_stream,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_close => crate::stream::pickle_stream_close,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_flush => crate::stream::pickle_stream_flush,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_open_append => crate::stream::pickle_stream_open_append,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_open_read => crate::stream::pickle_stream_open_read,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_open_write => crate::stream::pickle_stream_open_write,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_read => crate::stream::pickle_stream_read,
-    #[cfg(not(feature = "nostd"))]
     pickle_stream_write => crate::stream::pickle_stream_write,
 
     pickle_panic_arity_diff => crate::panic::pickle_panic_arity_diff,

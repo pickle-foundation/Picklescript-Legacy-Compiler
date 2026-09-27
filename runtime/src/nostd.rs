@@ -28,10 +28,254 @@ extern "system" {
         overlapped: *mut c_void,
     ) -> i32;
     pub fn ExitProcess(code: u32) -> !;
+
+    // ---- file / directory access, used by the `nostd` `fs` + `stream` backends
+    pub fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        security: *mut c_void,
+        creation: u32,
+        flags: u32,
+        template: WinHandle,
+    ) -> WinHandle;
+    pub fn ReadFile(
+        file: WinHandle,
+        buf: *mut u8,
+        count: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    pub fn CloseHandle(object: WinHandle) -> i32;
+    pub fn DeleteFileW(name: *const u16) -> i32;
+    pub fn GetFileAttributesW(name: *const u16) -> u32;
+    pub fn CreateDirectoryW(name: *const u16, security: *mut c_void) -> i32;
+    pub fn RemoveDirectoryW(name: *const u16) -> i32;
+    pub fn FindFirstFileW(pattern: *const u16, data: *mut Win32FindDataW) -> WinHandle;
+    pub fn FindNextFileW(find: WinHandle, data: *mut Win32FindDataW) -> i32;
+    pub fn FindClose(find: WinHandle) -> i32;
 }
+
+/// `FILETIME`. Modelled as two `u32`s rather than a `u64` so the struct keeps
+/// `FILETIME`'s real 4-byte alignment: representing it as a `u64` would insert
+/// padding after `dwFileAttributes` and shift everything after it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileTime {
+    pub dw_low_date_time: u32,
+    pub dw_high_date_time: u32,
+}
+
+/// `WIN32_FIND_DATAW`. `cFileName` is a fixed `WCHAR[MAX_PATH]` at byte 44
+/// (the real struct is 592 bytes on disk, but its natural alignment is 4, so
+/// the in-memory size is 564 and `offset_of` is what callers must trust).
+#[repr(C)]
+pub struct Win32FindDataW {
+    pub dw_file_attributes: u32,
+    pub ft_creation_time: FileTime,
+    pub ft_last_access_time: FileTime,
+    pub ft_last_write_time: FileTime,
+    pub n_file_size_high: u32,
+    pub n_file_size_low: u32,
+    pub dw_reserved0: u32,
+    pub dw_reserved1: u32,
+    pub c_file_name: [u16; 260],
+}
+
+// `FindFirstFileW`/`FindNextFileW` hand back this struct by pointer, so a
+// layout mistake silently misreads `cFileName`. Pin the layout at compile time
+// rather than trusting the comment above.
+const _: () = {
+    assert!(core::mem::size_of::<Win32FindDataW>() == 564);
+    assert!(core::mem::align_of::<Win32FindDataW>() == 4);
+    assert!(core::mem::offset_of!(Win32FindDataW, c_file_name) == 44);
+};
 
 pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const FILE_SHARE_READ: u32 = 0x0000_0001;
+pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+pub const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const OPEN_EXISTING: u32 = 3;
+pub const OPEN_ALWAYS: u32 = 4;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+pub const FIND_DATA_SIZE: usize = core::mem::size_of::<Win32FindDataW>();
+/// `INVALID_HANDLE_VALUE`, the `(-1)` HANDLE sentinel CreateFileW returns.
+#[inline]
+pub const fn invalid_handle() -> WinHandle {
+    (-1isize) as WinHandle
+}
+
+/// `FILE_APPEND_DATA`: the write-only access right that forces every write to
+/// land at the end of the file, without an explicit seek.
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+
+/// Buffer size for [`BufferedFile`]. Matches the `BufReader`/`BufWriter`
+/// capacity the `std` build of `stream` uses, so both builds issue the same
+/// number of `ReadFile`/`WriteFile` calls for the same program.
+const STREAM_BUFFER: usize = 8 * 1024;
+
+/// A buffered reader/writer over a Win32 file handle.
+///
+/// This is the freestanding stand-in for `BufReader<File>`/`BufWriter<File>`:
+/// same observable behaviour (reads are served from a refill buffer, writes
+/// accumulate until `flush`), but backed by the raw `ReadFile`/`WriteFile`
+/// entry points so a `nostd` build needs no `std::io`. Dropping it closes the
+/// handle, which is what makes `StreamInner`'s finalizer release the file.
+pub struct BufferedFile {
+    handle: WinHandle,
+    /// Unread bytes of the last refill: `rbuf[rpos..rend]`.
+    rbuf: alloc::vec::Vec<u8>,
+    rpos: usize,
+    rend: usize,
+    /// Bytes written but not yet handed to the OS.
+    wbuf: alloc::vec::Vec<u8>,
+}
+
+impl BufferedFile {
+    fn from_handle(handle: WinHandle) -> Option<Self> {
+        if handle == invalid_handle() || handle.is_null() {
+            return None;
+        }
+        Some(Self {
+            handle,
+            rbuf: alloc::vec::Vec::new(),
+            rpos: 0,
+            rend: 0,
+            wbuf: alloc::vec::Vec::new(),
+        })
+    }
+
+    fn open(path: &[u8], access: u32, disposition: u32) -> Option<Self> {
+        let mut w: alloc::vec::Vec<u16> =
+            core::str::from_utf8(path).unwrap_or("").encode_utf16().collect();
+        w.push(0);
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let h = unsafe {
+            CreateFileW(
+                w.as_ptr(),
+                access,
+                share,
+                core::ptr::null_mut(),
+                disposition,
+                FILE_ATTRIBUTE_NORMAL,
+                core::ptr::null_mut(),
+            )
+        };
+        Self::from_handle(h)
+    }
+
+    /// Open an existing file for reading. `None` when it cannot be opened.
+    pub fn open_read(path: &[u8]) -> Option<Self> {
+        Self::open(path, GENERIC_READ, OPEN_EXISTING)
+    }
+
+    /// Open for writing, truncating any existing content.
+    pub fn open_write(path: &[u8]) -> Option<Self> {
+        Self::open(path, GENERIC_WRITE, CREATE_ALWAYS)
+    }
+
+    /// Open for writing, keeping existing content and appending after it.
+    pub fn open_append(path: &[u8]) -> Option<Self> {
+        Self::open(path, FILE_APPEND_DATA, OPEN_ALWAYS)
+    }
+
+    /// Copy up to `out.len()` buffered bytes into `out`, refilling from the OS
+    /// as needed. Returns the count copied; `0` means end of input.
+    pub fn read_some(&mut self, out: &mut [u8]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        if self.rpos == self.rend && !self.refill() {
+            return 0;
+        }
+        let avail = self.rend - self.rpos;
+        let n = avail.min(out.len());
+        out[..n].copy_from_slice(&self.rbuf[self.rpos..self.rpos + n]);
+        self.rpos += n;
+        n
+    }
+
+    /// Refill `rbuf` from the OS. `false` at end of input or on error.
+    ///
+    /// The buffer is only zero-filled the first time; a refilled tail is
+    /// overwritten by `ReadFile` and only `rbuf[..rend]` is ever read, so
+    /// re-zeroing `STREAM_BUFFER` bytes per call would be wasted work.
+    fn refill(&mut self) -> bool {
+        if self.rbuf.len() < STREAM_BUFFER {
+            self.rbuf.resize(STREAM_BUFFER, 0);
+        }
+        let mut n: u32 = 0;
+        let ok = unsafe {
+            ReadFile(
+                self.handle,
+                self.rbuf.as_mut_ptr(),
+                STREAM_BUFFER as u32,
+                &mut n,
+                core::ptr::null_mut(),
+            ) != 0
+        };
+        self.rpos = 0;
+        self.rend = n as usize;
+        ok && self.rend > 0
+    }
+
+    /// Append `bytes` to the write buffer, flushing whenever it outgrows
+    /// `STREAM_BUFFER` so a long write does not grow without bound. `false`
+    /// when the OS rejected the bytes.
+    pub fn write_all(&mut self, bytes: &[u8]) -> bool {
+        self.wbuf.extend_from_slice(bytes);
+        if self.wbuf.len() < STREAM_BUFFER {
+            return true;
+        }
+        self.flush()
+    }
+
+    /// Hand every buffered byte to the OS. `false` on a short or failed write.
+    pub fn flush(&mut self) -> bool {
+        if self.wbuf.is_empty() {
+            return true;
+        }
+        let total = self.wbuf.len();
+        let mut done = 0usize;
+        while done < total {
+            let mut n: u32 = 0;
+            let left = total - done;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    self.wbuf[done..].as_ptr(),
+                    left as u32,
+                    &mut n,
+                    core::ptr::null_mut(),
+                ) != 0
+            };
+            if !ok || n == 0 {
+                break;
+            }
+            done += n as usize;
+        }
+        self.wbuf.clear();
+        done == total
+    }
+}
+
+impl Drop for BufferedFile {
+    fn drop(&mut self) {
+        // Best effort: a failed flush must not stop the handle from closing.
+        self.flush();
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
 
 /// Writes bytes to the process's standard output handle. `false` when the
 /// write call fails. Never panics.
@@ -118,6 +362,39 @@ fn on_panic(_info: &core::panic::PanicInfo) -> ! {
         ExitProcess(70);
     }
 }
+
+// `__chkstk`: MSVC's stack-probe helper.
+//
+// rustc emits a call to this whenever a function reserves more than one page
+// of stack, and it expects the callee to touch every intervening page so the
+// guard page is expanded before the writes land. The MSVC CRT normally supplies
+// it, but the pickle-written linker links without a CRT, and `core`/`alloc`
+// objects pulled in from the sysroot rlibs reference it. The algorithm is the
+// standard MSVC x64 sequence: probe downward from the incoming stack pointer in
+// `PAGE_SIZE` steps, stopping at the page the frame already occupies.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl __chkstk",
+    ".def __chkstk; .scl 2; .type 32; .endef",
+    "__chkstk:",
+    "push    rbx",
+    "mov     r11, rsp",
+    "add     r11, 8",
+    "mov     rbx, rsp",
+    "and     rbx, -4096",
+    "cmp     r11, rbx",
+    "jbe     2f",
+    "1:",
+    "test    byte ptr [r11 - 4096], 0",
+    "sub     r11, 4096",
+    "cmp     r11, rbx",
+    "ja      1b",
+    "2:",
+    "add     r11, 8",
+    "mov     rsp, r11",
+    "pop     rbx",
+    "ret",
+);
 
 /// Fallback `println!` for code paths used on a freestanding build.
 #[macro_export]
