@@ -1,8 +1,8 @@
 //! Blocking synchronisation primitives for tasks: mutex, condition, semaphore,
 //! atomics and once.
 //!
-//! All the blocking primitives are the same shape — a count of permits plus a
-//! parking queue — because the interesting part is not what they mean to a
+//! All the blocking primitives are the same shape ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a count of permits plus a
+//! parking queue ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â because the interesting part is not what they mean to a
 //! Pickle program but *where* they are allowed to block. A task that waits must
 //! hand the world lock ([`crate::world`]) to a runnable peer, and it must not
 //! hold a Rust mutex while it parks: a peer that holds the world lock and needs
@@ -17,16 +17,28 @@
 //! impossible to lose: a waiter between "no permits" and "parked" is already
 //! counted, and a waiter that has not counted itself yet re-checks the permits
 //! under the same mutex before parking. There is deliberately no
-//! predicate-plus-signal API here — a bare `Condvar` handoff cannot be made
-//! atomic from user code — so `condWait`/`condSignal` are a one-permit
+//! predicate-plus-signal API here ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â a bare `Condvar` handoff cannot be made
+//! atomic from user code ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â so `condWait`/`condSignal` are a one-permit
 //! semaphore, where the permit is the thing that cannot be dropped.
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::vec::Vec;
+#[cfg(not(feature = "nostd"))]
 use crate::world;
-use std::sync::{Condvar, Mutex, MutexGuard};
+#[cfg(not(feature = "nostd"))]
+use std::sync::Condvar;
+#[cfg(not(feature = "nostd"))]
+use std::sync::Mutex;
+#[cfg(not(feature = "nostd"))]
+use std::sync::MutexGuard;
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, MutexGuard};
 
 /// Permits plus parked-waiter bookkeeping. One mutex, so the check and the
 /// count cannot be observed out of order.
 #[derive(Default)]
+#[cfg(not(feature = "nostd"))]
 struct SemState {
     permits: i64,
     parked: u32,
@@ -36,12 +48,14 @@ fn state_lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(not(feature = "nostd"))]
 /// A counting semaphore: the one blocking primitive the rest are built from.
 pub struct PSemaphore {
     state: Mutex<SemState>,
     cv: Condvar,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl PSemaphore {
     fn new(permits: i64) -> Self {
         PSemaphore {
@@ -104,12 +118,14 @@ impl PSemaphore {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// A non-recursive mutex: one permit, so locking twice on a thread that
 /// already holds it parks forever, exactly as a real mutex would deadlock.
 pub struct PMutex {
     sem: PSemaphore,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl PMutex {
     fn new() -> Self {
         PMutex {
@@ -130,6 +146,7 @@ impl PMutex {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// A condition variable, modelled as a permit counter rather than a bare
 /// `Condvar` so a `signal` cannot be lost between a waiter's check and its
 /// park: a permit is either handed to a parked waiter or left for the next one.
@@ -137,6 +154,7 @@ pub struct PCond {
     sem: PSemaphore,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl PCond {
     fn new() -> Self {
         PCond {
@@ -160,11 +178,13 @@ impl PCond {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// A counting semaphore with `permits` initially available.
 pub struct PSem {
     sem: PSemaphore,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl PSem {
     fn new(permits: i64) -> Self {
         PSem {
@@ -225,12 +245,14 @@ impl PAtomic {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// Once: 0 = untouched, 1 = a caller is running the initialiser, 2 = done.
 pub struct POnce {
     state: Mutex<u8>,
     cv: Condvar,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl POnce {
     fn new() -> Self {
         POnce {
@@ -269,13 +291,14 @@ impl POnce {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 /// A bounded integer channel: a fixed-capacity ring buffer with blocking
 /// send/receive, a non-blocking pair, and close semantics. One monitor guards
 /// the buffer and the two condition variables, so a wake can never be lost
 /// between a waiter's check and its park: `world::parked_wait` re-checks under
 /// the same mutex it waits on, exactly as an ordinary `Condvar` wait does.
 ///
-/// The buffer holds raw `i64` bits — the values are scratch integers, boxed
+/// The buffer holds raw `i64` bits ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the values are scratch integers, boxed
 /// into managed `IntObject`s only when a receiver takes them out, exactly like
 /// the compiler's other scalar-returning builtins (`atomic_load`). Nothing in
 /// the buffer is a GC object, so no per-slot roots are needed and the ring is
@@ -286,6 +309,7 @@ pub struct Channel {
     not_full: Condvar,
 }
 
+#[cfg(not(feature = "nostd"))]
 struct ChanState {
     /// The ring slots. Never resized, so the buffer stays stable for the
     /// channel's whole lifetime.
@@ -295,6 +319,7 @@ struct ChanState {
     closed: bool,
 }
 
+#[cfg(not(feature = "nostd"))]
 impl Channel {
     fn new(cap: usize) -> Self {
         Channel {
@@ -412,11 +437,16 @@ impl Channel {
 /// registered cells (shadow frames, static roots) as the normal way to give a
 /// value a stable address.
 enum Primitive {
+#[cfg(not(feature = "nostd"))]
     Mutex(PMutex),
+#[cfg(not(feature = "nostd"))]
     Cond(PCond),
+#[cfg(not(feature = "nostd"))]
     Sem(PSem),
     Atomic(PAtomic),
+#[cfg(not(feature = "nostd"))]
     Once(POnce),
+#[cfg(not(feature = "nostd"))]
     Channel(Channel),
 }
 
@@ -440,6 +470,7 @@ fn not_a(handle: i64, what: &str) -> ! {
     crate::panic::fatal(&format!("pickle: handle {handle} is not {what}"))
 }
 
+#[cfg(not(feature = "nostd"))]
 fn mutex_of(handle: i64) -> Option<&'static PMutex> {
     match entry(handle) {
         Some(Primitive::Mutex(m)) => Some(m),
@@ -447,6 +478,7 @@ fn mutex_of(handle: i64) -> Option<&'static PMutex> {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn cond_of(handle: i64) -> Option<&'static PCond> {
     match entry(handle) {
         Some(Primitive::Cond(c)) => Some(c),
@@ -454,6 +486,7 @@ fn cond_of(handle: i64) -> Option<&'static PCond> {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn sem_of(handle: i64) -> Option<&'static PSem> {
     match entry(handle) {
         Some(Primitive::Sem(s)) => Some(s),
@@ -468,6 +501,7 @@ fn atomic_of(handle: i64) -> Option<&'static PAtomic> {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn once_of(handle: i64) -> Option<&'static POnce> {
     match entry(handle) {
         Some(Primitive::Once(o)) => Some(o),
@@ -475,6 +509,7 @@ fn once_of(handle: i64) -> Option<&'static POnce> {
     }
 }
 
+#[cfg(not(feature = "nostd"))]
 fn channel_of(handle: i64) -> Option<&'static Channel> {
     match entry(handle) {
         Some(Primitive::Channel(c)) => Some(c),
@@ -485,12 +520,14 @@ fn channel_of(handle: i64) -> Option<&'static Channel> {
 // --- ABI ------------------------------------------------------------------
 
 /// ABI: a new mutex, unlocked. Returns a handle.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_new() -> i64 {
     register(Primitive::Mutex(PMutex::new()))
 }
 
 /// ABI: lock the mutex, parking until it is free.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_lock(handle: i64) {
     match mutex_of(handle) {
@@ -500,6 +537,7 @@ pub extern "C" fn pickle_mutex_lock(handle: i64) {
 }
 
 /// ABI: try to lock without blocking. Returns 1 on success.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_trylock(handle: i64) -> bool {
     match mutex_of(handle) {
@@ -509,6 +547,7 @@ pub extern "C" fn pickle_mutex_trylock(handle: i64) -> bool {
 }
 
 /// ABI: unlock a mutex this thread holds.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_mutex_unlock(handle: i64) {
     match mutex_of(handle) {
@@ -518,6 +557,7 @@ pub extern "C" fn pickle_mutex_unlock(handle: i64) {
 }
 
 /// ABI: a new condition variable. Returns a handle.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_new() -> i64 {
     register(Primitive::Cond(PCond::new()))
@@ -525,6 +565,7 @@ pub extern "C" fn pickle_cond_new() -> i64 {
 
 /// ABI: wake one waiter. A signal with no waiter parked yet is remembered, so
 /// the next `condWait` returns immediately.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_signal(handle: i64) {
     match cond_of(handle) {
@@ -534,6 +575,7 @@ pub extern "C" fn pickle_cond_signal(handle: i64) {
 }
 
 /// ABI: wake every waiter parked right now.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_broadcast(handle: i64) {
     match cond_of(handle) {
@@ -544,6 +586,7 @@ pub extern "C" fn pickle_cond_broadcast(handle: i64) {
 
 /// ABI: release `mutex`, wait on `cond`, and return with `mutex` held again (the
 /// Go/Java condition-variable contract). A null `mutex` waits without one.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_cond_wait(cond: i64, mutex: i64) {
     let Some(c) = cond_of(cond) else {
@@ -560,12 +603,14 @@ pub extern "C" fn pickle_cond_wait(cond: i64, mutex: i64) {
 }
 
 /// ABI: a new semaphore with `permits` available. Returns a handle.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_new(permits: i64) -> i64 {
     register(Primitive::Sem(PSem::new(permits)))
 }
 
 /// ABI: take `n` permits, parking until they are available.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_acquire(handle: i64, n: i64) {
     match sem_of(handle) {
@@ -575,6 +620,7 @@ pub extern "C" fn pickle_sem_acquire(handle: i64, n: i64) {
 }
 
 /// ABI: take `n` permits without blocking. Returns 1 on success.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_try_acquire(handle: i64, n: i64) -> bool {
     match sem_of(handle) {
@@ -584,6 +630,7 @@ pub extern "C" fn pickle_sem_try_acquire(handle: i64, n: i64) -> bool {
 }
 
 /// ABI: return `n` permits, waking a waiter.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_sem_release(handle: i64, n: i64) {
     match sem_of(handle) {
@@ -636,12 +683,14 @@ pub extern "C" fn pickle_atomic_cas(handle: i64, expected: i64, value: i64) -> b
 }
 
 /// ABI: a new `once`. Returns a handle.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_new() -> i64 {
     register(Primitive::Once(POnce::new()))
 }
 
 /// ABI: whether the initialiser has already run.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_done(handle: i64) -> bool {
     match once_of(handle) {
@@ -653,6 +702,7 @@ pub extern "C" fn pickle_once_done(handle: i64) -> bool {
 /// ABI: run `body` (a zero-argument closure object) exactly once across all
 /// tasks. Returns true for the caller that ran it, false for the ones that
 /// waited for it.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleObject) -> bool {
     let Some(once) = once_of(handle) else {
@@ -664,7 +714,7 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
     // The winner runs the body with the world lock held, like any other call
     // from compiled code. A body that fails leaves the once "running" and
     // every other task parked forever: the same contract as a `Once` whose
-    // initialiser aborted, and the honest one — silently running the
+    // initialiser aborted, and the honest one ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â silently running the
     // initialiser twice would be worse than a visible hang.
     crate::threads::call_closure0(body);
     once.finish();
@@ -672,6 +722,7 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
 }
 
 /// ABI: a new bounded channel with room for `cap` values. Returns a handle.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
     let cap = if cap < 1 {
@@ -683,6 +734,7 @@ pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
 }
 
 /// ABI: how many values the channel can hold before a send blocks.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_cap(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -692,6 +744,7 @@ pub extern "C" fn pickle_channel_cap(handle: i64) -> i64 {
 }
 
 /// ABI: how many values are buffered right now.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_len(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -701,6 +754,7 @@ pub extern "C" fn pickle_channel_len(handle: i64) -> i64 {
 }
 
 /// ABI: block until a slot is free, then store `value` (a raw scalar).
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_send(handle: i64, value: i64) {
     match channel_of(handle) {
@@ -711,6 +765,7 @@ pub extern "C" fn pickle_channel_send(handle: i64, value: i64) {
 
 /// ABI: store `value` (a raw scalar) without blocking. Returns 1 on success,
 /// 0 when full.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_try_send(handle: i64, value: i64) -> bool {
     match channel_of(handle) {
@@ -721,6 +776,7 @@ pub extern "C" fn pickle_channel_try_send(handle: i64, value: i64) -> bool {
 
 /// ABI: block until a value is available. Returns the raw scalar, like
 /// `atomic_load`; the call site boxes it if it ever lands in an object slot.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_recv(handle: i64) -> i64 {
     match channel_of(handle) {
@@ -731,6 +787,7 @@ pub extern "C" fn pickle_channel_recv(handle: i64) -> i64 {
 
 /// ABI: take a value if one is buffered, boxing it (an `Option<int>` carries
 /// boxed objects, and `none` is the null pointer); returns null when empty.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::PickleObject {
     match channel_of(handle) {
@@ -744,6 +801,7 @@ pub extern "C" fn pickle_channel_try_recv(handle: i64) -> *mut crate::object::Pi
 
 /// ABI: mark the channel closed. Sends after this point fail loud; buffered
 /// values can still be received.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_close(handle: i64) {
     match channel_of(handle) {
@@ -753,6 +811,7 @@ pub extern "C" fn pickle_channel_close(handle: i64) {
 }
 
 /// ABI: whether the channel has been closed.
+#[cfg(not(feature = "nostd"))]
 #[no_mangle]
 pub extern "C" fn pickle_channel_closed(handle: i64) -> bool {
     match channel_of(handle) {

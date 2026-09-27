@@ -47,7 +47,6 @@ mod test;
 mod threads;
 mod trace;
 mod r#tuple;
-#[cfg(not(feature = "nostd"))]
 mod sync;
 #[cfg(not(feature = "nostd"))]
 pub mod world;
@@ -338,7 +337,7 @@ macro_rules! declare_abi {
 
         /// The address of ABI symbol `name`, or `None` when it is not part of
         /// the runtime ABI. (Symbols supplied by the host rather than the
-        /// runtime ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â `pickle_fmod` ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â are not listed here.)
+        /// runtime ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â `pickle_fmod` ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â are not listed here.)
         pub fn runtime_addr(name: &str) -> Option<usize> {
             match name {
                 $( $( #[$meta] )? stringify!($name) => Some($path as *const () as usize), )*
@@ -490,15 +489,10 @@ declare_abi! {
     #[cfg(not(feature = "nostd"))]
     pickle_thread_yield => crate::threads::pickle_thread_yield,
 
-    #[cfg(not(feature = "nostd"))]
     pickle_atomic_add => crate::sync::pickle_atomic_add,
-    #[cfg(not(feature = "nostd"))]
     pickle_atomic_cas => crate::sync::pickle_atomic_cas,
-    #[cfg(not(feature = "nostd"))]
     pickle_atomic_load => crate::sync::pickle_atomic_load,
-    #[cfg(not(feature = "nostd"))]
     pickle_atomic_new => crate::sync::pickle_atomic_new,
-    #[cfg(not(feature = "nostd"))]
     pickle_atomic_store => crate::sync::pickle_atomic_store,
     #[cfg(not(feature = "nostd"))]
     pickle_channel_cap => crate::sync::pickle_channel_cap,

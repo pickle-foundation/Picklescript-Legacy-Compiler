@@ -1,0 +1,42 @@
+// Exercises the whole `pickle_atomic_*` group, which is the part of `sync`
+// that needs no operating-system support: a cell is an
+// `core::sync::atomic::AtomicI64`, so the freestanding (nostd) build gives
+// the same observable behaviour as the threaded one. This is the end-to-end
+// check that the group is actually reachable through a selfhost link rather
+// than merely compiling.
+
+fn main() {
+    // new / load / store
+    let a = atomic_new(3)
+    expect(atomic_load(a)).toBe(3)
+    atomic_store(a, 10)
+    expect(atomic_load(a)).toBe(10)
+
+    // add returns the value from *before* the addition, so a running total
+    // is just the discarded result.
+    let b = atomic_new(100)
+    expect(atomic_add(b, 5)).toBe(100)
+    expect(atomic_add(b, -30)).toBe(105)
+    expect(atomic_load(b)).toBe(75)
+
+    // cas reports whether it swapped, and a failed cas must leave the cell
+    // alone rather than storing the rejected value.
+    let c = atomic_new(7)
+    expect(atomic_cas(c, 7, 42)).toBe(true)
+    expect(atomic_load(c)).toBe(42)
+    expect(atomic_cas(c, 7, 99)).toBe(false)
+    expect(atomic_load(c)).toBe(42)
+    expect(atomic_cas(c, 42, 0)).toBe(true)
+    expect(atomic_load(c)).toBe(0)
+
+    // cells are independent, and a negative value round-trips. `atomic_add`
+    // returns the pre-value, so the bump is done by discarding the result.
+    let d = atomic_new(-1)
+    expect(atomic_load(d)).toBe(-1)
+    atomic_add(d, 1)
+    expect(atomic_load(d)).toBe(0)
+    expect(atomic_load(a)).toBe(10)
+    expect(atomic_load(b)).toBe(75)
+
+    println("atomics ok")
+}
