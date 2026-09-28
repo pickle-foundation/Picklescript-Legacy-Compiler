@@ -711,6 +711,20 @@ impl<'a> Parser<'a> {
         }
 
         let kind = match self.kind().clone() {
+            Tok::Async => {
+                // `async fn name(...) -> R { body }` — a future-producing
+                // function. Calling it evaluates nothing: it returns a
+                // captured 0-arg closure (the future) that `await` drives.
+                self.bump();
+                if !self.at(&Tok::Fn) {
+                    self.err_at(self.span(), "expected `fn` after `async`");
+                    return Err(());
+                }
+                let mut f = self.parse_fn()?;
+                f.visibility = visibility;
+                f.is_async = true;
+                ItemKind::Fn(f)
+            }
             Tok::Fn => {
                 let mut f = self.parse_fn()?;
                 f.visibility = visibility;
@@ -1260,6 +1274,8 @@ impl<'a> Parser<'a> {
             }
             Tok::While => self.parse_while_stmt(),
             Tok::For => self.parse_for_stmt(),
+            Tok::Try => self.parse_try_stmt(),
+            Tok::Throw => self.parse_throw_stmt(),
             Tok::Semicolon => {
                 let span = self.span();
                 self.bump();
@@ -1290,6 +1306,58 @@ impl<'a> Parser<'a> {
             body: Box::new(body),
             span,
         })
+    }
+
+    /// `try B catch (name) H finally F`. `catch` and `finally` are each
+    /// optional, but a `try` with neither is a mistake rather than a no-op, so
+    /// it is rejected here instead of lowering to a block.
+    fn parse_try_stmt(&mut self) -> PResult<Stmt> {
+        let start = self.span();
+        self.expect(&Tok::Try)?;
+        let body = self.parse_block()?;
+
+        let (binder, handler) = if self.eat(&Tok::Catch) {
+            let binder = if self.eat(&Tok::LParen) {
+                let name = self.expect_ident("exception name")?;
+                self.expect(&Tok::RParen)?;
+                Some(name)
+            } else {
+                None
+            };
+            (binder, Some(Box::new(self.parse_block()?)))
+        } else {
+            (None, None)
+        };
+
+        if self.at(&Tok::Catch) {
+            self.err_here("a `try` can only have one `catch`");
+        }
+        let finally = if self.eat(&Tok::Finally) {
+            Some(Box::new(self.parse_block()?))
+        } else {
+            None
+        };
+
+        if handler.is_none() && finally.is_none() {
+            self.err_at(start, "`try` needs a `catch` or a `finally`");
+        }
+
+        let span = start.to(self.prev_span());
+        Ok(Stmt::Try {
+            body: Box::new(body),
+            binder,
+            handler,
+            finally,
+            span,
+        })
+    }
+
+    fn parse_throw_stmt(&mut self) -> PResult<Stmt> {
+        let start = self.span();
+        self.expect(&Tok::Throw)?;
+        let value = self.parse_expr()?;
+        let span = start.to(self.prev_span());
+        Ok(Stmt::Throw { value, span })
     }
 
     fn parse_for_stmt(&mut self) -> PResult<Stmt> {
@@ -3330,9 +3398,11 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Return { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
-        | Stmt::While { span, .. }
-        | Stmt::For { span, .. }
-        | Stmt::Empty(span) => *span,
+          | Stmt::While { span, .. }
+          | Stmt::For { span, .. }
+          | Stmt::Try { span, .. }
+          | Stmt::Throw { span, .. }
+          | Stmt::Empty(span) => *span,
         Stmt::Expr(e) => e.span,
     }
 }

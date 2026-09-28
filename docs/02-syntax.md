@@ -103,6 +103,31 @@ account.deposit(20)
 print("done")
 ```
 
+### Exceptions
+
+`try`/`catch`/`finally`/`throw` give structured exception handling. `throw`
+raises with a string payload; it can cross function boundaries until a
+matching `catch` unwinds it. `catch (e)` binds the thrown message as a `string`.
+
+```
+try {
+    danger()
+    "unreachable"
+} catch (e) {
+    "caught " + e
+} finally {
+    cleanup()
+}
+```
+
+- `try` may be used as a tail expression: the `try`/`catch` block value is the
+  matched arm's value (as in `guarded()` in `tests/pickle/exception_test.pkl`).
+- `finally` blocks run on every path (normal, caught, or escaping throw) and
+  write in observable order.
+- A `throw` with no enclosing `catch` on the call chain faults at runtime (the
+  exception surface is the runtime `exception.rs` module; `tests/pickle/exception_test.pkl`
+  covers nesting, escapes, `finally` ordering, and GC stress in the landing paths).
+
 ### Declarations & expressions together
 
 ```
@@ -282,6 +307,14 @@ extends implements
 async task channel
 ```
 
+`async` and `await` are active keywords: `async fn f(...) -> T { body }`
+declares a deferred function whose call yields a future, and the prefix
+operator `await <future>` drives a future to completion and yields its value.
+A future is a zero-argument function value (a closure over `f`'s arguments);
+`task { ... }` desugars to `thread_spawn(fn() { ... })` and `channel*` names
+are runtime handles. `task` and `channel` otherwise still lex and bind as
+ordinary identifiers.
+
 `from` is reserved exclusively for the import grammar (`import x from mod`).
 `use` is **no longer a keyword**: the old `use a.b.item` import syntax was
 replaced by `import item from a.b`, and `use` now lexes and binds as an
@@ -298,8 +331,7 @@ fn channel(v: int) -> int => v  // method named "channel"
 
 The same words still bind at their declaration slots: `get`/`set` inside a
 `property`, `init { }` / `deinit { }` bodies, an `operator` member, a
-`constructor`, an access modifier, `class C extends B`, `class C implements I`,
-and `async task = ...`.
+`constructor`, an access modifier, `class C extends B`, `class C implements I`.
 `await x` lives at the prefix-operator position, reserved there.
 
 `task { ... }` is sugar for `thread_spawn(fn() { ... })`: the block becomes a

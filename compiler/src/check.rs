@@ -1505,6 +1505,43 @@ impl<'a> Checker<'a> {
                 self.loop_depth -= 1;
                 Ty::Empty
             }
+            Stmt::Try {
+                body,
+                binder,
+                handler,
+                finally,
+                span,
+            } => {
+                self.check_block(body);
+                if let (Some(name), Some(handler)) = (binder, handler) {
+                    // The payload is a `string`, so the handler always knows
+                    // what it holds. Declared before the block so the handler's
+                    // own scope nests inside it.
+                    self.push_scope();
+                    self.declare(name, Ty::String, false);
+                    self.check_block(handler);
+                    self.pop_scope();
+                } else if let Some(handler) = handler {
+                    self.check_block(handler);
+                }
+                if let Some(finally) = finally {
+                    self.check_block(finally);
+                }
+                let _ = span;
+                Ty::Empty
+            }
+            Stmt::Throw { value, span } => {
+                let t = self.check_expr(value);
+                if t != Ty::Unknown && t != Ty::String {
+                    self.err_note(
+                        *span,
+                        "a `throw` payload must be a `string`",
+                        format!("found `{t}`"),
+                    );
+                }
+                self.guard_stored_ref(&Ty::String, &t, *span, "a `throw` payload");
+                Ty::Empty
+            }
             Stmt::Expr(e) => {
                 let t = self.check_expr(e);
                 let _ = t;
@@ -2094,8 +2131,22 @@ impl<'a> Checker<'a> {
             } => self.check_if(e, cond, then, else_else.as_deref()),
             ExprKind::Match { scrutinee, arms } => self.check_match(e, scrutinee, arms),
             ExprKind::Await(inner) => {
-                let _ = self.check_expr(inner);
-                Ty::Unknown
+                // `await <future>` drives a zero-argument function (a future
+                // returned by an `async fn`) to completion and yields its value.
+                let t = self.check_expr(inner);
+                match t {
+                    Ty::Fn(ps, r) if ps.is_empty() => *r,
+                    Ty::Unknown => Ty::Unknown,
+                    other => {
+                        self.err(
+                            e.span,
+                            format!(
+                                "cannot `await` a value of type `{other}`; a future is a zero-argument function (`() -> T`) returned by an `async fn`"
+                            ),
+                        );
+                        Ty::Unknown
+                    }
+                }
             }
             ExprKind::GenericCall { name, type_args } => self.generic_fn_ty(e, name, type_args),
             ExprKind::Cast { expr, ty, kind } => self.check_cast(e, expr, ty, *kind),
@@ -2648,6 +2699,15 @@ impl<'a> Checker<'a> {
                 }
                 if self.manual_ret_fns.contains(cname) {
                     self.pending_owned_calls.insert(e.span);
+                }
+                if first.is_async
+                    && first.generics.is_empty()
+                    && !matches!(first.ret, Ty::Empty)
+                {
+                    // Calling an `async fn` does not run the body: it returns a
+                    // captured 0-arg function (the future) typed `() -> R`,
+                    // which `await` drives.
+                    return Ty::Fn(Vec::new(), Box::new(first.ret.clone()));
                 }
                 return first.ret.clone();
             }

@@ -434,8 +434,11 @@ The inferred instantiation is exactly the explicit one (`pkl_id_fn__int` is
 - Instance methods compile to `pkl_<TypeName>_<m>`, with the receiver passed
   first as a managed pointer (IR param slot 0, declared as `this`); static
   methods compile to `pkl_<TypeName>_sm_<m>` with no receiver. Async/body-less
-  methods and methods with default/rest params are skipped like their
-  top-level counterparts; `override fn` methods lower with the same shape (and
+  methods and methods with default/rest params are skipped like top-level
+  functions with those shapes; an `async fn` top-level declaration instead
+  registers two functions — a visible wrapper returning a closure over its
+  parameters and a hidden 0-arg body the wrapper boxes into that closure —
+  and `override fn` methods lower with the same shape (and
   drive the dispatch cascade described above). Methods of a generic class
   instantiation follow the same shapes under the mangled symbols above
   (`pkl_Box_read_int`, `pkl_<T>_sm_<m>_<suffix>`).

@@ -1,0 +1,41 @@
+// Async machinery end to end through the JIT.
+//
+// An `async fn` call does not run the body: it returns a future, typed
+// `() -> R` — an ordinary closure snapshotting the arguments — and `await`
+// drives that closure to completion on the current thread and yields R.
+// Nothing here runs a background task; the language-level async/await pair is
+// the subject.
+
+async fn slow_square(n: int) -> int {
+    n * n
+}
+
+async fn add(a: int, b: int) -> int {
+    a + b
+}
+
+fn main() {
+    // calling an async fn does not run the body; it returns a future
+    let future = slow_square(7)
+    let v = await future
+    expect(v).toBe(49)
+
+    // awaiting inline works too, and each call makes a fresh future
+    expect(await slow_square(6)).toBe(36)
+
+    // a future is just a value: it can be stored, re-awaited, and passed along
+    let f2 = slow_square(3)
+    expect(await f2).toBe(9)
+    expect(await f2).toBe(9)
+
+    // arguments are captured per call, so two futures disagree on their values
+    let hi = add(10, 1)
+    let lo = add(2, 3)
+    expect(await hi).toBe(11)
+    expect(await lo).toBe(5)
+
+    // an async body is only a deferred ordinary function: it can call other
+    // functions, and its future can be built with a variable-sized argument
+    let n = 4
+    expect(await slow_square(n * 2)).toBe(64)
+}

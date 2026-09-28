@@ -50,7 +50,15 @@ thread maintains its own shadow stack, GC ids, and heap-affiliated data.
 
 - `task { ... }` spawns an OS thread (or a coroutine on the shared pool,
   configurable) executing a `fn (): T`.
-- `async fn` lowers to a state machine that yields at each `await`.
+- `async fn` is a deferred ordinary function: the call is lowered by the
+  compiler (not the runtime) to a wrapper that builds a closure over the fn's
+  parameters — the "future", a zero-argument function — and returns it without
+  running the body. `await f` drives that closure to completion on the current
+  thread with an ordinary dynamic call and yields its value. There is no
+  scheduler, no state machine, and no runtime pin: a future is a value, so it
+  can be stored, passed around, awaited any number of times (each drive
+  re-runs the body), and handed to `thread_spawn` to be driven on another
+  thread by joining it with `thread_join`.
 - Channels are rendezvous buffers with a bounded queue: `channel(T, cap)`,
   `send` (blocking/`trySend`), `receive`/`tryReceive`/`select`.
 - A program-wide work-stealing pool backs `parallel { }` blocks:

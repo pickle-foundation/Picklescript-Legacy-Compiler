@@ -5,6 +5,40 @@
 //! `ir.rs`. Constructs outside the slice-1 subset are rejected with a
 //! "not lowered yet" diagnostic rather than miscompiled.
 
+//! Lower the checked AST to PickleIR.
+//!
+//! The checker runs first (collecting `expr -> Ty` into a side table); this
+//! module walks the typed AST and emits the flat block/slot/temp IR from
+//! `ir.rs`. Constructs outside the slice-1 subset are rejected with a
+//! "not lowered yet" diagnostic rather than miscompiled.
+//!
+//! # `try`/`catch`/`throw`/`finally`
+//!
+//! Compiled frames carry no unwind information, so a throw cannot skip a frame.
+//! [`try_stmt`] therefore lowers a throw to *cooperating* propagation:
+//!
+//! - `throw v` calls the runtime to publish `v` and raise a per-thread flag,
+//!   then branches straight to the innermost enclosing `catch` (or, with none,
+//!   runs the `finally` chain and returns, leaving the flag for the caller).
+//! - A call that can propagate is followed by a check of that flag; when it is
+//!   set the enclosing function returns immediately. Every frame between the
+//!   throw and its handler therefore leaves *in order*, so the collector's
+//!   shadow stack stays balanced.
+//! - `catch` consumes the flag and binds the payload.
+//!
+//! Because the IR is a flat CFG with no unwind tables, `finally` is lowered by
+//! *duplication*: [`exit_through_finallys`] re-emits each active `finally` on
+//! the way out of the block, so a `finally` also runs on a `return`, a
+//! `break`/`continue`, and a propagating throw. No new IR variant is needed for
+//! any of this, so both backends and the textual printer are untouched.
+//!
+//! The check after a call costs a runtime call, so it is emitted only where a
+//! throw is actually possible: [`Emitter::solve_may_throw`] solves a least fixed
+//! point over the call graph first, and a call to a function that provably cannot
+//! throw gets no check at all. That analysis needs the call graph, which only
+//! exists once the bodies have been walked, so emission runs twice — see
+//! [`Emitter::emit`].
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -130,6 +164,15 @@ pub fn emit_ir(
         next_block: 0,
         next_temp: 0,
         loops: Vec::new(),
+        finallys: Vec::new(),
+        handlers: Vec::new(),
+        may_throw: HashMap::new(),
+        prog_may_throw: false,
+        analyzing: false,
+        call_edges: HashMap::new(),
+        direct_throw: HashSet::new(),
+        suppressed: Vec::new(),
+        in_throw_transfer: false,
         failed: false,
     };
     em.emit();
@@ -140,11 +183,32 @@ pub fn emit_ir(
     }
 }
 
-/// A `break`/`continue` target pair.
+    /// A `break`/`continue` target pair.
 struct LoopCtx {
     continue_target: BlockId,
     break_target: BlockId,
 }
+
+/// An enclosing `catch` that a `throw` in the same function can branch to
+/// directly, without a flag round-trip through the caller.
+#[derive(Clone)]
+struct HandlerCtx {
+    /// First block of the handler body.
+    target: BlockId,
+    /// Index in [`Emitter::finallys`] of the `finally` belonging to the `try`
+    /// that owns this handler, or the length at the time the handler was pushed
+    /// when that `try` has no `finally`. Read together with [`Self::own_finally`]
+    /// to find the first `finally` that is still owed on the way to the handler.
+    fin_base: usize,
+    /// Whether the owning `try` has a `finally` of its own. That one is *not*
+    /// run on the way to the handler: `try_stmt` emits it once, after the
+    /// handler body, on the path the branch takes. Without this flag the two
+    /// cases are indistinguishable, because a `try` with no `finally` pushes
+    /// nothing and leaves an inner `finally` sitting exactly at `fin_base`.
+    own_finally: bool,
+}
+
+
 
 /// Where a registered function's body and signature come from.
 #[derive(Clone)]
@@ -154,7 +218,7 @@ enum FnSource<'a> {
     /// A lambda expression's hoisted body: slot 0 is the closure object, whose
     /// slots 1..N hold the captured values copied in at entry; the lambda's own
     /// parameters come after the closure object.
-    Lambda {
+Lambda {
         lambda: &'a Expr,
         captures: Vec<Capture>,
         /// The lambda's parameter types (substituted under the enclosing
@@ -164,6 +228,14 @@ enum FnSource<'a> {
         ret: Ty,
         owner: Option<i64>,
     },
+    /// A visible `async fn`: a wrapper with the fn's real ABI that builds a
+    /// closure over the caller-supplied parameters (the future) and returns it.
+    /// Calling it runs no body code; the body runs only under `await`.
+    AsyncFn { f: &'a FnDecl, hidden: FuncId },
+    /// The hidden 0-arg future body of an `async fn`, sharing the hoisted
+    /// lambda ABI: slot 0 is the closure object whose slots 1..N hold the async
+    /// fn's parameters, read as named captures inside the body.
+    AsyncBody { f: &'a FnDecl, pty: Vec<Ty>, ret: Ty },
     /// The constructor of a class/struct: synthesized from the fields unless an
     /// explicit `constructor(...)` body is present.
     Ctor {
@@ -283,8 +355,33 @@ const MAX_LAMBDA_CAPTURES: usize = 8;
 /// Runtime symbol names used to build and call closure values.
 const CLOSURE_CLASS_PREFIX: &str = "__closure_";
 
-/// The slot holding the hoisted body's code address inside a closure object.
-const CLOSURE_FN_SLOT: usize = 0;
+    /// The slot holding the hoisted body's code address inside a closure object.
+    const CLOSURE_FN_SLOT: usize = 0;
+
+    /// Runtime symbols for cooperative exception propagation. See the module
+    /// docs: a throw raises a per-thread flag that enclosing frames observe
+    /// after each call, and `finally` is lowered by duplication.
+    mod exc {
+        /// Publish `payload` and raise this thread's pending flag.
+        pub const THROW: &str = "pickle_exc_throw";
+        /// Is a throw in flight on this thread?
+        pub const PENDING: &str = "pickle_exc_pending";
+        /// Consume the in-flight throw, returning its payload.
+        pub const TAKE: &str = "pickle_exc_take";
+    }
+
+    /// How control leaves a block once its `finally` chain has run.
+    enum Exit {
+        /// Leave the function with this value.
+        Return(Option<Temp>),
+        /// Jump to an existing block (a `break`/`continue` target).
+        Branch(BlockId),
+        /// Leave the function because a throw is propagating. A function with a
+        /// result must still produce one, so a zero of that type is returned;
+        /// the caller checks the pending flag before it reads the value.
+        Propagate,
+    }
+
 
 /// The number of parameters on a lambda expression.
 fn params_len(lambda: &Expr) -> usize {
@@ -619,6 +716,48 @@ struct Emitter<'a> {
     next_block: u32,
     next_temp: u32,
     loops: Vec<LoopCtx>,
+    /// `finally` blocks in scope, outermost first. A `return`, `break`,
+    /// `continue`, or propagating `throw` re-emits each one on the way out.
+    /// Held by value: a `finally` has to outlive the borrow of the statement
+    /// that introduced it, and `stmt` is handed borrows shorter than `'a`.
+    finallys: Vec<Block>,
+    /// Enclosing `catch`es, innermost last, while their `try` body is emitted.
+    handlers: Vec<HandlerCtx>,
+    /// Functions that can propagate a throw, by [`FuncId`], as solved by
+    /// [`Emitter::solve_may_throw`]. An id that is absent is treated as
+    /// propagating, so this map only ever removes checks.
+    may_throw: HashMap<FuncId, bool>,
+    /// Whether the program contains a `throw` at all, read off the analysis
+    /// pass. When false no call site can propagate one, so no propagation check
+    /// is emitted anywhere.
+    prog_may_throw: bool,
+    /// True while the analysis pass is running.
+    ///
+    /// Emission runs twice: once to *discover* the call graph with no checks
+    /// emitted, then again for real once the throwing set is known. The first
+    /// pass only records, so a program that fails to lower reports its
+    /// diagnostic once (from the second pass) rather than twice.
+    analyzing: bool,
+    /// Caller -> callees, recorded by [`Emitter::guard_propagation`] during the
+    /// analysis pass. Only ever a superset of the real call graph, which is what
+    /// makes the fixed point sound: a missing check would lose a throw, so every
+    /// edge that might exist is kept.
+    call_edges: HashMap<FuncId, Vec<FuncId>>,
+    /// Functions whose own body contains a `throw`, recorded during the
+    /// analysis pass. These seed the fixed point.
+    direct_throw: HashSet<FuncId>,
+    /// Diagnostics raised during the analysis pass, replayed only if that pass
+    /// is the one that fails.
+    suppressed: Vec<Diagnostic>,
+    /// True while emitting a `finally` that runs *because* of a pending throw.
+    ///
+    /// The flag is already set on those paths, so a propagation check after any
+    /// call in the `finally` would read the throw we are already handling and
+    /// divert out of the transfer we are in the middle of. Suppressing the
+    /// checks keeps the transfer straight through; a call in the `finally` that
+    /// throws anyway replaces the payload, which is the same rule the handler
+    /// path already relies on.
+    in_throw_transfer: bool,
     failed: bool,
 }
 
@@ -686,15 +825,87 @@ impl<'a> Emitter<'a> {
             self.test_setup_id = Some(fid);
         }
         self.register_lambdas();
-        // Instantiated generic functions are registered lazily while their
-        // callers compile, so the build loop must keep consuming newly-appended
-        // function ids rather than snapshotting the list up front.
+        // Pass 1: lower every body with the propagation checks suppressed,
+        // purely to record which function calls which and which bodies contain
+        // a `throw` of their own. Instantiated generics and the synthesized
+        // trampolines are registered lazily *during* this loop, so this is also
+        // the pass that discovers them; the loop keeps consuming newly appended
+        // ids rather than snapshotting the list up front.
+        //
+        // A program with no `throw` anywhere cannot propagate one, so it needs no
+        // check at any call site. That fact is read back off `direct_throw`
+        // rather than from the parser's own global, which is shared mutable
+        // state: two compilations in one process could interleave and leave it
+        // describing the other program. What was actually lowered cannot.
+        self.analyzing = true;
+        self.build_all();
+        self.analyzing = false;
+        if self.failed {
+            // Nothing to re-lower: report what the analysis pass found.
+            for d in std::mem::take(&mut self.suppressed) {
+                self.diags.emit(d);
+            }
+            return;
+        }
+        self.suppressed.clear();
+        self.prog_may_throw = !self.direct_throw.is_empty();
+        if self.prog_may_throw {
+            self.solve_may_throw();
+        }
+        // Pass 2: the real thing. `build_func` replaces each function entry
+        // wholesale, and every cache that hands out a `FuncId` is keyed, so
+        // re-running the loop over the same ids overwrites pass 1 cleanly
+        // instead of appending to it.
+        self.build_all();
+    }
+
+    /// Lower every registered function body, including any registered lazily by
+    /// an earlier one.
+    fn build_all(&mut self) {
         let mut ix = 0;
         while ix < self.fid_list.len() {
             let fid = self.fid_list[ix];
             self.build_func(fid);
             ix += 1;
         }
+    }
+
+    /// Solve the least fixed point of "can propagate" over the recorded call
+    /// graph.
+    ///
+    /// The seeds are the bodies that contain a `throw` themselves; every caller
+    /// of a throwing function then inherits it, transitively. Running to a fixed
+    /// point matters because the graph has cycles (a recursive throwing function
+    /// seeds itself through its own edge).
+    ///
+    /// The result records an answer for *every* function the analysis pass
+    /// lowered, including the ones that came out `false`. That is the whole
+    /// point: [`Emitter::check_propagates`] treats an absent id as propagating,
+    /// so recording only the throwing set would leave every safe callee looking
+    /// unknown and every call site checked. Only a function the pass never
+    /// reached stays absent, and that can only cost a branch.
+    fn solve_may_throw(&mut self) {
+        let mut throws: HashSet<FuncId> = self.direct_throw.clone();
+        loop {
+            let mut changed = false;
+            for (caller, callees) in &self.call_edges {
+                if throws.contains(caller) {
+                    continue;
+                }
+                if callees.iter().any(|c| throws.contains(c)) {
+                    throws.insert(*caller);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.may_throw = self
+            .fid_list
+            .iter()
+            .map(|fid| (*fid, throws.contains(fid)))
+            .collect();
     }
 
     // ---- lambda pre-registration ----------------------------------------
@@ -872,6 +1083,33 @@ impl<'a> Emitter<'a> {
                 self.walk_expr(e, owner_cid, owner_name, lmark, scope, acc)
             }
             Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Empty(_) => {}
+            Stmt::Throw { value, .. } => {
+                self.walk_expr(value, owner_cid, owner_name, lmark, scope, acc)
+            }
+            Stmt::Try {
+                body,
+                binder,
+                handler,
+                finally,
+                ..
+            } => {
+                scope.push(HashSet::new());
+                self.walk_block(body, owner_cid, owner_name, lmark, scope, acc);
+                scope.pop();
+                if let Some(handler) = handler {
+                    scope.push(HashSet::new());
+                    if let Some(name) = binder {
+                        scope_bind(scope, name);
+                    }
+                    self.walk_block(handler, owner_cid, owner_name, lmark, scope, acc);
+                    scope.pop();
+                }
+                if let Some(finally) = finally {
+                    scope.push(HashSet::new());
+                    self.walk_block(finally, owner_cid, owner_name, lmark, scope, acc);
+                    scope.pop();
+                }
+            }
             Stmt::Expr(e) => self.walk_expr(e, owner_cid, owner_name, lmark, scope, acc),
             Stmt::While { cond, body, .. } => {
                 self.walk_expr(cond, owner_cid, owner_name, lmark, scope, acc);
@@ -1397,8 +1635,8 @@ impl<'a> Emitter<'a> {
         out
     }
 
-    fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
-        if f.is_async || !f.generics.is_empty() {
+fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
+        if !f.generics.is_empty() {
             return;
         }
         if f.params.iter().any(|p| p.default.is_some() || p.rest) {
@@ -1415,6 +1653,10 @@ impl<'a> Emitter<'a> {
             .is_ok();
         let ok_ret = self.map_ty(&info.ret, f.span).is_ok();
         if !ok_params || !ok_ret {
+            return;
+        }
+        if f.is_async {
+            self.register_async_fn(f, is_test, attrs, &info);
             return;
         }
         let fid = FuncId(self.module.funcs.len());
@@ -1437,6 +1679,76 @@ impl<'a> Emitter<'a> {
         self.finfo.insert(fid, info.clone());
         self.src_param_tys
             .insert(fid, info.params.iter().map(|p| p.ty.clone()).collect());
+    }
+
+    /// Register an `async fn` as two lowerable functions connected by the
+    /// confirmed design (no new runtime primitives, no new `Ty` variant):
+    ///
+    ///   * the hidden future body — a 0-arg hoisted body with the lambda ABI
+    ///     (`env = closure object`), whose closure slots 1..N snapshot each of
+    ///     the async fn's parameters under its own name; and
+    ///   * the visible wrapper — a normal module function with the async fn's
+    ///     real ABI that allocates that closure and returns it. Calling it
+    ///     runs no user code; the body runs only when `await` drives the
+    ///     future's 0-arg call.
+    ///
+    /// The hidden entry is registered first so the wrapper can name it.
+    fn register_async_fn(
+        &mut self,
+        f: &'a FnDecl,
+        is_test: bool,
+        attrs: &[Attribute],
+        info: &CallableInfo,
+    ) {
+        let symbol = self.symbol_for(&f.name, is_test);
+        let hidden_name = format!("{}__future", f.name);
+        let hidden_symbol = format!("{symbol}__future");
+        let hidden = FuncId(self.module.funcs.len());
+        self.module.funcs_by_name.insert(hidden_name.clone(), hidden);
+        self.module.funcs.push(IrFunc {
+            name: hidden_name,
+            symbol: hidden_symbol,
+            params: Vec::new(),
+            ret: IrTy::Unit,
+            slots: Vec::new(),
+            entry: BlockId(0),
+            blocks: Vec::new(),
+            is_main: false,
+            is_test: false,
+            tags: Vec::new(),
+        });
+        self.fid_list.push(hidden);
+        self.fsource.insert(
+            hidden,
+            FnSource::AsyncBody {
+                f,
+                pty: info.params.iter().map(|p| p.ty.clone()).collect(),
+                ret: info.ret.clone(),
+            },
+        );
+        let mut hidden_info = info.clone();
+        hidden_info.params = Vec::new();
+        self.finfo.insert(hidden, hidden_info);
+
+        let wfid = FuncId(self.module.funcs.len());
+        self.module.funcs_by_name.insert(f.name.clone(), wfid);
+        self.module.funcs.push(IrFunc {
+            name: f.name.clone(),
+            symbol,
+            params: Vec::new(),
+            ret: IrTy::Unit,
+            slots: Vec::new(),
+            entry: BlockId(0),
+            blocks: Vec::new(),
+            is_main: !is_test && f.name == "main",
+            is_test,
+            tags: self.item_tags(attrs),
+        });
+        self.fid_list.push(wfid);
+        self.fsource.insert(wfid, FnSource::AsyncFn { f, hidden });
+        self.finfo.insert(wfid, info.clone());
+        self.src_param_tys
+            .insert(wfid, info.params.iter().map(|p| p.ty.clone()).collect());
     }
 
     // ---- class/struct registration ---------------------------------------
@@ -2803,13 +3115,38 @@ impl<'a> Emitter<'a> {
                 self.fret = self.map_ty(&info.ret, f.span).unwrap_or(IrTy::Unit);
                 self.emit_body(&f.body);
             }
-            FnSource::Lambda {
+FnSource::Lambda {
                 lambda,
                 captures,
                 pty,
                 ret,
                 owner,
             } => self.build_lambda_body(lambda, &captures, &pty, &ret, owner, fid),
+            FnSource::AsyncFn { f, hidden } => {
+                let Some(info) = self.finfo.get(&fid).cloned() else {
+                    return;
+                };
+                self.declare_params(&info.params);
+                self.adopt_manual_params(&f.params);
+                // The wrapper returns the future: a closure snapshotting each
+                // parameter under its own name (slot 0 is the hidden body).
+                self.fret = IrTy::Ptr;
+                let captures: Vec<Capture> = info
+                    .params
+                    .iter()
+                    .map(|p| Capture {
+                        name: p.name.clone(),
+                        ty: p.ty.clone(),
+                        span: p.span,
+                    })
+                    .collect();
+                if let Ok(obj) = self.closure_obj_span(f.span, hidden, &captures) {
+                    self.term(IrTerm::Return { v: Some(obj) });
+                }
+            }
+            FnSource::AsyncBody { f, pty, ret } => {
+                self.build_async_body(f, &pty, &ret, fid);
+            }
             FnSource::Trampoline {
                 span,
                 target,
@@ -3039,7 +3376,37 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        let _ = self.emit_body(&Some(body.clone()));
+let _ = self.emit_body(&Some(body.clone()));
+    }
+
+    /// Build the hidden future body of an `async fn`. It shares the hoisted
+    /// lambda ABI with zero parameters: slot 0 is the closure object, whose
+    /// slots 1..N snapshot the async fn's parameters (built by the wrapper via
+    /// `closure_obj_span` in parameter order). Those parameters are declared as
+    /// named captures, then the fn's real body is emitted with its return type.
+    fn build_async_body(&mut self, f: &'a FnDecl, pty: &[Ty], ret: &Ty, _fid: FuncId) {
+        let _ = self.map_ty(ret, f.span).map(|ir| self.fret = ir);
+        self.owner = None;
+        let env_ir = IrTy::Ptr;
+        let env_slot = self.new_slot(env_ir);
+        self.fparams.push(IrParam {
+            name: "env".to_string(),
+            ty: env_ir,
+        });
+        self.declare("env", env_slot);
+        let env_obj = self.load(env_slot);
+        for (i, p) in f.params.iter().enumerate() {
+            let t = pty.get(i).cloned().unwrap_or(Ty::Unknown);
+            let v = match self.field_read(p.span, env_obj, &t, 1 + i) {
+                Ok(v) => v,
+                Err(()) => return,
+            };
+            let ir = self.map_ty(&t, p.span).unwrap_or(IrTy::Ptr);
+            let slot = self.new_slot(ir);
+            self.instr(IrInstr::StoreSlot { slot, v });
+            self.declare(&p.name, slot);
+        }
+        let _ = self.emit_body(&f.body);
     }
 
     /// Declare function parameters as slots 0..n (used by top-level fns).
@@ -4010,6 +4377,17 @@ impl<'a> Emitter<'a> {
     /// then if the function returns a value the tail expression *is* the return
     /// value; otherwise it is discarded.
     fn block_tail_as_return(&mut self, b: &Block) {
+        let try_slot = match self.stmts_with_try_tail(&b.stmts, self.fret) {
+            Ok(slot) => slot,
+            Err(()) => return,
+        };
+        if let Some(slot) = try_slot {
+            // `block_into_slot` already option-boxed a scalar tail into a `Ptr`
+            // result slot, so the loaded value matches `fret` as-is.
+            let t = self.load(slot);
+            self.term(IrTerm::Return { v: Some(t) });
+            return;
+        }
         for s in &b.stmts {
             if self.stmt(s).is_err() {
                 return;
@@ -4172,34 +4550,360 @@ impl<'a> Emitter<'a> {
                     }
                     None => None,
                 };
-                self.term(IrTerm::Return { v });
-                self.cur = self.new_block();
+                self.exit_through_finallys(Exit::Return(v))?;
                 Ok(())
             }
             Stmt::Break { span: _ } => {
                 let Some(target) = self.loops.last().map(|l| l.break_target) else {
                     return self.bad_span_note("unbalanced `break`");
                 };
-                self.term(IrTerm::Branch { target });
-                self.cur = self.new_block();
+                self.exit_through_finallys(Exit::Branch(target))?;
                 Ok(())
             }
             Stmt::Continue { span: _ } => {
                 let Some(target) = self.loops.last().map(|l| l.continue_target) else {
                     return self.bad_span_note("unbalanced `continue`");
                 };
-                self.term(IrTerm::Branch { target });
-                self.cur = self.new_block();
+                self.exit_through_finallys(Exit::Branch(target))?;
                 Ok(())
             }
             Stmt::While { cond, body, span } => self.while_stmt(cond, body, *span),
             Stmt::For { header, body, span } => self.for_stmt(header, body, *span),
+            Stmt::Try {
+                body,
+                binder,
+                handler,
+                finally,
+                span,
+            } => self.try_stmt(
+                body,
+                binder.as_deref(),
+                handler.as_deref(),
+                finally.as_deref(),
+                *span,
+                None,
+            ),
+            Stmt::Throw { value, span } => self.throw_stmt(value, *span),
             Stmt::Expr(e) => {
                 let _ = self.expr(e)?;
                 Ok(())
             }
             Stmt::Empty(_) => Ok(()),
         }
+    }
+
+    /// Emit a statement sequence, giving a trailing `try` a slot to leave its
+    /// value in. Returns that slot when the last statement was a `try`, so the
+    /// caller can read the value the `try` produced.
+    fn stmts_with_try_tail(&mut self, stmts: &[Stmt], want: IrTy) -> Result<Option<Slot>, ()> {
+        // Peek before emitting: on a miss the caller still has to emit the
+        // whole sequence itself, and emitting it twice would duplicate effects.
+        let is_try = matches!(stmts.last(), Some(Stmt::Try { .. }));
+        if !is_try {
+            return Ok(None);
+        }
+        let (last, rest) = stmts.split_last().expect("checked non-empty");
+        for s in rest {
+            self.stmt(s)?;
+        }
+        let Stmt::Try {            body,
+            binder,
+            handler,
+            finally,
+            span,
+        } = last
+        else {
+            unreachable!("guarded by is_try");
+        };
+        let slot = self.new_slot(want);
+        self.try_stmt(
+            body,
+            binder.as_deref(),
+            handler.as_deref(),
+            finally.as_deref(),
+            *span,
+            Some(slot),
+        )?;
+        Ok(Some(slot))
+    }
+
+    /// Emit `b` as a statement, optionally capturing its tail value into `res`.
+    /// A block with no tail expression leaves `res` untouched, which is fine:
+    /// every path that reaches it stores a value of its own.
+    fn emit_block(&mut self, b: &Block, res: Option<Slot>) -> Result<(), ()> {
+        match res {
+            Some(slot) => self.block_into_slot(b, Some(slot)),
+            None => self.block_body_only(b),
+        }
+    }
+
+    /// Emit `exit` after every `finally` currently in scope, innermost first.
+    ///
+    /// Each `finally` is re-emitted here rather than shared, because a flat CFG
+    /// has no way to return to a single copy from several exits. The
+    /// `finallys` stack is cleared while they are emitted, so a `return`,
+    /// `break`, or `throw` written *inside* a `finally` means "discard the
+    /// pending exit", which is what Java and C# do.
+    fn exit_through_finallys(&mut self, exit: Exit) -> Result<(), ()> {
+        if self.finallys.is_empty() {
+            return self.perform_exit(exit);
+        }
+        let chain = core::mem::take(&mut self.finallys);
+        // The flag is set on every path that reaches here through a throw, so
+        // the `finally` bodies run with propagation checks suppressed.
+        let saved = self.in_throw_transfer;
+        self.in_throw_transfer = true;
+        for fin in chain.iter().rev() {
+            // One copy of the `finally` per level, then on to the next level.
+            let after = self.new_block();
+            self.push_scope();
+            self.block_body_only(fin)?;
+            self.pop_scope();
+            self.term(IrTerm::Branch { target: after });
+            self.cur = after;
+        }
+        self.in_throw_transfer = saved;
+        self.finallys = chain;
+        self.perform_exit(exit)
+    }
+
+    /// The exit itself, once every `finally` has run.
+    fn perform_exit(&mut self, exit: Exit) -> Result<(), ()> {
+        match exit {
+            Exit::Return(v) => {
+                self.term(IrTerm::Return { v });
+            }
+            Exit::Branch(target) => {
+                self.term(IrTerm::Branch { target });
+            }
+            Exit::Propagate => {
+                let v = match self.fret {
+                    IrTy::Unit => None,
+                    IrTy::Ptr => Some(self.zero_ptr()),
+                    other => Some(self.const_temp(Self::zero_const(other))),
+                };
+                self.term(IrTerm::Return { v });
+            }
+        }
+        self.cur = self.new_block();
+        Ok(())
+    }
+
+    /// The zero value of a lowered type, for a return path abandoned by a
+    /// propagating throw. A caller checks the pending flag before reading the
+    /// result, so this only has to be a well-formed value of the right type.
+    fn zero_const(ty: IrTy) -> IrConst {
+        match ty {
+            IrTy::Bool => IrConst::Bool(false),
+            IrTy::Char => IrConst::Char(0),
+            IrTy::Float => IrConst::Float(0),
+            _ => IrConst::Int(0),
+        }
+    }
+
+    /// A null pointer constant, for the propagate path of a reference-returning
+    /// function whose real result was abandoned by a throw.
+    fn zero_ptr(&mut self) -> Temp {
+        self.const_temp(IrConst::Null)
+    }
+
+    /// `throw value`: publish the payload, then leave.
+    ///
+    /// The transfer is a direct branch to the innermost enclosing `catch`, so a
+    /// `throw` inside the `try` it matches does not pay for a flag round-trip.
+    /// With no `catch` in this function the flag stays set for the caller, which
+    /// observes it after the call.
+    fn throw_stmt(&mut self, value: &Expr, span: Span) -> Result<(), ()> {
+        let _ = span;
+        let payload = self.expr(value)?;
+        if self.fret == IrTy::Ptr {
+            let vt = self.ty_of(&value.span).unwrap_or(Ty::Unknown);
+            let payload = self.option_wrap(payload, &vt, value.span)?;
+            self.throw_with(payload)
+        } else {
+            self.throw_with(payload)
+        }
+    }
+
+    /// Publish `payload` and transfer control.
+    ///
+    /// With an enclosing `catch` in this function, control branches straight to
+    /// it after running any `finally` from *inside* that `catch`'s own `try`, so
+    /// a local `throw` costs no flag round-trip. The payload still goes through
+    /// `pickle_exc_throw`, which roots it in the GC for the jump and lets the
+    /// handler's `pickle_exc_take` release it. With no `catch` here the flag
+    /// stays set and the caller observes it after the call.
+    fn throw_with(&mut self, payload: Temp) -> Result<(), ()> {
+        if self.analyzing {
+            // A `throw` in this body is the seed for its own fixed point; the
+            // transfer that follows is pass 2's problem.
+            if let Some(fid) = self.current_fid {
+                self.direct_throw.insert(fid);
+            }
+            return Ok(());
+        }
+        self.extern_call_void(exc::THROW, vec![IrTy::Ptr], vec![payload]);
+        self.transfer_to_handler_or_propagate()
+    }
+
+    /// Leave the current block for the innermost `catch` in this function, or
+    /// out of the function when there is none.
+    ///
+    /// The `finally`s still owed on the way are only the ones from *inside* the
+    /// handler's own `try`, and they run innermost first. The handler's own
+    /// `finally` is deliberately left on the stack: `try_stmt` emits it once,
+    /// after the handler body, on the path this branch takes.
+    ///
+    /// This only *emits*; it never mutates the `handlers`/`finallys` stacks.
+    /// Both callers lower a path that does not necessarily commit — a
+    /// `check_pending` guard resumes into the same handler scope afterwards, and
+    /// a `throw` statement is only one of several statements still to be emitted
+    /// — so a transfer that consumed the enclosing context would strand every
+    /// later `throw` in the same body. `try_stmt` balances its own push once,
+    /// when the body and the handler are both fully emitted.
+    fn transfer_to_handler_or_propagate(&mut self) -> Result<(), ()> {
+        let Some(handler) = self.handlers.last().cloned() else {
+            return self.exit_through_finallys(Exit::Propagate);
+        };
+
+        let chain = core::mem::take(&mut self.finallys);
+        // The `try` emits its own `finally` after the handler body, not before,
+        // so the first `finally` still owed on the way is one past it when the
+        // owning `try` has one of its own, and exactly at the base when it does
+        // not -- an inner `try`'s `finally` then occupies the base itself.
+        let inner_base = handler.fin_base + usize::from(handler.own_finally);
+        // The flag is still set here, so the inner `finally` bodies run with
+        // propagation checks suppressed: a check would see the throw we are
+        // transferring on and divert straight to the handler, skipping the
+        // remaining `finally`s.
+        let saved = self.in_throw_transfer;
+        self.in_throw_transfer = true;
+        for i in (inner_base..chain.len()).rev() {
+            let after = self.new_block();
+            self.push_scope();
+            self.block_body_only(&chain[i])?;
+            self.pop_scope();
+            self.term(IrTerm::Branch { target: after });
+            self.cur = after;
+        }
+        self.in_throw_transfer = saved;
+        // The whole chain goes back, including the handler's own `finally`: the
+        // handler body is emitted with it live, so a `return` inside the handler
+        // still runs it.
+        self.finallys = chain;
+
+        self.term(IrTerm::Branch { target: handler.target });
+        self.cur = self.new_block();
+        Ok(())
+    }
+
+    /// `try B catch (name) H finally F`.
+    ///
+    /// `B` is emitted inline. The end of `B` checks the pending flag and either
+    /// falls through to `finally` or enters `H`, which consumes the flag and
+    /// binds the payload to a frame slot (the IR has no block parameters, so the
+    /// `logic` idiom of a `Slot` written in one block and read in another is
+    /// what carries the value across the branch). A `throw` written inside `B`
+    /// skips the flag and branches to `H` directly.
+    ///
+    /// All three ways out — body normal, handler, and a propagating throw — run
+    /// `F`, so `F` is emitted once per way out. The owning `try`'s `finally` is
+    /// on the `finallys` stack while `B` and `H` are emitted, so a `return`
+    /// inside either runs it; a single pop then balances it before the
+    /// fall-through copies are emitted, so those copies cannot re-enter it.
+    fn try_stmt(
+        &mut self,
+        body: &Block,
+        binder: Option<&str>,
+        handler: Option<&Block>,
+        finally: Option<&Block>,
+        span: Span,
+        res: Option<Slot>,
+    ) -> Result<(), ()> {
+        let _ = span;
+        let after_body = self.new_block();
+        let handler_id = self.new_block();
+        let handler_fin_id = self.new_block();
+        let end_id = self.new_block();
+
+        // A `throw` in the body targets the handler directly, so it must be in
+        // scope while the body is emitted.
+        let fin_base = self.finallys.len();
+        if let Some(fin) = finally {
+            self.finallys.push(fin.clone());
+        }
+        if handler.is_some() {
+            self.handlers.push(HandlerCtx {
+                target: handler_id,
+                fin_base,
+                own_finally: finally.is_some(),
+            });
+        }
+
+        self.push_scope();
+        self.emit_block(body, res)?;
+        self.pop_scope();
+
+        if handler.is_some() {
+            // A call in the body may have thrown: hand over to the handler.
+            let pending = self.extern_call_t1(exc::PENDING, vec![], IrTy::Bool, vec![])?;
+            self.term(IrTerm::BranchIf {
+                cond: pending,
+                then: handler_id,
+                else_: after_body,
+            });
+        } else {
+            self.term(IrTerm::Branch { target: after_body });
+        }
+
+        // The body can no longer `throw` to this handler, so a `throw` in `H`
+        // propagates outward instead. Only the context this `try` pushed goes
+        // away: a `try` with no `catch` of its own must leave an enclosing
+        // handler in scope for the code that follows it.
+        if handler.is_some() {
+            self.handlers.pop();
+        }
+
+        self.cur = handler_id;
+        if let Some(handler) = handler {
+            // Consume the throw: this both clears the flag and yields the
+            // payload, and it is the only thing that unroots the payload.
+            let payload = self.extern_call_t1(exc::TAKE, vec![], IrTy::Ptr, vec![])?;
+            self.push_scope();
+            if let Some(name) = binder {
+                let slot = self.new_slot(IrTy::Ptr);
+                self.instr(IrInstr::StoreSlot { slot, v: payload });
+                self.declare(name, slot);
+            }
+            self.emit_block(handler, res)?;
+            self.pop_scope();
+        }
+
+        if let Some(fin) = finally {
+            // A single compile-time pop balances the push from before the body.
+            // The handler's fall-through copy and the body's fall-through copy
+            // are two emissions of the *same* `finally`, so the stack is already
+            // balanced by the time the body copy is emitted.
+            self.finallys.pop();
+            if handler.is_some() {
+                self.term(IrTerm::Branch { target: handler_fin_id });
+                self.cur = handler_fin_id;
+                self.push_scope();
+                self.block_body_only(fin)?;
+                self.pop_scope();
+            }
+        }
+        self.term(IrTerm::Branch { target: end_id });
+
+        self.cur = after_body;
+        if let Some(fin) = finally {
+            self.push_scope();
+            self.block_body_only(fin)?;
+            self.pop_scope();
+        }
+        self.term(IrTerm::Branch { target: end_id });
+        self.cur = end_id;
+        Ok(())
     }
 
     fn while_stmt(&mut self, cond: &Expr, body: &Block, span: Span) -> Result<(), ()> {
@@ -4931,8 +5635,30 @@ impl<'a> Emitter<'a> {
             ExprKind::OptAccess { object, name } => self.opt_access(e, object, name),
             ExprKind::OptUnwrap(inner) => self.opt_unwrap(e, inner),
             ExprKind::Lambda { .. } => self.lambda_value(e),
-            ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
-            ExprKind::Await(_) => self.bad(e.span, "`await` is not lowered yet"),
+ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
+            // `await <future>` drives the future (a zero-argument function from
+            // an `async fn`) to completion synchronously and yields its value:
+            // it lowers to a dynamic call of the closure with no arguments.
+            ExprKind::Await(inner) => match self.ty_of(&inner.span) {
+                Some(Ty::Fn(ps, prt)) if ps.is_empty() => {
+                    let obj = self.expr(inner)?;
+                    self.fn_value_call_from(e, obj, &Ty::Fn(Vec::new(), prt.clone()), &[])
+                }
+                Some(Ty::Unknown) => self.bad(
+                    inner.span,
+                    "cannot `await` a value whose type is unknown; an `async fn` call returns a `() -> T` future",
+                ),
+                other => {
+                    let shown = match other {
+                        Some(Ty::Fn(ps, _)) if !ps.is_empty() => {
+                            "a function taking arguments; a future is a zero-argument function"
+                        }
+                        Some(t) => return self.bad(inner.span, format!("cannot `await` a value of type `{t}`; a future is the `() -> T` value returned by an `async fn`")),
+                        None => "an untyped value",
+                    };
+                    self.bad(inner.span, format!("cannot `await` {shown}"))
+                }
+            },
             ExprKind::GenericCall { name, type_args } => self.generic_fn_value(e, name, type_args),
             ExprKind::Cast { expr, ty, kind } => self.cast(e, expr, ty, *kind),
             ExprKind::Unsafe(b) => {
@@ -4949,6 +5675,13 @@ impl<'a> Emitter<'a> {
     }
 
     fn block_value(&mut self, b: &Block) -> Result<Temp, ()> {
+        let want = self
+            .ty_of(&b.span)
+            .map(|t| elem_ir(&t))
+            .unwrap_or(IrTy::Unit);
+        if let Some(slot) = self.stmts_with_try_tail(&b.stmts, want)? {
+            return Ok(self.load(slot));
+        }
         for s in &b.stmts {
             self.stmt(s)?;
         }
@@ -6088,6 +6821,11 @@ impl<'a> Emitter<'a> {
                             callee: Callee::Func(fid),
                             args: vec![packed],
                         });
+                        // A setter is an ordinary method body, so it can
+                        // `throw`. Nothing reads `dsti` here, but the pending
+                        // flag still has to be noticed before the assignment
+                        // finishes and the caller carries on.
+                        self.guard_propagation(fid, e.span)?;
                         return Ok(dst);
                     }
                     let v = self.expr(value)?;
@@ -6106,6 +6844,10 @@ impl<'a> Emitter<'a> {
                         callee: Callee::Func(fid),
                         args: vec![packed],
                     });
+                    // Plain `Type.prop = v`: same as the instance case, the
+                    // assignment's value is `v` but the accessor call still
+                    // has to be observed for a pending throw.
+                    self.guard_propagation(fid, e.span)?;
                     return Ok(v);
                 }
                 if let Some((dcid, slot, info)) = self.static_field(cid as i64, name) {
@@ -6164,13 +6906,17 @@ impl<'a> Emitter<'a> {
                     } else {
                         dst
                     };
-                    let dsti = self.temp();
-                    self.instr(IrInstr::Call {
-                        dst: Some(dsti),
-                        callee: Callee::Func(fid),
-                        args: vec![obj, packed],
-                    });
-                    return Ok(dst);
+                        let dsti = self.temp();
+                        self.instr(IrInstr::Call {
+                            dst: Some(dsti),
+                            callee: Callee::Func(fid),
+                            args: vec![obj, packed],
+                        });
+                        // As with the static setter: a throwing accessor has to
+                        // be noticed here, or the assignment looks successful
+                        // and the flag escapes to some unrelated later call.
+                        self.guard_propagation(fid, e.span)?;
+                        return Ok(dst);
                 }
                 let obj = self.expr(object)?;
                 let v = self.expr(value)?;
@@ -6189,6 +6935,11 @@ impl<'a> Emitter<'a> {
                     callee: Callee::Func(fid),
                     args: vec![obj, packed],
                 });
+                // Plain `obj.prop = v`. The accessor's own body may `throw`,
+                // which comes back as a pending flag on this function's
+                // return; the assignment's value is `v`, but the call still
+                // has to be observed or the flag leaks into whatever runs next.
+                self.guard_propagation(fid, e.span)?;
                 return Ok(v);
             }
             return self.bad(
@@ -8466,6 +9217,19 @@ impl<'a> Emitter<'a> {
 
     /// Emit a block whose tail value (if any) is stored into `res_slot`.
     fn block_into_slot(&mut self, b: &Block, res_slot: Option<Slot>) -> Result<(), ()> {
+        if let Some(slot) = res_slot {
+            let want = self.fslots.get(slot.0 as usize).copied().unwrap_or(IrTy::Unit);
+            if let Some(try_slot) = self.stmts_with_try_tail(&b.stmts, want)? {
+                let t = self.load(try_slot);
+                self.instr(IrInstr::StoreSlot { slot, v: t });
+                return Ok(());
+            }
+        } else if self
+            .stmts_with_try_tail(&b.stmts, IrTy::Unit)?
+            .is_some()
+        {
+            return Ok(());
+        }
         for s in &b.stmts {
             self.stmt(s)?;
         }
@@ -9052,11 +9816,22 @@ impl<'a> Emitter<'a> {
         Ok(dst)
     }
 
-    /// A closure object holding `fid`'s code address (boxed) in slot 0 and the
+/// A closure object holding `fid`'s code address (boxed) in slot 0 and the
     /// given captures (boxed like list elements) in slots 1..N. The slot layout
     /// must match the hoisted body's reads in `build_lambda_body`.
     fn closure_obj(&mut self, e: &Expr, fid: FuncId, captures: &[Capture]) -> Result<Temp, ()> {
-        let cid = self.register_closure_class(captures.len(), e.span)?;
+        self.closure_obj_span(e.span, fid, captures)
+    }
+
+    /// Span-taking core of `closure_obj`; used where no source expression is at
+    /// hand (an `async fn` wrapper synthesizes the future over its parameters).
+    fn closure_obj_span(
+        &mut self,
+        span: Span,
+        fid: FuncId,
+        captures: &[Capture],
+    ) -> Result<Temp, ()> {
+        let cid = self.register_closure_class(captures.len(), span)?;
         let cid_t = self.int_const(cid as i64);
         let n_t = self.int_const((captures.len() + 1) as i64);
         let obj = self.extern_call_t1(
@@ -9348,6 +10123,7 @@ impl<'a> Emitter<'a> {
                 callee: Callee::Func(fid),
                 args: arg_temps,
             });
+            self.guard_propagation(fid, e.span)?;
             return Ok(dst);
         }
         // Class/struct constructor call: `TypeName(arg...)`.
@@ -9389,6 +10165,7 @@ impl<'a> Emitter<'a> {
                 callee: Callee::Func(fid),
                 args: arg_temps,
             });
+            self.guard_propagation(fid, e.span)?;
             return Ok(dst);
         }
         // Builtins.
@@ -10301,13 +11078,14 @@ impl<'a> Emitter<'a> {
             };
             arg_temps.push(t);
         }
-        let dst = self.temp();
-        self.instr(IrInstr::Call {
-            dst: Some(dst),
-            callee: Callee::Func(fid),
-            args: arg_temps,
-        });
-        Ok(dst)
+            let dst = self.temp();
+            self.instr(IrInstr::Call {
+                dst: Some(dst),
+                callee: Callee::Func(fid),
+                args: arg_temps,
+            });
+            self.guard_propagation(fid, e.span)?;
+            Ok(dst)
     }
 
     /// Lower `name<Type,...>` used as a VALUE (not called): the explicit type
@@ -10583,13 +11361,14 @@ impl<'a> Emitter<'a> {
             };
             arg_temps.push(t);
         }
-        let dst = self.temp();
-        self.instr(IrInstr::Call {
-            dst: Some(dst),
-            callee: Callee::Func(fid),
-            args: arg_temps,
-        });
-        Ok(dst)
+            let dst = self.temp();
+            self.instr(IrInstr::Call {
+                dst: Some(dst),
+                callee: Callee::Func(fid),
+                args: arg_temps,
+            });
+            self.guard_propagation(fid, e.span)?;
+            Ok(dst)
     }
 
     /// Create the concrete instantiation of a generic function over `map`
@@ -11295,14 +12074,76 @@ return self.spread_static_call(
     }
 
     /// Emit the call instruction for an already-marshaled method call.
-    fn emit_call_to(&mut self, fid: FuncId, call_args: Vec<Temp>, _e: &Expr) -> Result<Temp, ()> {
+    fn emit_call_to(&mut self, fid: FuncId, call_args: Vec<Temp>, e: &Expr) -> Result<Temp, ()> {
         let dst = self.temp();
         self.instr(IrInstr::Call {
             dst: Some(dst),
             callee: Callee::Func(fid),
             args: call_args,
         });
+        // A Pickle-level `throw` is cooperative: the callee returns normally
+        // with the pending flag set instead of unwinding, so the call site has
+        // to notice and leave before anyone reads `dst`.
+        self.guard_propagation(fid, e.span)?;
         Ok(dst)
+    }
+
+    /// Emit the pending check after a call to `fid`, if that call can propagate.
+    /// After a call that may leave a throw pending, either record the edge (on
+    /// the analysis pass) or emit the check (on the real one).
+    ///
+    /// Recording happens even when the enclosing function will turn out not to
+    /// need a check at all: the call really is a call, so it is really an edge.
+    /// Keeping every edge is what makes the fixed point safe, since the answer
+    /// is only ever used to *remove* a check.
+    fn guard_propagation(&mut self, fid: FuncId, span: Span) -> Result<(), ()> {
+        if self.analyzing {
+            if let Some(caller) = self.current_fid {
+                self.call_edges.entry(caller).or_default().push(fid);
+            }
+            return Ok(());
+        }
+        if self.check_propagates(fid, span) {
+            self.check_pending()?;
+        }
+        Ok(())
+    }
+
+    /// Can a call to `fid` leave a throw pending?
+    ///
+    /// A program with no `throw` anywhere cannot propagate one, so it skips
+    /// every check. Otherwise this is the fixed point from
+    /// [`Emitter::solve_may_throw`], and anything it does not know — a function
+    /// the analysis pass could not reach — is assumed to propagate. That
+    /// direction only ever costs a predictable branch, whereas guessing "no"
+    /// would lose a throw.
+    fn check_propagates(&self, fid: FuncId, _span: Span) -> bool {
+        if !self.prog_may_throw {
+            return false;
+        }
+        // A `finally` running on a throw path already has the flag set; a check
+        // there would see the throw we are transferring on, not a new one.
+        if self.in_throw_transfer {
+            return false;
+        }
+        self.may_throw.get(&fid).copied().unwrap_or(true)
+    }
+
+    /// After a call that may have thrown, branch to the innermost `catch` in
+    /// this function or out of it. The flag stays set until someone consumes it.
+    fn check_pending(&mut self) -> Result<(), ()> {
+        let pending = self.extern_call_t1(exc::PENDING, vec![], IrTy::Bool, vec![])?;
+        let thrown = self.new_block();
+        let resume = self.new_block();
+        self.term(IrTerm::BranchIf {
+            cond: pending,
+            then: thrown,
+            else_: resume,
+        });
+        self.cur = thrown;
+        self.transfer_to_handler_or_propagate()?;
+        self.cur = resume;
+        Ok(())
     }
 
     /// Lower an instance call to a method that is overridden somewhere in the
@@ -11531,6 +12372,10 @@ return self.spread_static_call(
             callee: Callee::Func(tramp),
             args: call_args,
         });
+        // The trampoline tail-calls `fid`, so a throw comes back with the flag
+        // set and `dst` never written. Check before the store, or the join block
+        // would load an unwritten slot and the throw would surface much later.
+        self.guard_propagation(fid, span)?;
         self.instr(IrInstr::StoreSlot {
             slot: res_slot,
             v: dst,
@@ -12285,7 +13130,13 @@ return self.spread_static_call(
         if msg.contains("not lowered yet") {
             d.code = Some(crate::error::ErrorCode::NotLowered);
         }
-        self.diags.emit(d);
+        if self.analyzing {
+            // The real pass reports this too; holding it here keeps a program
+            // that fails to lower from reporting every diagnostic twice.
+            self.suppressed.push(d);
+        } else {
+            self.diags.emit(d);
+        }
         Err(())
     }
 
@@ -12298,7 +13149,11 @@ return self.spread_static_call(
         if msg.contains("not lowered yet") {
             d.code = Some(crate::error::ErrorCode::NotLowered);
         }
-        self.diags.emit(d);
+        if self.analyzing {
+            self.suppressed.push(d);
+        } else {
+            self.diags.emit(d);
+        }
         Err(())
     }
 

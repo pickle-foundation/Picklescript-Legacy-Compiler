@@ -1,0 +1,47 @@
+// Async through the test runner: `test fn` bodies lower `await` exactly like
+// `main`. This file exercises future construction, inline awaiting, repeated
+// awaiting (the future is a stored value, each drive re-runs the body), and
+// argument capture isolation across futures.
+
+async fn slow_square(n: int) -> int {
+    n * n
+}
+
+async fn add(a: int, b: int) -> int {
+    a + b
+}
+
+async fn ness(x: int) -> int {
+    let inner = innermost(x)
+    await inner
+}
+
+async fn innermost(x: int) -> int {
+    x + 100
+}
+
+test fn calling_an_async_fn_defers_the_body() {
+    // No body code runs at the call; a future is just a value.
+    let f = slow_square(7)
+    expect(await f).toBe(49)
+}
+
+test fn await_inline_and_reawaited() {
+    expect(await slow_square(6)).toBe(36)
+    let f2 = slow_square(3)
+    expect(await f2).toBe(9)
+    expect(await f2).toBe(9)
+}
+
+test fn captures_are_per_call() {
+    let hi = add(10, 1)
+    let lo = add(2, 3)
+    expect(await hi).toBe(11)
+    expect(await lo).toBe(5)
+}
+
+test fn future_returning_future_from_nested_async() {
+    // A future whose body awaits another future: `await` inside the hidden
+    // body is itself a dynamic 0-arg call, so nesting composes.
+    expect(await ness(1)).toBe(101)
+}
