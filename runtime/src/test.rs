@@ -316,10 +316,24 @@ pub extern "C" fn pickle_runtime_run_tests() -> i32 {
         for p in &prefixes {
             run_hooks(&hooks, p, HOOK_BEFORE_EACH);
         }
-        let detail = {
+        // A `throw` that no `catch` in the test body handled is a failure, not a
+        // pass: it leaves the pending flag set, and every later call in the test
+        // would propagate it, so the body silently stops early. Checking the flag
+        // is what keeps an unhandled throw from reporting "ok" while skipping the
+        // rest of the test's assertions.
+        crate::exception::reset();
+        let mut detail = {
             (t.body)();
             crate::panic::take_captured_panic()
         };
+        if detail.is_none() {
+            if let Some(payload) = crate::exception::take_escaped() {
+                detail = Some(format!("uncaught exception: {payload}"));
+            }
+        } else {
+            // The test already failed; do not leave the payload rooted.
+            crate::exception::reset();
+        }
         let ok = detail.is_none();
         if ok {
             passed += 1;
@@ -527,6 +541,43 @@ mod tests {
             capture_stop(),
             "test ok ... ok\ntest bad ... FAILED (nope)\ntest boom ... FAILED (assertion failed)\ntest result: 1 passed; 2 failed\n"
         );
+        TESTS.lock().unwrap().clear();
+    }
+
+    extern "C" fn leak_throw() {
+        let s = crate::strings::string_from_bytes(b"escaped".as_ptr(), 7, crate::gc::gc_mut());
+        crate::exception::pickle_exc_throw(s);
+    }
+
+    /// A test body that leaves a `throw` with no handler must be reported as a
+    /// failure. Without this the body just stops early — every later call
+    /// propagates the pending flag — and the test reports "ok" while skipping its
+    /// own remaining assertions.
+    #[test]
+    fn an_uncaught_throw_fails_the_test() {
+        let _guard = crate::gc::test_begin();
+        capture_start();
+        let table = [
+            PickleTest {
+                name: b"leaky\0".as_ptr(),
+                name_len: 5,
+                body: leak_throw,
+            },
+            PickleTest {
+                name: b"after\0".as_ptr(),
+                name_len: 5,
+                body: pass,
+            },
+        ];
+        reg(&table);
+        assert_eq!(pickle_runtime_run_tests(), 1);
+        let out = capture_stop();
+        assert!(
+            out.contains("test leaky ... FAILED (uncaught exception: escaped)"),
+            "expected the leaked throw to fail the test, got:\n{out}"
+        );
+        // The next test must not inherit the payload.
+        assert!(out.contains("test after ... ok"), "got:\n{out}");
         TESTS.lock().unwrap().clear();
     }
 }

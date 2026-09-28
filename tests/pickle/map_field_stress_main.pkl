@@ -1,0 +1,136 @@
+class EdgeHolder {
+    var callEdges: Map<int, List<int>>
+    var directThrow: Map<int, bool>
+    var currentFid: int
+    var analyzing: bool
+
+    fn guard(caller: int, callee: int) {
+        if (this.analyzing) {
+            if (let some(existing) = this.callEdges.get(caller)) {
+                existing.push(callee)
+            } else {
+                this.callEdges[caller] = [callee]
+            }
+        }
+    }
+
+    fn markThrows(fid: int) {
+        if (this.analyzing) {
+            this.directThrow[fid] = true
+        }
+    }
+
+    fn keysCount() -> int {
+        var n = 0
+        for (k in this.callEdges.keys()) {
+            n = n + 1
+        }
+        n
+    }
+}
+
+fn seedIntBoolMap() -> Map<int, bool> {
+    let m = {0: false}
+    m.remove(0)
+    m
+}
+
+fn seedIntIntListMap() -> Map<int, List<int>> {
+    let m = {0: emptyInts()}
+    m.remove(0)
+    m
+}
+
+fn emptyInts() -> List<int> {
+    let l = [0]
+    l.remove(0)
+    l
+}
+
+fn emptyStrs() -> List<string> {
+    let l = [""]
+    l.remove(0)
+    l
+}
+
+fn bigChurn() {
+    var blobs = emptyStrs()
+    var gz = 0
+    while (gz < 1200) {
+        blobs.push("blob-" + str(gz) + "-abcdefghijklmnopqrstuvwxyz0123456789")
+        gz = gz + 1
+    }
+    var l2 = emptyInts()
+    var g2 = 0
+    while (g2 < 20000) {
+        l2.push(g2)
+        g2 = g2 + 1
+    }
+    var m2 = seedIntBoolMap()
+    var g3 = 0
+    while (g3 < 1200) {
+        m2[g3] = g3 % 2 == 0
+        g3 = g3 + 1
+    }
+    gcCollect(true)
+}
+
+fn fill(h: EdgeHolder) {
+    var i = 0
+    while (i < 150) {
+        h.currentFid = i
+        h.guard(i, (i * 7) % 200)
+        h.guard(i, (i * 13 + 5) % 200)
+        if (i % 3 == 0) {
+            h.markThrows(i)
+        }
+        i = i + 1
+    }
+}
+
+fn runCompile() -> string {
+    let h = EdgeHolder(seedIntIntListMap(), seedIntBoolMap(), 0, true)
+    fill(h)
+    bigChurn()
+    var h2 = EdgeHolder(seedIntIntListMap(), seedIntBoolMap(), 0, true)
+    fill(h2)
+    gcCollect(true)
+    h2.currentFid = 777
+    h2.guard(777, 100)
+    bigChurn()
+    var ceCount = h.keysCount()
+    var dtCount = 0
+    for (t in h.directThrow.keys()) {
+        dtCount = dtCount + 1
+    }
+    var verity = true
+    var i2 = 0
+    while (i2 < 150) {
+        var expectT = i2 % 3 == 0
+        if (h.directThrow[i2] != expectT) {
+            verity = false
+        }
+        if (let some(got) = h.callEdges.get(i2)) {
+            if (len(got) != 2) {
+                verity = false
+            }
+        } else {
+            verity = false
+        }
+        i2 = i2 + 1
+    }
+    if (ceCount == 150 && dtCount == 50 && verity && h2.keysCount() == 151) {
+        return "ST"
+    }
+    "VAR ce=" + str(ceCount) + " dt=" + str(dtCount) + " ver=" + str(verity) + " h2=" + str(h2.keysCount())
+}
+
+fn main() {
+    var out = ""
+    var r = 0
+    while (r < 5) {
+        out = out + runCompile() + ";"
+        r = r + 1
+    }
+    print(out)
+}

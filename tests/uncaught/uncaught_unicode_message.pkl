@@ -1,0 +1,14 @@
+// A payload that is not ASCII, and one carrying a combining mark, so that a
+// report path which writes bytes rather than characters stays byte-exact and
+// nothing is transliterated on the way out.
+
+module uncaught_unicode_message
+
+fn boom() {
+    throw "café — naïve 日本語 🚀"
+}
+
+fn main() {
+    println("before")
+    boom()
+}

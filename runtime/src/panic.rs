@@ -106,6 +106,9 @@ pub fn set_task_mode(task: bool) {
     TASK_MODE.with(|m| m.set(task));
     if task {
         TASK_PANIC.with(|p| *p.borrow_mut() = None);
+        // A task body starts with no throw in flight, so a flag left on this
+        // thread by earlier work is never one of its own.
+        crate::exception::reset();
     }
 }
 
@@ -258,6 +261,10 @@ pub fn install_panic_hook() {
             .unwrap_or_default();
         let _ = lock.write_all(location.as_bytes());
         let _ = lock.write_all(b"\n");
+        if std::env::var_os("PKL_PANIC_BT").is_some() {
+            let bt = std::backtrace::Backtrace::force_capture();
+            let _ = lock.write_all(format!("BACKTRACE:\n{}\n", bt).as_bytes());
+        }
         let _ = lock.flush();
         std::process::exit(1);
     }));

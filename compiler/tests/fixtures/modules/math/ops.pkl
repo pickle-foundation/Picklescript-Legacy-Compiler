@@ -11,3 +11,9 @@ fn double(v: int) -> int {
 fn helper() -> int {
     return 1
 }
+
+// A string-returning helper, so a fixture can put a *qualified call* in the
+// operand position of a `throw` rather than only a literal.
+fn message() -> string {
+    return "from math.ops"
+}

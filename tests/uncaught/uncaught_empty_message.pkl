@@ -1,0 +1,13 @@
+// An empty payload is a throw, not a non-throw. The report must still appear
+// rather than being skipped for having nothing to say.
+
+module uncaught_empty_message
+
+fn boom() {
+    throw ""
+}
+
+fn main() {
+    println("before")
+    boom()
+}

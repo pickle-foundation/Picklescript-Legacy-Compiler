@@ -1,0 +1,16 @@
+// A throw raised by a `finally` replaces the payload that was already in
+// flight, and the replacement is what escapes.
+
+module uncaught_throw_from_finally
+
+fn boom() {
+    throw "original"
+}
+
+fn main() {
+    try {
+        boom()
+    } finally {
+        throw "replacement"
+    }
+}

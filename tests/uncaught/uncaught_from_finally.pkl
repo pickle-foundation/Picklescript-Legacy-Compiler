@@ -1,0 +1,17 @@
+// The `finally` owed on the way out has to run before the program reports and
+// exits, so this pins both that it runs and that the report still happens once.
+
+module uncaught_from_finally
+
+fn boom() {
+    throw "from body"
+}
+
+fn main() {
+    try {
+        println("in try")
+        boom()
+    } finally {
+        println("finally ran")
+    }
+}

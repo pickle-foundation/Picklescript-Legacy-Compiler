@@ -1,0 +1,230 @@
+// Propagation checks sit after every *user* call, because a callee that throws
+// returns normally with the pending flag set. These tests cover the call shapes
+// that are lowered outside the plain `f(x)` / `o.m(x)` path, where a missing
+// check would silently drop the throw: property setters, spread calls, and the
+// static-initializer preamble.
+
+class Holder {
+    var backing: int = 0
+
+    property value: int {
+        get { return this.backing }
+        set { this.backing = value }
+    }
+
+    property boom: int {
+        get { return 0 }
+        set { throw "setter boom" }
+    }
+
+    property plain: int {
+        get { return this.backing }
+        set { this.backing = value }
+    }
+}
+
+fn id_fn<T>(x: T) -> T {
+    return x
+}
+
+fn sum3(a: int, b: int, c: int) -> int {
+    return a + b + c
+}
+
+fn sum3_throwing(a: int, b: int, c: int) -> int {
+    throw "spread boom"
+}
+
+// A setter that assigns normally must stay transparent to a `throw` in the
+// surrounding expression.
+fn uses_plain_setter(h: Holder, n: int) -> int {
+    h.plain = n
+    return h.plain
+}
+
+fn sets_then_throws(h: Holder, n: int) -> int {
+    h.plain = n
+    throw "after set"
+}
+
+// The guard after a setter call must branch to the *innermost* handler, i.e. the
+// `try` in the same frame that contains the assignment. Returning 7 proves the
+// handler ran; 100 is what the body would have produced without a throw.
+fn setter_throw_caught_locally(h: Holder, n: int) -> int {
+    try {
+        h.boom = n
+        100
+    } catch (e) {
+        7
+    }
+}
+
+test fn an_ordinary_setter_is_unchanged() {
+    let h = Holder()
+    expect(id_fn<int>(uses_plain_setter(h, 7))).toBe(7)
+}
+
+test fn a_setter_call_is_a_propagation_point() {
+    let h = Holder()
+    try {
+        sets_then_throws(h, 1)
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("after set")
+    }
+}
+
+test fn a_throwing_setter_is_caught_by_an_enclosing_try() {
+    let h = Holder()
+    try {
+        h.boom = 5
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("setter boom")
+    }
+}
+
+test fn a_throwing_setter_propagates_out_of_its_callee() {
+    expect(id_fn<int>(setter_throw_caught_locally(Holder(), 3))).toBe(7)
+}
+
+// `h.boom += n` reads through the getter and writes through the setter, so the
+// setter's throw must be observed on the compound-assign path too. Returning 7
+// proves the handler ran; 100 is the no-throw value.
+fn compound_setter_caught_locally(h: Holder, n: int) -> int {
+    try {
+        h.boom += n
+        100
+    } catch (e) {
+        7
+    }
+}
+
+test fn a_throwing_setter_in_compound_assign_is_caught_locally() {
+    expect(id_fn<int>(compound_setter_caught_locally(Holder(), 1))).toBe(7)
+}
+
+// A static property accessor is the same shape as an instance one, and the
+// static lowering keeps its own call site, so it needs the same guard.
+class StaticHolder {
+    static var backing: int = 0
+
+    static property value: int {
+        get { return StaticHolder.backing }
+        set { StaticHolder.backing = value }
+    }
+
+    static property boom: int {
+        get { return 0 }
+        set { throw "static setter boom" }
+    }
+}
+
+fn uses_plain_static_setter(n: int) -> int {
+    StaticHolder.value = n
+    return StaticHolder.backing
+}
+
+// No local `try`: the setter's throw has to return out of this function, then
+// be picked up by the caller. Without the guard at the static setter the frame
+// would fall through to `return 0` and the flag would be attributed to whatever
+// ran next.
+fn static_boom_sets(n: int) -> int {
+    StaticHolder.boom = n
+    return 0
+}
+
+test fn an_ordinary_static_setter_is_unchanged() {
+    expect(id_fn<int>(uses_plain_static_setter(9))).toBe(9)
+}
+
+test fn a_static_setter_throw_propagates_out_of_its_callee() {
+    try {
+        static_boom_sets(4)
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("static setter boom")
+    }
+}
+
+// ---- spread calls ----
+
+fn spread_plain(xs: List<int>) -> int {
+    return sum3(1, ...xs)
+}
+
+fn spread_of_throwing() -> int {
+    return sum3_throwing(1, 2, 3)
+}
+
+test fn a_spread_call_still_returns_its_value() {
+    expect(id_fn<int>(spread_plain([10, 100]))).toBe(111)
+}
+
+test fn a_spread_call_to_a_throwing_function_propagates() {
+    try {
+        spread_of_throwing()
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("spread boom")
+    }
+}
+
+fn spread_in_a_try(xs: List<int>) -> int {
+    try {
+        sum3(...xs)
+    } catch (e) {
+        -1
+    }
+}
+
+test fn a_spread_call_inside_a_try_keeps_its_value() {
+    expect(id_fn<int>(spread_in_a_try([1, 2, 3]))).toBe(6)
+}
+
+// A spread call as the tail of a function: the function's own return value must
+// survive, and a throw on that path must still propagate.
+fn spread_tail(xs: List<int>) -> int {
+    return sum3(1, 1, ...xs)
+}
+
+test fn a_spread_tail_call_keeps_its_value() {
+    expect(id_fn<int>(spread_tail([5]))).toBe(7)
+}
+
+// ---- method receivers through a variable ----
+
+class Counter {
+    var n: int = 0
+    fn bump() {
+        this.n = this.n + 1
+    }
+    fn boom() {
+        throw "method boom"
+    }
+}
+
+fn calls_bump_twice(c: Counter) -> int {
+    c.bump()
+    c.bump()
+    return c.n
+}
+
+fn calls_boom(c: Counter) -> int {
+    c.boom()
+    return 0
+}
+
+test fn repeated_method_calls_keep_accumulating() {
+    let c = Counter()
+    expect(id_fn<int>(calls_bump_twice(c))).toBe(2)
+}
+
+test fn a_method_throw_propagates_to_the_caller() {
+    try {
+        calls_boom(Counter())
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("method boom")
+    }
+}

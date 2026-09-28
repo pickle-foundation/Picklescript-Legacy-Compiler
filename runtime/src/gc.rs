@@ -445,6 +445,12 @@ impl Gc {
         TempRootLease(obj)
     }
 
+    /// Test-only probe: whether `obj` currently holds a `temp_root` lease.
+    #[cfg(test)]
+    pub fn temp_root_contains_for_test(&self, obj: *mut PickleObject) -> bool {
+        self.temp_roots.contains(&obj)
+    }
+
     /// Explicitly release a `#[manualAlloc]` object: run its finalizer, free
     /// any raw side buffers, and return the block to the heap. Panics if the
     /// object was not adopted (double free / free of a managed object).

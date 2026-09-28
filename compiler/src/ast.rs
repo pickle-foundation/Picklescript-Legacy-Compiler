@@ -211,6 +211,24 @@ pub enum Stmt {
         body: Box<Block>,
         span: Span,
     },
+    /// `try B catch (name) H finally F`. Every clause is optional except the
+    /// body: `catch` may be absent (a `try`/`finally`), and both may be absent
+    /// (a bare `try` that only exists for its `finally`). `binder` is `None`
+    /// for a bare `catch (e)`, and `handler` is `None` for a `finally`-only
+    /// `try`.
+    Try {
+        body: Box<Block>,
+        binder: Option<String>,
+        handler: Option<Box<Block>>,
+        finally: Option<Box<Block>>,
+        span: Span,
+    },
+    /// `throw value`. The payload is a `string`; control transfers to the
+    /// innermost enclosing `catch`, or out of the function when there is none.
+    Throw {
+        value: Expr,
+        span: Span,
+    },
     Expr(Expr),
     Empty(Span),
 }

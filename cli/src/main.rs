@@ -353,14 +353,20 @@ fn run() -> Result<()> {
             // void-returning host-convention function.
             let res = std::thread::Builder::new()
                 .stack_size(512 * 1024 * 1024)
-                .spawn(move || unsafe {
-                    program.run();
-                })
+                .spawn(move || unsafe { program.run() })
                 .with_context(|| "while spawning run thread")?
                 .join();
-            if res.is_err() {
-                eprintln!("[main] run thread panicked (res.is_err)");
-                std::process::exit(101);
+            let escaped = match res {
+                Ok(escaped) => escaped,
+                Err(_) => {
+                    eprintln!("[main] run thread panicked (res.is_err)");
+                    std::process::exit(101);
+                }
+            };
+            if let Some(payload) = escaped {
+                eprintln!("uncaught exception: {payload}");
+                pickle_runtime::abi::pickle_runtime_shutdown();
+                std::process::exit(1);
             }
             pickle_runtime::abi::pickle_runtime_shutdown();
         }
@@ -393,15 +399,21 @@ fn run() -> Result<()> {
             // void-returning host-convention function.
             let res = std::thread::Builder::new()
                 .stack_size(512 * 1024 * 1024)
-                .spawn(move || unsafe {
-                    program.run();
-                })
+                .spawn(move || unsafe { program.run() })
                 .with_context(|| "while spawning run thread")?
                 .join();
-            if res.is_err() {
-                // TEMP: identify whether the 101 comes from a panic here.
-                eprintln!("[main] run thread panicked (res.is_err)");
-                std::process::exit(101);
+            let escaped = match res {
+                Ok(escaped) => escaped,
+                Err(_) => {
+                    // TEMP: identify whether the 101 comes from a panic here.
+                    eprintln!("[main] run thread panicked (res.is_err)");
+                    std::process::exit(101);
+                }
+            };
+            if let Some(payload) = escaped {
+                eprintln!("uncaught exception: {payload}");
+                pickle_runtime::abi::pickle_runtime_shutdown();
+                std::process::exit(1);
             }
             pickle_runtime::abi::pickle_runtime_shutdown();
         }

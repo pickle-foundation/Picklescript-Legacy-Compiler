@@ -218,10 +218,22 @@ pub fn link_object(
     } else {
         "o"
     };
-    let obj_path = object_dir.join(format!("pickle_program.{ext}"));
+    // Both scratch paths have to be unique per invocation. Two `build`s running
+    // at once (cargo's test harness runs integration tests in parallel, and a
+    // user may script concurrent builds) would otherwise write over each
+    // other's object and shim, so each could link the other's program.
+    let stamp = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let obj_path = object_dir.join(format!("pickle_program-{stamp}.{ext}"));
     std::fs::write(&obj_path, object).context("cannot write object file")?;
 
-    let shim = object_dir.join("main_shim.rs");
+    let shim = object_dir.join(format!("main_shim-{stamp}.rs"));
     std::fs::write(
         &shim,
         "unsafe extern \"C\" {\n".to_string()
@@ -262,6 +274,14 @@ pub fn link_object(
             + "        pickle_runtime_init();\n"
             + "        pickle_main();\n"
             + "        pickle_flush();\n"
+            // Propagation is cooperative, so a `throw` with no handler left
+            // makes `pickle_main` return early like any other exit. Only the
+            // host can tell that apart from a normal return.
+            + "        if let Some(payload) = pickle_runtime::take_escaped_exception() {\n"
+            + "            eprintln!(\"uncaught exception: {}\", payload);\n"
+            + "            pickle_runtime_shutdown();\n"
+            + "            std::process::exit(1);\n"
+            + "        }\n"
             + "        pickle_runtime_shutdown();\n"
             + "    }\n"
             + "}\n",
@@ -283,6 +303,10 @@ pub fn link_object(
         .arg(out)
         .status()
         .context("cannot run rustc to link the program")?;
+    // Clean up both scratch files, including on the failure path, so a failed
+    // build does not leave the object behind for the next one to pick up.
+    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&shim);
     if !status.success() {
         bail!("linking {out:?} failed");
     }

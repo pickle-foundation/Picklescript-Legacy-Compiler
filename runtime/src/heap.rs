@@ -14,7 +14,7 @@ pub const MIN_OBJECT: usize = 32;
 /// Free-bin count: covers objects up to 2^31; bigger sizes go into the last bin.
 pub const NBINS: usize = 28;
 
-const FREE_SENTINEL: u32 = 0xDEAD;
+pub(crate) const FREE_SENTINEL: u32 = 0xDEAD;
 
 fn gc_trace_env() -> bool {
     #[cfg(feature = "nostd")]

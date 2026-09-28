@@ -92,9 +92,11 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Return { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
-        | Stmt::While { span, .. }
-        | Stmt::For { span, .. }
-        | Stmt::Expr(Expr { span, .. })
+          | Stmt::While { span, .. }
+          | Stmt::For { span, .. }
+          | Stmt::Try { span, .. }
+          | Stmt::Throw { span, .. }
+          | Stmt::Expr(Expr { span, .. })
         | Stmt::Empty(span) => *span,
     }
 }
@@ -1429,6 +1431,28 @@ impl<'a> Rewriter<'a> {
                 self.rewrite_block(body);
             }
             Stmt::Expr(e) => self.rewrite_expr(e),
+            Stmt::Try {
+                body,
+                handler,
+                finally,
+                ..
+            } => {
+                // All three blocks carry expressions that can name an imported
+                // item, so a qualified call inside a `try` body, its `catch`, or
+                // its `finally` has to be rewritten like any other. The binder
+                // is a plain name, not an expression, so there is nothing to
+                // visit.
+                self.rewrite_block(body);
+                if let Some(h) = handler {
+                    self.rewrite_block(h);
+                }
+                if let Some(f) = finally {
+                    self.rewrite_block(f);
+                }
+            }
+            Stmt::Throw { value, .. } => self.rewrite_expr(value),
+            // `Break`, `Continue` and `Empty` carry no subexpressions, so
+            // leaving them alone is correct rather than an oversight.
             _ => {}
         }
     }

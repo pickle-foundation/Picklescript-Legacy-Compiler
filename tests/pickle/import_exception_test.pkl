@@ -1,0 +1,126 @@
+// A regression test for a bug that no other file in the corpus could catch.
+//
+// Import resolution rewrites a qualified call, such as `fs.pathName`, into a
+// resolved one. That rewrite used to run only over statements it already knew
+// about, and it did not know about `try`: a qualified call inside a `try` body,
+// a `catch` handler or a `finally` block kept its module prefix, reached the
+// emitter unresolved, and the module failed to build. A `throw` whose operand
+// was a qualified call failed the same way.
+//
+// The bug is only reachable through an *aliased* import. `import { pathName }
+// from std.fs` binds the bare name `pathName`, which the resolver resolves
+// through its alias table without any rewriting, so a fixture written that way
+// passes whether or not the fix is present. `import std.fs as fs` is what
+// produces a genuinely qualified reference, so the cases below that have to be
+// rewritten all use the aliased form.
+//
+// Note the two import styles cannot be mixed for one module: a bare-item import
+// claims the source's last segment as an alias, so `import { writeln } from
+// std.io` and `import std.io as io` collide on `io`. Hence `currentDir`, taken
+// bare from `std.process`, is the one bare name used here.
+//
+// The rest of the corpus has no imports at all, which is why the bug survived
+// the full sweep. `stdlib/io_test.pkl` imports too, but the compiler's own test
+// runner never lowers it to IR, so it would not have caught this either.
+//
+// This is a plain module rather than a `test fn` item so that the self-host IR
+// parity gate lowers it the same way it lowers the rest of the corpus.
+
+module import_exception_test
+
+import std.io as io
+import std.fs as fs
+import { currentDir } from std.process
+
+// A qualified call from inside a `try` body.
+fn qualifying_in_try() -> int {
+    try {
+        return io.writeln(fs.pathName("in/try.pkl"))
+    } catch (e) {
+        return io.writeln(e)
+    }
+}
+
+// ... from inside a `catch` handler.
+fn qualifying_in_catch() -> int {
+    try {
+        throw "handed to the handler"
+    } catch (e) {
+        return io.writeln(e)
+    }
+}
+
+// ... from inside a `finally`, on a path that also returns through it.
+fn qualifying_in_finally() -> int {
+    try {
+        return io.writeln("in try")
+    } finally {
+        io.writeln(fs.pathName("in/finally.pkl"))
+    }
+}
+
+// A qualified call as the operand of a `throw`, on the escaping path.
+fn throwing_a_qualified_call() -> int {
+    try {
+        throw fs.pathName("thrown/from/a/call.pkl")
+    } catch (e) {
+        return io.writeln(e)
+    }
+}
+
+// A nested qualified call inside a `throw` operand, so the rewrite has to
+// descend into the operand rather than match only its outermost call.
+fn throwing_a_nested_qualified_call() -> int {
+    try {
+        throw fs.pathName(fs.pathName("thrown/from/nested.pkl"))
+    } catch (e) {
+        return io.writeln(e)
+    }
+}
+
+// A qualified call in the condition guarding a `throw`, so the rewrite is
+// reached from inside a nested block rather than from the top level of the
+// `try`.
+fn qualifying_in_a_nested_condition() -> int {
+    try {
+        if (fs.pathName("cond/guard.pkl") != "") {
+            throw fs.pathName("cond/throw.pkl")
+        }
+    } catch (e) {
+        return io.writeln(e)
+    }
+    return 0
+}
+
+// A bare imported name called from inside a `try`, which must keep working
+// alongside the qualified forms. `currentDir` returns an option, so this also
+// puts a bare call inside a nested `if let` block.
+fn bare_name_in_try() -> int {
+    try {
+        if (let some(dir) = currentDir()) {
+            return io.writeln(fs.pathName(dir + "/probe.pkl"))
+        }
+        return 0
+    } catch (e) {
+        return io.writeln(e)
+    }
+}
+
+// A qualified call reached through a `let` binding, so the checker has to
+// accept a name form that is neither a direct call nor a plain reference.
+fn qualifying_a_bound_import() -> int {
+    let emit = io.writeln
+    return emit(fs.pathName("bound.pkl"))
+}
+
+fn main() {
+    qualifying_in_try()
+    qualifying_in_catch()
+    qualifying_in_finally()
+    throwing_a_qualified_call()
+    throwing_a_nested_qualified_call()
+    qualifying_in_a_nested_condition()
+    bare_name_in_try()
+    qualifying_a_bound_import()
+    io.writeln("done")
+}

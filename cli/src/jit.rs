@@ -1059,6 +1059,18 @@ const SLOT_BYTES: i64 = 8;
         IrInstr::LoadSlot { dst, slot } => {
             let v = load_slot(builder, func, plan, frame, slot_ss, *slot)?;
             values.insert(dst.0, v);
+            // A loaded managed value is the same object already stashed in the
+            // source slot's cell, but that cell can be overwritten by a later
+            // `StoreSlot` *before* this temp's next use. If the temp survives
+            // across a subsequent allocating call, a collection can then free
+            // the object while only its register copy remains live: root it in
+            // its own cell too so the value pins until this temp is superseded.
+            // (Was the missing `write_through` here that made the selfhost emit
+            // non-deterministic under auto-GC: a slot-reuse pattern left a map
+            // key/holder only in a CLIF register at a safe point.)
+            if is_managed(func.slots.get(slot.0 as usize).copied().unwrap_or(IrTy::Ptr)) {
+                write_through(builder, plan, frame, dst.0, v);
+            }
         }
         IrInstr::StoreSlot { slot, v } => {
             let x = *values.get(&v.0).context("store operand")?;
@@ -1105,6 +1117,19 @@ const SLOT_BYTES: i64 = 8;
                     (e.symbol.clone(), e.params.clone(), e.ret)
                 }
             };
+            if matches!(callee, Callee::Extern(_)) {
+                for (ai, a) in args.iter().enumerate() {
+                    if ai < params.len() && is_managed(params[ai]) {
+                        let ty = plan.types.get(&a.0).copied().unwrap_or(IrTy::Ptr);
+                        if !is_managed(ty) {
+                            eprintln!(
+                                "UNROOTED-ARG fn={} extern={} arg#{} temp={} typed={ty:?} (managed param)",
+                                func.name, name, ai, a.0
+                            );
+                        }
+                    }
+                }
+            }
             if let Callee::Extern(_) = callee {
                 if try_inline_extern_call(
                     plan,
@@ -1365,10 +1390,14 @@ impl Drop for JitProgram {
 impl JitProgram {
     /// Execute the compiled `pickle_main`.
     ///
+    /// Returns a `throw` payload that escaped `main` uncaught. Propagation is
+    /// cooperative, so such a throw makes the entry function return early just
+    /// like a normal return; only the host can tell the difference.
+    ///
     /// # Safety
     ///
     /// The process must have run `pickle_runtime_init` first.
-    pub unsafe fn run(&self) {
+    pub unsafe fn run(&self) -> Option<String> {
         // SAFETY: `entry` points at the compiled pickle_main, a no-arg
         // void-returning function with the host C calling convention.
         let f: unsafe extern "C" fn() =
@@ -1376,6 +1405,7 @@ impl JitProgram {
         unsafe {
             f();
         }
+        pickle_runtime::take_escaped_exception()
     }
 
     /// Absolute address of a compiled symbol (a `pickle_*` function or a

@@ -47,6 +47,28 @@ fn imports_and_aliases_compile_clean() {
     assert_eq!(codes(&diags), Vec::new(), "no diagnostics expected");
 }
 
+// ---- qualified names inside `try` and `throw` ------------------------------
+//
+// `rewrite_stmt` had a catch-all arm that returned a statement unvisited, and
+// `Stmt::Try` and `Stmt::Throw` both fell into it. A qualified call inside a
+// `try` body, a `catch`, a `finally`, or a thrown expression therefore kept its
+// module prefix and the checker reported it as an undeclared name.
+//
+// A bare imported name does not reach the rewriter, so the other tests in this
+// file pass whether or not this is fixed; only an `import mod` reference does.
+
+#[test]
+fn qualified_names_inside_try_and_throw_resolve() {
+    let (ok, diags, _map) = check_file(&fixture("try_qualified_main.pkl"));
+    assert!(
+        ok.is_some(),
+        "a qualified call inside try/catch/finally or a throw operand must \
+         resolve; got {:?}",
+        codes(&diags)
+    );
+    assert_eq!(codes(&diags), Vec::new(), "no diagnostics expected");
+}
+
 // ---- module path mismatch -------------------------------------------------
 
 #[test]

@@ -1,0 +1,488 @@
+module exception_test
+
+// `finally` blocks write here, so their order is observable from a test.
+// A module-level mutable global is not supported, so the log is threaded
+// through as a parameter.
+class Log {
+    var s: string = ""
+}
+
+fn note(l: Log, x: string) {
+    l.s = l.s + x + ";"
+}
+
+// Force monomorphisation over each result type, so a `try` used as a tail
+// value is checked at more than one type.
+fn id_fn<T>(x: T) -> T {
+    return x
+}
+
+fn boom() {
+    throw "boom"
+}
+
+fn guarded() -> string {
+    try {
+        boom()
+        "unreachable"
+    } catch (e) {
+        "caught " + e
+    }
+}
+
+// A throw that crosses a function boundary with no `catch` in between, caught
+// by the caller.
+fn throws_here() {
+    throw "deep"
+}
+
+fn escapes() -> string {
+    try {
+        throws_here()
+        "unreachable"
+    } catch (e) {
+        "outer " + e
+    }
+}
+
+// `finally` only, no `catch`: the throw has to keep going. Nothing comes back
+// from this function, so the caller is what observes the propagation.
+fn finally_only(l: Log) -> string {
+    try {
+        boom()
+        "unreachable"
+    } finally {
+        note(l, "fin")
+    }
+    "after"
+}
+
+fn finally_only_caught(l: Log) -> string {
+    try {
+        finally_only(l)
+        "no throw"
+    } catch (e) {
+        "got " + e
+    }
+}
+
+fn ret_through_finally(l: Log, n: int) -> string {
+    try {
+        if (n > 0) {
+            return "pos"
+        }
+        "nonpos"
+    } finally {
+        note(l, "ret")
+    }
+}
+
+fn nested_throw(l: Log) -> string {
+    try {
+        try {
+            throw "inner"
+        } finally {
+            note(l, "innerfin")
+        }
+    } catch (e) {
+        "outer " + e
+    }
+}
+
+// A bare `catch` with no binder still catches.
+fn bare_catch() -> string {
+    try {
+        throw "ignored"
+    } catch {
+        "bare"
+    }
+}
+
+// A handler that throws: the new payload wins and the outer `catch` sees it.
+fn handler_throws() -> string {
+    try {
+        try {
+            throw "first"
+        } catch {
+            throw "second"
+        }
+    } catch (e) {
+        "got " + e
+    }
+}
+
+// Two `finally`s in scope: the inner one runs before the outer one.
+fn two_finalys(l: Log) -> string {
+    try {
+        try {
+            return "ret"
+        } finally {
+            note(l, "f2")
+        }
+    } finally {
+        note(l, "f1")
+    }
+}
+
+fn break_through_finally(l: Log) -> string {
+    while (true) {
+        try {
+            break
+        } finally {
+            note(l, "brk")
+        }
+    }
+    "done"
+}
+
+fn continue_through_finally(l: Log) -> int {
+    var n: int = 0
+    for (i in 0..3) {
+        try {
+            if (i == 1) {
+                continue
+            }
+            n = n + 10
+        } finally {
+            note(l, "c")
+        }
+    }
+    n
+}
+
+class Thrower {
+    var tag: string
+    constructor(tag: string) {
+        this.tag = tag
+    }
+    fn get() -> string {
+        throw this.tag
+    }
+}
+
+fn method_throws(t: Thrower) -> string {
+    try {
+        t.get()
+        "unreachable"
+    } catch (e) {
+        "method " + e
+    }
+}
+
+fn generic_throw<T>(v: T) -> T {
+    throw "gen"
+}
+
+fn calls_generic() -> string {
+    try {
+        generic_throw<int>(1)
+        "unreachable"
+    } catch (e) {
+        "generic " + e
+    }
+}
+
+// Reuse one payload shape across several throws: nothing may stay rooted or
+// leak state between handlers.
+fn repeated() -> string {
+    var out: string = ""
+    var i: int = 0
+    while (i < 3) {
+        try {
+            throw "p"
+        } catch (e) {
+            out = out + e
+        }
+        i = i + 1
+    }
+    out
+}
+
+// A `throw` as a function tail: control never reaches the end.
+fn throws_at_tail() -> string {
+    throw "tail"
+}
+
+fn tail_is_uncaught() -> string {
+    try {
+        throws_at_tail()
+        "unreachable"
+    } catch (e) {
+        "tail " + e
+    }
+}
+
+test fn a_local_throw_is_caught_in_the_same_frame() {
+    expect(id_fn<string>(guarded())).toBe("caught boom")
+}
+
+test fn a_throw_crosses_a_function_boundary() {
+    expect(id_fn<string>(escapes())).toBe("outer deep")
+}
+
+// A `catch` that swallows the throw leaves the caller on the normal path.
+fn swallowed() -> string {
+    try {
+        throws_here()
+        "unreachable"
+    } catch (e) {
+        "handled " + e
+    }
+}
+
+// `try` with BOTH a `catch` and a `finally`, where the `throw` is a direct
+// statement in the body rather than a call. The order must be catch, then
+// finally, and the `finally` must run exactly once.
+fn catch_then_finally(l: Log) -> string {
+    try {
+        note(l, "body")
+        throw "tf"
+    } catch (e) {
+        note(l, "catch")
+        "handled " + e
+    } finally {
+        note(l, "fin")
+    }
+}
+
+// The same shape, but the body throws from a *call* rather than a statement, so
+// the transfer goes through the pending flag instead of a direct branch.
+fn catch_then_finally_by_call(l: Log) -> string {
+    try {
+        note(l, "body")
+        throws_here()
+    } catch (e) {
+        note(l, "catch")
+        "handled " + e
+    } finally {
+        note(l, "fin")
+    }
+}
+
+// An inner `try`/`finally` inside a `try`/`catch`: the inner `finally` still owes
+// a run before the outer `catch`, exactly once.
+fn inner_finally_before_outer_catch(l: Log) -> string {
+    try {
+        try {
+            note(l, "body")
+            throw "io"
+        } finally {
+            note(l, "inner")
+        }
+    } catch (e) {
+        note(l, "catch")
+        "handled " + e
+    }
+}
+
+// A `try`/`finally` with no `catch`, nested in a `try`/`catch`. The inner `try`
+// pushes no handler of its own, so it must not consume the outer one: a later
+// `throw` in the same body still belongs to the outer `catch`.
+fn catchless_inner_keeps_outer_handler(l: Log) -> string {
+    try {
+        try {
+            note(l, "inner")
+        } finally {
+            note(l, "f1")
+        }
+        note(l, "after-inner")
+        throw "keep"
+    } catch (e) {
+        "handled " + e
+    }
+}
+
+// Three `finally` levels between the `throw` and the `catch`: all run, inner
+// first, each once.
+fn three_inner_finalys(l: Log) -> string {
+    try {
+        try {
+            try {
+                throw "deep"
+            } finally {
+                note(l, "f3")
+            }
+        } finally {
+            note(l, "f2")
+        }
+    } catch (e) {
+        note(l, "catch")
+        "handled " + e
+    } finally {
+        note(l, "f1")
+    }
+}
+
+test fn a_direct_throw_with_catch_and_finally_runs_catch_then_finally() {
+    let l = Log()
+    expect(id_fn<string>(catch_then_finally(l))).toBe("handled tf")
+    expect(l.s).toBe("body;catch;fin;")
+}
+
+test fn a_call_throw_with_catch_and_finally_runs_catch_then_finally() {
+    let l = Log()
+    expect(id_fn<string>(catch_then_finally_by_call(l))).toBe("handled deep")
+    expect(l.s).toBe("body;catch;fin;")
+}
+
+test fn an_inner_finally_runs_before_the_outer_catch() {
+    let l = Log()
+    expect(id_fn<string>(inner_finally_before_outer_catch(l))).toBe("handled io")
+    expect(l.s).toBe("body;inner;catch;")
+}
+
+test fn a_catchless_inner_try_does_not_consume_the_outer_handler() {
+    let l = Log()
+    expect(id_fn<string>(catchless_inner_keeps_outer_handler(l))).toBe("handled keep")
+    expect(l.s).toBe("inner;f1;after-inner;")
+}
+
+test fn every_inner_finally_runs_once_innermost_first() {
+    let l = Log()
+    expect(id_fn<string>(three_inner_finalys(l))).toBe("handled deep")
+    expect(l.s).toBe("f3;f2;catch;f1;")
+}
+
+test fn a_caught_throw_does_not_disturb_the_caller() {
+    expect(id_fn<string>(swallowed())).toBe("handled deep")
+}
+
+test fn finally_runs_while_a_throw_propagates() {
+    let l = Log()
+    // The `finally` ran on the way out, and the throw reached the caller.
+    expect(id_fn<string>(finally_only_caught(l))).toBe("got boom")
+    expect(l.s).toBe("fin;")
+}
+
+test fn finally_runs_on_an_early_return() {
+    let l = Log()
+    expect(id_fn<string>(ret_through_finally(l, 1))).toBe("pos")
+    expect(l.s).toBe("ret;")
+}
+
+test fn finally_runs_when_a_return_is_not_taken() {
+    let l = Log()
+    expect(id_fn<string>(ret_through_finally(l, 0))).toBe("nonpos")
+    expect(l.s).toBe("ret;")
+}
+
+test fn an_inner_finally_runs_before_an_outer_catch() {
+    let l = Log()
+    expect(id_fn<string>(nested_throw(l))).toBe("outer inner")
+    expect(l.s).toBe("innerfin;")
+}
+
+test fn nested_finalys_run_inner_first() {
+    let l = Log()
+    expect(id_fn<string>(two_finalys(l))).toBe("ret")
+    expect(l.s).toBe("f2;f1;")
+}
+
+test fn a_bare_catch_catches_without_binding() {
+    expect(id_fn<string>(bare_catch())).toBe("bare")
+}
+
+test fn a_throw_from_a_handler_replaces_the_payload() {
+    expect(id_fn<string>(handler_throws())).toBe("got second")
+}
+
+test fn break_runs_the_finally() {
+    let l = Log()
+    expect(id_fn<string>(break_through_finally(l))).toBe("done")
+    expect(l.s).toBe("brk;")
+}
+
+test fn continue_runs_the_finally() {
+    let l = Log()
+    expect(id_fn<int>(continue_through_finally(l))).toBe(20)
+    expect(l.s).toBe("c;c;c;")
+}
+
+test fn a_method_can_throw_and_be_caught() {
+    expect(id_fn<string>(method_throws(Thrower("mt")))).toBe("method mt")
+}
+
+test fn a_generic_function_can_throw() {
+    expect(id_fn<string>(calls_generic())).toBe("generic gen")
+}
+
+test fn repeated_throws_do_not_leak_payload_state() {
+    expect(id_fn<string>(repeated())).toBe("ppp")
+}
+
+test fn a_throw_at_a_function_tail_still_propagates() {
+    expect(id_fn<string>(tail_is_uncaught())).toBe("tail tail")
+}
+
+test fn a_try_without_a_throw_is_just_a_value() {
+    // No `throw` runs, so the body's tail value is the result.
+    expect(id_fn<string>(quiet_value())).toBe("plain")
+}
+
+// A `try` is a statement, not an expression, so a value only comes from it when
+// it is the tail of the enclosing block.
+fn quiet_value() -> string {
+    try {
+        "plain"
+    } catch (e) {
+        "caught"
+    }
+}
+
+// A function whose body diverges: it declares a value, but control never reaches
+// the end of the body to produce one.
+fn diverges() -> int {
+    throw "diverges"
+}
+
+// `return` inside the `try` rather than the try being the tail value, so the
+// handler has to produce the function's result itself.
+fn return_through_catch() -> int {
+    try {
+        return diverges()
+    } catch (e) {
+        return 7
+    }
+}
+
+// The diverging call is a bare statement, so the emitter must not expect a value
+// on the stack afterwards, and the next statement must not run.
+fn diverges_mid_body() -> int {
+    diverges()
+    return 99
+}
+
+// The diverging call is the last statement, so the declared `int` never exists.
+fn diverges_at_tail() -> int {
+    diverges()
+}
+
+test fn a_return_through_a_catch_supplies_the_result() {
+    expect(id_fn<int>(return_through_catch())).toBe(7)
+}
+
+test fn a_diverging_call_as_a_statement_skips_the_rest_of_the_body() {
+    expect(id_fn<int>(catches_mid_body())).toBe(-1)
+}
+
+test fn a_diverging_call_at_the_tail_yields_no_value() {
+    expect(id_fn<int>(catches_tail())).toBe(-2)
+}
+
+// `diverges_mid_body` declares `int` but the throw leaves before `99`, so the
+// only way out is the caller's handler.
+fn catches_mid_body() -> int {
+    try {
+        return diverges_mid_body()
+    } catch (e) {
+        return -1
+    }
+}
+
+fn catches_tail() -> int {
+    try {
+        return diverges_at_tail()
+    } catch (e) {
+        return -2
+    }
+}

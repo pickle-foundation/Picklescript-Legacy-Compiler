@@ -1,0 +1,13 @@
+// The simplest escape: a throw with no handler anywhere above it.
+
+module uncaught_basic
+
+fn boom() {
+    throw "uncaught boom"
+}
+
+fn main() {
+    println("before")
+    boom()
+    println("after")
+}

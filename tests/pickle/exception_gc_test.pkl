@@ -1,0 +1,104 @@
+// A pending payload is only reachable through the runtime's temp root: the
+// `throw` has already returned and the `catch` has not run yet, so there is no
+// local variable holding it. That window is exactly where an unrooted payload
+// would be collected, so these tests force a collection inside it.
+
+class Box {
+    var payload: string
+    constructor(p: string) {
+        this.payload = p
+    }
+}
+
+// Allocate hard and collect on every iteration. The filler values are the only
+// other things the collector has to trace, so a bad root shows up immediately.
+fn churn(n: int) -> string {
+    var keep: string = ""
+    var i: int = 0
+    while (i < n) {
+        let b = Box("filler " + keep)
+        keep = b.payload
+        gcCollect(true)
+        i = i + 1
+    }
+    keep
+}
+
+// Several frames of pending payload, each one allocating and collecting, before
+// anything catches it.
+fn deep(n: int) -> string {
+    if (n == 0) {
+        throw "payload survives"
+    }
+    churn(20)
+    deep(n - 1)
+}
+
+fn caught() -> string {
+    try {
+        deep(6)
+        "no throw"
+    } catch (e) {
+        // Collect again with the payload bound to `e`: the binding has to be
+        // traced too, not just the temp root the handler took it from.
+        churn(20)
+        "got " + e
+    }
+}
+
+test fn a_pending_payload_survives_many_collections() {
+    expect(caught()).toBe("got payload survives")
+}
+
+test fn a_bound_payload_is_still_rooted_after_the_handler_runs() {
+    expect(caught()).toBe("got payload survives")
+}
+
+// The payload is a heap string, not an interned constant, so a collection has
+// real work to do on it: the string was built by concatenation at run time.
+fn built_payload() -> string {
+    let a = "payload"
+    let b = " survives"
+    churn(10)
+    throw a + b
+}
+
+test fn a_run_time_built_payload_survives_a_collection() {
+    try {
+        built_payload()
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("payload survives")
+    }
+}
+
+// A payload that a `finally` touches while it is still in flight.
+fn touched_by_finally() -> string {
+    try {
+        throw "in flight"
+    } finally {
+        churn(10)
+    }
+    "unreachable"
+}
+
+test fn a_finally_can_run_while_the_payload_is_still_pending() {
+    try {
+        touched_by_finally()
+        expect("no throw").toBe("unreachable")
+    } catch (e) {
+        expect(e).toBe("in flight")
+    }
+}
+
+// A collection between a `throw` and a `catch` in the *same* frame, with the
+// handler's own code collecting before it reads the binder.
+test fn a_handler_collects_before_reading_its_binder() {
+    try {
+        churn(30)
+        throw "same frame"
+    } catch (e) {
+        churn(30)
+        expect(e).toBe("same frame")
+    }
+}

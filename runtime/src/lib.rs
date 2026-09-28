@@ -19,6 +19,8 @@
 
 extern crate alloc;
 
+use alloc::string::String;
+
 #[cfg(feature = "nostd")]
 #[macro_use]
 extern crate alloc as alloc_macros;
@@ -31,6 +33,7 @@ mod boxscalar;
 mod class;
 pub(crate) mod console;
 mod r#enum;
+mod exception;
 mod fs;
 mod gc;
 mod heap;
@@ -54,6 +57,15 @@ mod r#tuple;
 mod sync;
 #[cfg(not(feature = "nostd"))]
 pub mod world;
+
+/// A `throw` that reached the end of `main` with no handler left to take it.
+///
+/// The host calls this after the entry point returns: a propagated throw makes
+/// the entry function return early like any other exit, so nothing inside the
+/// program observes it. Returns the payload and clears the pending state.
+pub fn take_escaped_exception() -> Option<String> {
+    crate::exception::take_escaped()
+}
 
 /// Descriptor for the builtin types; ids 0..=9 are reserved and `tuple` keeps a
 /// (non-traced) placeholder so user classes, registered via
@@ -480,6 +492,12 @@ declare_abi! {
     pickle_panic_none_unwrap => crate::panic::pickle_panic_none_unwrap,
     pickle_test_capture_begin => crate::panic::pickle_test_capture_begin,
     pickle_test_capture_take => crate::panic::pickle_test_capture_take,
+
+      pickle_exc_throw => crate::exception::pickle_exc_throw,
+      pickle_exc_pending => crate::exception::pickle_exc_pending,
+      pickle_exc_take => crate::exception::pickle_exc_take,
+      pickle_exc_clear => crate::exception::pickle_exc_clear,
+      pickle_exc_uncaught => crate::exception::pickle_exc_uncaught,
 
     pickle_thread_count => crate::threads::pickle_thread_count,
     pickle_thread_current => crate::threads::pickle_thread_current,

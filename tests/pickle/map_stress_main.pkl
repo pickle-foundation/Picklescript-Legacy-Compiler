@@ -1,0 +1,102 @@
+fn emptyIntBoolMap() -> Map<int, bool> {
+    let m = {0: false}
+    m.remove(0)
+    m
+}
+
+fn emptyIntIntListMap() -> Map<int, List<int>> {
+    let m = {0: emptyInts()}
+    m.remove(0)
+    m
+}
+
+fn emptyInts() -> List<int> {
+    let l = [0]
+    l.remove(0)
+    l
+}
+
+fn emptyStrs() -> List<string> {
+    let l = [""]
+    l.remove(0)
+    l
+}
+
+fn bigChurn() {
+    var blobs = emptyStrs()
+    var gz = 0
+    while (gz < 300) {
+        blobs.push("blob-" + str(gz) + "-abcdefghijklmnopqrstuvwxyz0123456789")
+        gz = gz + 1
+    }
+    var l2 = emptyInts()
+    var g2 = 0
+    while (g2 < 5000) {
+        l2.push(g2)
+        g2 = g2 + 1
+    }
+    var m2 = emptyIntBoolMap()
+    var g3 = 0
+    while (g3 < 300) {
+        m2[g3] = g3 % 2 == 0
+        g3 = g3 + 1
+    }
+}
+
+fn verifyMap(m: Map<int, bool>, n: int, pred: (int) -> bool) -> bool {
+    var ok = len(m) == n
+    var i = 0
+    while (i < n) {
+        if (m[i] != pred(i)) {
+            ok = false
+        }
+        i = i + 1
+    }
+    var ksum = 0
+    var kcount = 0
+    for (k in m.keys()) {
+        kcount = kcount + 1
+        ksum = ksum + k
+    }
+    if (kcount != n) {
+        ok = false
+    }
+    if (ksum != n * (n - 1) / 2) {
+        ok = false
+    }
+    ok
+}
+
+fn runCompile() -> string {
+    var directThrow = emptyIntBoolMap()
+    var i = 0
+    while (i < 200) {
+        directThrow[i] = i % 3 == 0
+        i = i + 1
+    }
+    bigChurn()
+    var a = verifyMap(directThrow, 200, fn (x: int) -> bool { x % 3 == 0 })
+    bigChurn()
+    var b = verifyMap(directThrow, 200, fn (x: int) -> bool { x % 3 == 0 })
+    if (a && b) {
+        return "ST"
+    }
+    var detail = "a=" + str(a) + " b=" + str(b) + " len=" + str(len(directThrow))
+    for (k in directThrow.keys()) {
+        detail = detail + "," + str(k)
+        if (len(detail) > 300) {
+            break
+        }
+    }
+    "VAR " + detail
+}
+
+fn main() {
+    var out = ""
+    var r = 0
+    while (r < 3) {
+        out = out + runCompile() + ";"
+        r = r + 1
+    }
+    print(out)
+}

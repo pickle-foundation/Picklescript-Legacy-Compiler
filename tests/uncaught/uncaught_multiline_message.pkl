@@ -1,0 +1,15 @@
+// A payload that already ends in a line break, and one that contains one. The
+// report is written verbatim with a single trailing newline appended, so neither
+// is trimmed or re-wrapped. This is the fixture that would catch a formatter
+// "helpfully" escaping or normalising the payload.
+
+module uncaught_multiline_message
+
+fn boom() {
+    throw "first line\nsecond line"
+}
+
+fn main() {
+    println("before")
+    boom()
+}

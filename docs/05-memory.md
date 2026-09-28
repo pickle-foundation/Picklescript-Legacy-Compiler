@@ -142,6 +142,42 @@ with the following properties:
 - The GC is **incremental-izable** later; v1 reserves a stop-the-world
   pause for simplicity and predictability.
 
+### Diagnostics env vars
+
+All are debug gates in the runtime (each documented in the source at its
+gate); they are off by default.
+
+- `PKL_NO_AUTO_GC=1` — disable the collector's automatic collection so the
+  allocation path stops running `gcCollect`. Used to isolate GC-triggered
+  bugs from allocator ones.
+- `PKL_GC_TRACE=1` — verbose sweep / new-object tracing (the allocator prints
+  `NEW`/`SWEEP` lines) inside the heap. Uses Win32 `GetEnvironmentVariable`.
+- `PKL_PANIC_BT=1` — print a Rust `Backtrace` from the panic hook before
+  exiting, so an abort inside the runtime names its own call chain.
+- `PKL_ICED_DEBUG=1` / `PKL_ICED_SYMS=1` — CLI debugging of the JIT symbol
+  table (iced codegen/dump hooks).
+
+The bulk of the exploratory gates (`PKL_PIN_MAPS`, `PKL_ALL_KLED`,
+`PKL_CLS_DUMP`, `PKL_SWEPT`, `PKL_LIVE_EDGES`, `PKL_CENSUS`) were removed once
+their instrumentation resolved: they were chase-the-corruption probes for a
+**latent use-after-free** in the selfhost build. The finding and the
+v1 hardening shipped in their place are:
+
+- The collector now **harden-copies** `deep_hash`'s user-class walk: a key
+  whose block header reports `FREE_SENTINEL` or an implausible size is hashed
+  by identity instead of walking raw memory (which previously dereferenced a
+  misaligned `0x3d`). The stale key then makes lookups *miss* rather than
+  crash the map table.
+- The JIT spills a `LoadSlot` into the shadow cell before a slot is
+  overwritten by a later `StoreSlot`, so a loaded managed value is never
+  left living only in a register across an allocating call.
+
+Both are root-cause fixes for the class: an object freed at a collection
+while still referenced only through an untraced raw value table (the
+compiler's IR constants/regs buffers), exactly the profile of the armed
+forced-collect repro. The natural (auto-GC) path never reproduces it and the
+armed variant is no longer part of the build.
+
 ## Safe vs unsafe
 
 ```

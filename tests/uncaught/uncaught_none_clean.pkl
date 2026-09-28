@@ -1,0 +1,29 @@
+// The complement of the escape fixtures: a program that throws nothing must exit
+// 0 and write nothing to stderr, even though the backend now puts a check on
+// every path out of `pickle_main`. If the check ever started reporting
+// speculatively, or the entry point reported twice, this is what would notice.
+
+module uncaught_none_clean
+
+fn helper(n: int) -> int {
+    try {
+        return n + 1
+    } catch (e) {
+        return 0
+    } finally {
+        println("finally")
+    }
+}
+
+fn caught() -> string {
+    try {
+        throw "handled"
+    } catch (e) {
+        return "caught " + e
+    }
+}
+
+fn main() {
+    println(helper(41))
+    println(caught())
+}

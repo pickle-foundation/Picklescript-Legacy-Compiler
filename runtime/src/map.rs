@@ -126,6 +126,15 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
         }
         path.push(obj);
         let class_id = (*obj).class_id;
+        // `FREE_SENTINEL` blocks can reach `deep_hash` only through a stale
+        // key (a live value freed by a collection then reused as a map key,
+        // observed in the selfhost build). Hash by identity instead of
+        // trampling a free-list block; lookups then miss rather than corrupt.
+        if class_id == crate::heap::FREE_SENTINEL {
+            let eh =
+                0xcbf29ce484222325u64 ^ (class_id as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ (obj as u64);
+            return (eh.wrapping_mul(0x100000001b3), false);
+        }
         let mut h: u64 = 0xcbf29ce484222325;
         let mut cyclic = false;
         let mix = |h: &mut u64, x: u64| {
@@ -211,7 +220,18 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
                 // User class/struct/interface instance: class identity + slots.
                 mix(&mut h, class_id as u64);
                 let size = (*obj).size as usize;
-                let slots = size.saturating_sub(crate::object::pickle_header_size()) / 8;
+                let header = crate::object::pickle_header_size() as usize;
+                // A block header reporting an absurd size is a stale/reused key
+                // (freed at a collection, reallocated since). Hashing its raw
+                // slots would walk arbitrary memory (previously a misaligned
+                // deref at 0x3d); hash by identity instead so lookups miss.
+                if size < header || size >= (1 << 26) {
+                    let eh = 0xcbf29ce484222325u64
+                        ^ (class_id as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                        ^ (obj as u64);
+                    return (eh.wrapping_mul(0x100000001b3), false);
+                }
+                let slots = size.saturating_sub(crate::object::pickle_header_size() as usize) / 8;
                 let mut i = 0usize;
                 while i < slots {
                     let (sh, sc) = deep_hash((*obj).slot(i), path);

@@ -1,0 +1,33 @@
+// A deep chain, so the escape has to travel through several frames and unwind
+// several `finally` blocks before anything is reported. The report must be
+// emitted once, after the last of them, not once per frame.
+
+module uncaught_deep_chain
+
+fn level3() {
+    throw "deep"
+}
+
+fn level2() {
+    try {
+        level3()
+    } finally {
+        println("f2")
+    }
+}
+
+fn level1() {
+    try {
+        level2()
+    } finally {
+        println("f1")
+    }
+}
+
+fn main() {
+    try {
+        level1()
+    } finally {
+        println("f0")
+    }
+}

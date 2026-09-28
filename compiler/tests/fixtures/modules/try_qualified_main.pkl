@@ -1,0 +1,87 @@
+// A qualified call is a name the loader has to resolve, and the rewriter that
+// does it used to skip `try` and `throw` entirely. Both fell through
+// `rewrite_stmt`'s catch-all arm, so a qualified call inside a `try` body, a
+// `catch` handler or a `finally` block kept its module prefix and failed to
+// resolve with "use of undeclared name".
+//
+// Bare imported names are not affected, which is why a fixture written with
+// `import { add } from math.ops` would pass either way. `import math.ops` and
+// then calling `math.ops.add` is what reaches the rewriter.
+
+import math.ops
+
+fn in_try_body() -> int {
+    try {
+        return math.ops.add(1, 2)
+    } catch (e) {
+        return 0
+    }
+}
+
+fn in_catch_handler() -> int {
+    try {
+        throw "boom"
+    } catch (e) {
+        return math.ops.add(1, 2)
+    }
+}
+
+fn in_finally() -> int {
+    try {
+        return math.ops.add(1, 2)
+    } finally {
+        math.ops.double(3)
+    }
+}
+
+// A qualified call in the operand position of a `throw`. This is a different
+// path from the one above: the operand is an expression, so it is rewritten by
+// the `Stmt::Throw` arm rather than by the `Stmt::Try` arm that walks bodies.
+fn as_a_throw_operand() -> int {
+    try {
+        throw math.ops.message()
+    } catch (e) {
+        if (e == "from math.ops") { return 1 }
+        return 0
+    }
+}
+
+// The same again, but with the throw nested inside a condition in the body, so
+// it is reached through a nested statement as well as the direct one.
+fn throw_with_a_qualified_operand() -> int {
+    try {
+        if (math.ops.helper() == 1) {
+            throw math.ops.message()
+        }
+        return 0
+    } catch (e) {
+        if (e == "from math.ops") { return 1 }
+        return 0
+    }
+}
+
+fn nested_in_a_condition() -> int {
+    try {
+        if (math.ops.helper() == 1) {
+            return math.ops.double(4)
+        }
+    } catch (e) {
+        return 0
+    }
+    return 0
+}
+
+fn main() {
+    let a = in_try_body()
+    let b = in_catch_handler()
+    let c = in_finally()
+    let d = as_a_throw_operand()
+    let e = throw_with_a_qualified_operand()
+    let f = nested_in_a_condition()
+    expect(a).toBe(3)
+    expect(b).toBe(3)
+    expect(c).toBe(3)
+    expect(d).toBe(1)
+    expect(e).toBe(1)
+    expect(f).toBe(8)
+}

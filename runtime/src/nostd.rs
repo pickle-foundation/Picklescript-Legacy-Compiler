@@ -305,6 +305,32 @@ pub fn console_write(buf: &[u8]) -> bool {
     }
 }
 
+/// Writes bytes to the process's standard error handle. `false` when the write
+/// call fails. Never panics.
+///
+/// Not the general-purpose stderr for a freestanding build: the [`eprintln!`]
+/// shim below sends to stdout on purpose, because a program with no separate
+/// error channel still has to have its diagnostics *appear* somewhere and stdout
+/// is the handle a console will show. This is for the one case where the
+/// channel is part of the contract rather than the delivery -- an uncaught
+/// `throw` report, which a host reads from stderr to find out that a run failed.
+/// Redirecting stdout and discarding it must not be able to hide a failure.
+///
+/// [`eprintln!`]: macro@crate
+pub fn console_error_write(buf: &[u8]) -> bool {
+    let h = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    if h.is_null() || core::ptr::eq(h, core::ptr::null_mut::<c_void>()) {
+        return false;
+    }
+    if !buf.is_empty() {
+        let mut written: u32 = 0;
+        let ok = unsafe { WriteFile(h, buf.as_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut written, core::ptr::null_mut()) };
+        ok != 0
+    } else {
+        true
+    }
+}
+
 unsafe impl GlobalAlloc for PfHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         HeapAlloc(GetProcessHeap(), 8, layout.size()) as *mut u8
