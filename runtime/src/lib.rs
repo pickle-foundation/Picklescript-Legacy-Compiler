@@ -243,6 +243,13 @@ pub extern "C" fn pickle_runtime_init() -> u32 {
             g.register_class(*d);
         }
     }
+    // The freestanding Windows exe has no CRT, so the real process command
+    // line is captured here instead of via `pickle_args_set`. Runs before the
+    // compiled `pickle_main`, so `args()` sees the process vector. The `entry`
+    // build and the JIT driver already forward `argc/argv` through
+    // `pickle_args_set`, so no capture is needed (or possible) off-Windows.
+    #[cfg(all(feature = "nostd", target_os = "windows"))]
+    os::capture_from_windows();
     0
 }
 

@@ -345,4 +345,52 @@ if (-not (Test-Path -LiteralPath $pklcBuild)) {
     }
 }
 
+# ---- GATE 12b: ported run — compile -> COFF -> PE-link -> spawn, all in the port ----
+# The ported run driver (cli-selfhost/run.pkl, AOT-built the same way) goes one step
+# further than the build driver: it compiles the source, links the PE, then spawns the
+# exe and propagates its exit code — with zero Rust compiler or irx-run in the loop.
+# It also exercises real argv forwarding: the freestanding exe reads the process
+# command line via GetCommandLineW/CommandLineToArgvW (routed through shell32 by the
+# ported PE linker), so os_args_main runs WITH arguments here, unlike the build block.
+$pklcRun = "tools\diff\port\pklc_run.exe"
+& $cli build "cli-selfhost\run.pkl" -o $pklcRun 2>&1 | Out-Null
+if (-not (Test-Path -LiteralPath $pklcRun)) {
+    Write-Output "GATE12b PORTED RUN: DRIVER BUILD FAILED"
+} else {
+    $combinedCand = @(
+        "$env:TEMP\opencode\rarc\combined.lib"
+        "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $combinedCand) {
+        Write-Output "GATE12b PORTED RUN: COMBINED LIB MISSING (rebuild via tools\build_combined_lib.ps1)"
+    } else {
+        $g12bdir = "tools\diff\g12run"
+        New-Item -ItemType Directory -Path $g12bdir -Force | Out-Null
+        $g12bok = 0; $g12bfail = 0
+        foreach ($m in $mains) {
+            $target = "tests\pickle\$($m.BaseName).pkl"
+            # The run driver rebuilds and respawns the exe itself.
+            cmd /c "`"$cli`" run `"$target`" > `"$g12bdir\rust.txt`" 2>nul"
+            $rc = $LASTEXITCODE
+            cmd /c "`"$pklcRun`" `"$target`" `"$combinedCand`" > `"$g12bdir\port.txt`" 2>nul"
+            $ic = $LASTEXITCODE
+            $r = [System.IO.File]::ReadAllText((Resolve-Path "$g12bdir\rust.txt"))
+            $p = [System.IO.File]::ReadAllText((Resolve-Path "$g12bdir\port.txt"))
+            if ($rc -eq $ic -and $r -eq $p) { $g12bok++ }
+            else { $g12bfail++; Write-Output "GATE12b $($m.BaseName): exit=$rc/$ic stdout_match=$($r -eq $p)" }
+        }
+        # os_args_main with real arguments: the ported exe must see "2/foo/bar" and
+        # exit 7 on a1=="exit", byte-identical to the Rust JIT oracle.
+        cmd /c "`"$pklcRun`" `"tests\pickle\os_args_main.pkl`" `"$combinedCand`" exit exit > `"$g12bdir\port_args.txt`" 2>nul"
+        $pa = $LASTEXITCODE
+        cmd /c "`"$cli`" run `"tests\pickle\os_args_main.pkl`" -- exit exit > `"$g12bdir\rust_args.txt`" 2>nul"
+        $ra = $LASTEXITCODE
+        $rp = [System.IO.File]::ReadAllText((Resolve-Path "$g12bdir\rust_args.txt"))
+        $pp = [System.IO.File]::ReadAllText((Resolve-Path "$g12bdir\port_args.txt"))
+        if ($ra -eq $pa -and $rp -eq $pp) { $g12bok++ }
+        else { $g12bfail++; Write-Output "GATE12b os_args_main(-- exit exit): exit=$ra/$pa stdout_match=$($rp -eq $pp)" }
+        Write-Output "GATE12b PORTED RUN (compile->spawn stdout+exit + argv, $($mains.Count) mains, +1 args case): PASS=$g12bok FAIL=$g12bfail"
+    }
+}
+
 Write-Output "===== BATTERY COMPLETE ====="

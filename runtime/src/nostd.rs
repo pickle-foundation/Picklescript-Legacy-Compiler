@@ -29,6 +29,10 @@ extern "system" {
     ) -> i32;
     pub fn ExitProcess(code: u32) -> !;
 
+    // ---- process command line, used by the `nostd` `os` args capture
+    pub fn GetCommandLineW() -> *mut u16;
+    pub fn LocalFree(mem: *mut c_void) -> *mut c_void;
+
     // ---- timing, used by the `nostd` `thread_sleep_ms` backing
     pub fn Sleep(ms: u32);
 
@@ -57,6 +61,13 @@ extern "system" {
     pub fn FindFirstFileW(pattern: *const u16, data: *mut Win32FindDataW) -> WinHandle;
     pub fn FindNextFileW(find: WinHandle, data: *mut Win32FindDataW) -> i32;
     pub fn FindClose(find: WinHandle) -> i32;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    /// Parse the process command line into a `(argc, argv)` pair the CRT would
+    /// have produced. Lives in `shell32.dll`, so it gets its own link group.
+    pub fn CommandLineToArgvW(cmd: *const u16, argc: *mut i32) -> *mut *mut u16;
 }
 
 /// `FILETIME`. Modelled as two `u32`s rather than a `u64` so the struct keeps

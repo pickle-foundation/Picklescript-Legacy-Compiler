@@ -60,6 +60,53 @@ pub(crate) fn reset() {
     PROGRAM_ARGS.lock().unwrap().clear();
 }
 
+/// `nostd` build on Windows only: capture the real process command line into
+/// [`PROGRAM_ARGS`]. The freestanding Windows exe has no CRT to forward
+/// `_argc/_argv` through `pickle_args_set`, so the boot stub asks the OS
+/// directly: get the wide command line, split it the way the CRT would, and
+/// drop `argv[0]` (the program name) so `args()` stays consistent with the
+/// `entry`-build contract.
+///
+/// Everywhere else the vector arrives the usual way: the `entry` build's
+/// `main(argc, argv)` (and the JIT driver's trailing `--` forwarding) call
+/// `pickle_args_set`, so no OS query is needed on POSIX/macOS or their wider
+/// CLI paths.
+///
+/// Safe to call even with zero arguments; `PROGRAM_ARGS` is cleared first so a
+/// repeated init cannot leak a previous program's vector.
+#[cfg(all(feature = "nostd", target_os = "windows"))]
+pub(crate) fn capture_from_windows() {
+    unsafe {
+        let cmd = crate::nostd::GetCommandLineW();
+        if cmd.is_null() {
+            return;
+        }
+        let mut argc: i32 = 0;
+        let argv = crate::nostd::CommandLineToArgvW(cmd, &mut argc);
+        if argv.is_null() {
+            return;
+        }
+        let mut stored = PROGRAM_ARGS.lock().unwrap();
+        stored.clear();
+        if argc > 1 {
+            for i in 1..argc {
+                let p = *argv.add(i as usize);
+                if p.is_null() {
+                    continue;
+                }
+                let mut len = 0usize;
+                while *p.add(len) != 0 {
+                    len += 1;
+                }
+                let units = core::slice::from_raw_parts(p, len);
+                let s = alloc::string::String::from_utf16_lossy(units);
+                stored.push(s.into_bytes());
+            }
+        }
+        crate::nostd::LocalFree(argv as *mut core::ffi::c_void);
+    }
+}
+
 /// `args() -> List<string>`: the program's command-line arguments, excluding
 /// the program name. Returns a fresh list on every call.
 #[no_mangle]
