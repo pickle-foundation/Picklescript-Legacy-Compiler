@@ -1,0 +1,127 @@
+// Async methods, async lambdas, and generic async fns through the JIT.
+//
+// `async fn` methods are declared with the `async` modifier and dispatched
+// through the same vtable machinery as ordinary methods: the table entry is a
+// wrapper that captures the receiver (and any arguments) into a future
+// closure, and `await` drives it. Static async methods work the same way
+// without a receiver.
+
+class Thermometer {
+    let base: int
+
+    constructor(mult: int) {
+        this.base = mult
+    }
+
+    async fn read_offset() -> int {
+        this.base * 10
+    }
+
+    async fn scale_by(k: int) -> int {
+        this.base * k
+    }
+
+    static async fn calibrate(n: int) -> int {
+        n + 5
+    }
+}
+
+class Ramp {
+    let step: int
+
+    constructor(step: int) {
+        this.step = step
+    }
+
+    async fn tick(acc: int) -> int {
+        acc + this.step
+    }
+
+    async fn current() -> int {
+        this.step
+    }
+}
+
+class Stepper extends Ramp {
+    override async fn current() -> int {
+        this.step * 100
+    }
+
+    override async fn tick(acc: int) -> int {
+        acc + this.step + 1000
+    }
+}
+
+class Vault<T> {
+    let item: T
+
+    constructor(item: T) {
+        this.item = item
+    }
+
+    async fn pick() -> T {
+        this.item
+    }
+}
+
+async fn passthru<T>(v: T) -> T {
+    v
+}
+
+async fn dot(a: int, b: int) -> int {
+    a * b
+}
+
+fn main() {
+    let t = Thermometer(3)
+
+    // instance async method: calling builds a future, awaiting runs the
+    // hidden body on the captured receiver
+    let off = t.read_offset()
+    expect(await off).toBe(30)
+
+    expect(await t.scale_by(4)).toBe(12)
+
+    // static async method
+    expect(await Thermometer.calibrate(2)).toBe(7)
+
+    // async override dispatch: `current` is virtual
+    let r = Ramp(2)
+    let s = Stepper(2)
+    expect(await r.current()).toBe(2)
+    expect(await s.current()).toBe(200)
+    expect(await s.tick(5)).toBe(1007)
+
+    // async method in a generic class, instantiated with a substituted type
+    let v = Vault<string>("pickles")
+    expect(await v.pick()).toBe("pickles")
+
+    // generic async fn: awaits return the substituted type
+    expect(await passthru<int>(42)).toBe(42)
+    expect(await passthru<string>("ok")).toBe("ok")
+
+    // async lambda: calling it builds the future without running the body
+    let lazy = async fn(x: int) -> int { x * 2 }
+    expect(await lazy(21)).toBe(42)
+
+    let outer = 5
+    let lazy2 = async fn(y: int) -> int { outer + y }
+    expect(await lazy2(100)).toBe(105)
+
+    // zero-argument async lambda
+    let z = 9
+    let k = async fn() -> int { z * z }
+    expect(await k()).toBe(81)
+
+    // async lambda returning a string
+    let greet = async fn() -> string { "hi" }
+    expect(await greet()).toBe("hi")
+
+    // arrow-body async lambda
+    let prod = async fn(a: int, b: int) -> int => a * b
+    expect(await prod(6, 7)).toBe(42)
+
+    // an async lambda can await a future from a plain async fn inside it
+    let wrap = async fn(a: int, b: int) -> int { await dot(a, b) + 1 }
+    expect(await wrap(2, 3)).toBe(7)
+}

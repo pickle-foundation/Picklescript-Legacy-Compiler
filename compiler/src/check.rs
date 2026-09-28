@@ -2278,7 +2278,7 @@ impl<'a> Checker<'a> {
                 if let Some(m) = self.find_method(&cn, name) {
                     return Ty::Fn(
                         m.params.iter().map(|p| p.ty.clone()).collect(),
-                        Box::new(m.ret.clone()),
+                        Box::new(self.method_ret_ty(&m, &HashMap::new())),
                     );
                 }
             }
@@ -2316,10 +2316,28 @@ impl<'a> Checker<'a> {
         let Some(f) = fns.first() else {
             return Ty::Unknown;
         };
+        // An `async fn` used as a value is a function returning a future
+        // (`() -> R`), not the result `R` itself.
+        let ret = if f.is_async && f.generics.is_empty() {
+            Ty::Fn(Vec::new(), Box::new(f.ret.clone()))
+        } else {
+            f.ret.clone()
+        };
         Ty::Fn(
             f.params.iter().map(|p| p.ty.clone()).collect(),
-            Box::new(f.ret.clone()),
+            Box::new(ret),
         )
+    }
+
+    /// Type of a method call. For an `async` method this is the future
+    /// (`() -> R`), which `await` then drives.
+    fn method_ret_ty(&self, m: &CallableInfo, map: &HashMap<String, Ty>) -> Ty {
+        let ret = self.subst(&m.ret, map);
+        if m.is_async {
+            Ty::Fn(Vec::new(), Box::new(ret))
+        } else {
+            ret
+        }
     }
 
     fn super_ty(&mut self, e: &Expr) -> Ty {
@@ -2645,7 +2663,7 @@ impl<'a> Checker<'a> {
                     if let Some(m) = self.find_method(&cn, cname) {
                         let params: Vec<Ty> = m.params.iter().map(|p| p.ty.clone()).collect();
                         self.check_args(e, &params, args);
-                        return m.ret.clone();
+                        return self.method_ret_ty(&m, &HashMap::new());
                     }
                 }
                 if let Some(c) = self.class_table(cname) {
@@ -3086,7 +3104,15 @@ impl<'a> Checker<'a> {
             .zip(args.iter().cloned())
             .collect();
         let params: Vec<Ty> = f.params.iter().map(|p| self.subst(&p.ty, &map)).collect();
-        Ty::Fn(params, Box::new(self.subst(&f.ret, &map)))
+        let ret = self.subst(&f.ret, &map);
+        // An `async fn` called with explicit type arguments returns a future
+        // (`() -> R`), exactly like the inferred-generic path.
+        let ret = if f.is_async {
+            Ty::Fn(Vec::new(), Box::new(ret))
+        } else {
+            ret
+        };
+        Ty::Fn(params, Box::new(ret))
     }
 
     fn check_args(&mut self, e: &Expr, params: &[Ty], args: &[CallArg]) {
@@ -3209,7 +3235,14 @@ impl<'a> Checker<'a> {
         }
         let params: Vec<Ty> = f.params.iter().map(|p| self.subst(&p.ty, &map)).collect();
         self.check_args_typed(e, &params, args, &got);
-        Some(self.subst(&f.ret, &map))
+        let ret = self.subst(&f.ret, &map);
+        // Calling an inferred `async fn` returns the future, not the body's
+        // result: the future is a captured zero-argument function `() -> R`.
+        Some(if f.is_async {
+            Ty::Fn(Vec::new(), Box::new(ret))
+        } else {
+            ret
+        })
     }
 
     /// Argument checking against a signature whose expressions have already
@@ -3455,7 +3488,7 @@ impl<'a> Checker<'a> {
                 if let Some(m) = self.find_method(&gname, name) {
                     return Ty::Fn(
                         m.params.iter().map(|p| p.ty.clone()).collect(),
-                        Box::new(m.ret.clone()),
+                        Box::new(self.method_ret_ty(&m, &HashMap::new())),
                     );
                 }
                 if let Some(nc) = self.find_named_ctor(&gname, name) {
@@ -3666,7 +3699,7 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|p| self.subst(&p.ty, &args_map))
                     .collect(),
-                Box::new(self.subst(&m.ret, &args_map)),
+                Box::new(self.method_ret_ty(&m, &args_map)),
             );
         }
         self.err_note(
@@ -3700,7 +3733,7 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(|p| self.subst(&p.ty, &args_map))
                     .collect(),
-                Box::new(self.subst(&m.ret, &args_map)),
+                Box::new(self.method_ret_ty(&m, &args_map)),
             )
         } else {
             self.err(e.span, format!("no member `{name}` on `{class}`"));

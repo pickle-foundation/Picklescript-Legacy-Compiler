@@ -236,6 +236,29 @@ Lambda {
     /// lambda ABI: slot 0 is the closure object whose slots 1..N hold the async
     /// fn's parameters, read as named captures inside the body.
     AsyncBody { f: &'a FnDecl, pty: Vec<Ty>, ret: Ty },
+    /// A visible `async` method: the method itself, with its real
+    /// (receiver-first for instance methods) ABI, building a closure over
+    /// `this` (if any) plus the call parameters — the future — and returning
+    /// it without running the body. The body runs only when `await` drives the
+    /// future's 0-arg call.
+    AsyncMethod {
+        table: ClassTable,
+        md: &'a MethodDecl,
+        hidden: FuncId,
+        is_static: bool,
+        this_ty: Option<Ty>,
+    },
+    /// The hidden 0-arg future body of an `async` method. Its closure slots hold
+    /// `this` (instance methods) then the parameters; `this` is re-declared as a
+    /// named capture so the body's receiver-fallback (`self.owner`) applies,
+    /// exactly as in a regular method body.
+    AsyncMethodBody {
+        table: ClassTable,
+        md: &'a MethodDecl,
+        pty: Vec<Ty>,
+        ret: Ty,
+        is_static: bool,
+    },
     /// The constructor of a class/struct: synthesized from the fields unless an
     /// explicit `constructor(...)` body is present.
     Ctor {
@@ -1744,11 +1767,100 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
             is_test,
             tags: self.item_tags(attrs),
         });
-        self.fid_list.push(wfid);
+self.fid_list.push(wfid);
         self.fsource.insert(wfid, FnSource::AsyncFn { f, hidden });
         self.finfo.insert(wfid, info.clone());
         self.src_param_tys
             .insert(wfid, info.params.iter().map(|p| p.ty.clone()).collect());
+    }
+
+    /// Register an async method as two lowerable functions, mirroring
+    /// `register_async_fn` for methods:
+    ///
+    ///   * the hidden future body, whose closure slots hold the receiver
+    ///     (`this`, instance methods) followed by the parameters; and
+    ///   * the visible wrapper — the method itself — with the method's real
+    ///     ABI (receiver-first for instance methods), allocating that closure
+    ///     and returning it without running the body. `method_ids` maps the
+    ///     method name to the wrapper, so instance/static calls and (via
+    ///     `method_ids` inheritance + `build_virtual_dispatch`) overrides
+    ///     dispatch exactly like regular async methods do.
+    ///
+    /// `pty` for the hidden body is [this_ty] + parameter types (instance) or
+    /// parameter types alone (static); `suffix` disambiguates generic-class
+    /// instantiation symbols, and `subst_info` carries the instantiated
+    /// signature when the receiver class is a generic instantiation.
+    fn register_async_method(
+        &mut self,
+        class: &str,
+        table: &ClassTable,
+        md: &'a MethodDecl,
+        info: &CallableInfo,
+        cid: u32,
+        args: &[Ty],
+        is_struct: bool,
+        suffix: &str,
+        subst: Option<HashMap<String, Ty>>,
+        generics: Vec<String>,
+    ) {
+        let this_ty = if info.is_static {
+            None
+        } else if is_struct {
+            Some(Ty::Struct(class.to_string(), args.to_vec()))
+        } else {
+            Some(Ty::Class(class.to_string(), args.to_vec()))
+        };
+        let pty: Vec<Ty> = this_ty
+            .clone()
+            .into_iter()
+            .chain(info.params.iter().map(|p| p.ty.clone()))
+            .collect();
+        let stem = if info.is_static {
+            format!("pkl_{class}_sm_{}", md.name)
+        } else {
+            format!("pkl_{class}_{}", md.name)
+        };
+        let hidden = self.push_class_func(
+            &format!("{}.{}.future", class, md.name),
+            &format!("{stem}{suffix}__future"),
+            FnSource::AsyncMethodBody {
+                table: table.clone(),
+                md,
+                pty,
+                ret: info.ret.clone(),
+                is_static: info.is_static,
+            },
+        );
+        let mut hidden_info = info.clone();
+        hidden_info.params = Vec::new();
+        self.finfo.insert(hidden, hidden_info);
+        self.fid_owner.insert(hidden, cid as i64);
+        if let Some(s) = subst.clone() {
+            self.instanton_subst.insert(hidden, s.clone());
+            self.fid_generics.insert(hidden, generics.clone());
+        }
+
+        let wfid = self.push_class_func(
+            &format!("{}.{}", class, md.name),
+            &format!("{stem}{suffix}"),
+            FnSource::AsyncMethod {
+                table: table.clone(),
+                md,
+                hidden,
+                is_static: info.is_static,
+                this_ty: this_ty.clone(),
+            },
+        );
+        self.finfo.insert(wfid, info.clone());
+        self.src_param_tys
+            .insert(wfid, info.params.iter().map(|p| p.ty.clone()).collect());
+        self.method_ids
+            .insert((cid, md.name.clone()), (wfid, info.is_static));
+        self.fid_owner.insert(wfid, cid as i64);
+        if let Some(s) = subst {
+            self.instanton_subst.insert(wfid, s);
+            self.fid_generics.insert(wfid, generics);
+        }
     }
 
     // ---- class/struct registration ---------------------------------------
@@ -2628,13 +2740,17 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
             ClassMember::Method(md) => Some(md),
             _ => None,
         }) {
-            if md.is_async || md.body.is_none() || !md.generics.is_empty() {
+if md.body.is_none() || !md.generics.is_empty() {
                 continue;
             }
             let Some(info) = table.methods.iter().find(|m| m.name == md.name) else {
                 continue;
             };
             if info.params.iter().any(|p| p.has_default || p.rest) {
+                continue;
+            }
+            if md.is_async {
+                self.register_async_method(name, &table, md, &info, cid, &[], false, "", None, Vec::new());
                 continue;
             }
             let symbol = if info.is_static {
@@ -2970,17 +3086,46 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
         self.fid_owner.insert(ctor_fid, cid as i64);
         self.fid_generics.insert(ctor_fid, table.generics.clone());
 
-        for md in members.iter().filter_map(|m| match m {
+for md in members.iter().filter_map(|m| match m {
             ClassMember::Method(md) => Some(md),
             _ => None,
         }) {
-            if md.is_async || md.is_override || md.body.is_none() || !md.generics.is_empty() {
+            if md.is_override || md.body.is_none() || !md.generics.is_empty() {
                 continue;
             }
             let Some(info) = stable.methods.iter().find(|m| m.name == md.name).cloned() else {
                 continue;
             };
             if info.params.iter().any(|p| p.has_default || p.rest) {
+                continue;
+            }
+            if md.is_async {
+                let sub_info = CallableInfo {
+                    params: info
+                        .params
+                        .iter()
+                        .map(|p| ParamInfo {
+                            ty: p.ty.subst(&map),
+                            ..p.clone()
+                        })
+                        .collect(),
+                    ret: info.ret.subst(&map),
+                    ..info.clone()
+                };
+                let is_struct =
+                    matches!(self.resolved.types.get(name), Some(TypeTableEntry::Struct(_)));
+                self.register_async_method(
+                    &display,
+                    &stable,
+                    md,
+                    &sub_info,
+                    cid,
+                    args,
+                    is_struct,
+                    &format!("_{suffix}"),
+                    Some(map.clone()),
+                    table.generics.clone(),
+                );
                 continue;
             }
             let symbol = if info.is_static {
@@ -3146,6 +3291,39 @@ FnSource::Lambda {
             }
             FnSource::AsyncBody { f, pty, ret } => {
                 self.build_async_body(f, &pty, &ret, fid);
+            }
+            FnSource::AsyncMethod {
+                table,
+                md,
+                hidden,
+                is_static,
+                this_ty,
+            } => {
+                let Some(info) = self.finfo.get(&fid).cloned() else {
+                    return;
+                };
+                self.owner = self.fid_owner.get(&fid).copied().or_else(|| {
+                    self.class_by_name
+                        .get(&table.name)
+                        .copied()
+                        .map(|x| x as i64)
+                });
+                self.build_async_method_wrapper(md, &info, hidden, is_static, this_ty);
+            }
+            FnSource::AsyncMethodBody {
+                table,
+                md,
+                pty,
+                ret,
+                is_static,
+            } => {
+                self.owner = self.fid_owner.get(&fid).copied().or_else(|| {
+                    self.class_by_name
+                        .get(&table.name)
+                        .copied()
+                        .map(|x| x as i64)
+                });
+                self.build_async_method_body(md, &pty, &ret, is_static);
             }
             FnSource::Trampoline {
                 span,
@@ -3407,6 +3585,103 @@ let _ = self.emit_body(&Some(body.clone()));
             self.declare(&p.name, slot);
         }
         let _ = self.emit_body(&f.body);
+    }
+
+    /// Build the visible wrapper of an `async` method: it has the method's real
+    /// ABI (`this` at slot 0 for instance methods, then the parameters, exactly
+    /// like `build_method_body`) but returns the future — a closure over the
+    /// receiver (if any) and the parameters — without running the body.
+    fn build_async_method_wrapper(
+        &mut self,
+        md: &'a MethodDecl,
+        info: &CallableInfo,
+        hidden: FuncId,
+        is_static: bool,
+        this_ty: Option<Ty>,
+    ) {
+        let mut d = 0usize;
+        let mut captures: Vec<Capture> = Vec::new();
+        if !is_static {
+            let this_slot = Slot(0);
+            self.fslots.push(IrTy::Ptr);
+            self.fparams.push(IrParam {
+                name: "this".to_string(),
+                ty: IrTy::Ptr,
+            });
+            self.declare("this", this_slot);
+            captures.push(Capture {
+                name: "this".to_string(),
+                ty: this_ty.unwrap_or(Ty::Unknown),
+                span: md.span,
+            });
+            d = 1;
+        }
+        for (i, p) in info.params.iter().enumerate() {
+            let ir = self.map_ty(&p.ty, p.span).unwrap_or(IrTy::Ptr);
+            let slot = Slot((d + i) as u32);
+            self.fslots.push(ir);
+            self.fparams.push(IrParam {
+                name: p.name.clone(),
+                ty: ir,
+            });
+            self.declare(&p.name, slot);
+            captures.push(Capture {
+                name: p.name.clone(),
+                ty: p.ty.clone(),
+                span: p.span,
+            });
+        }
+        self.fret = IrTy::Ptr;
+        if let Ok(obj) = self.closure_obj_span(md.span, hidden, &captures) {
+            self.term(IrTerm::Return { v: Some(obj) });
+        }
+    }
+
+    /// Build the hidden future body of an `async` method. The closure slots hold
+    /// the receiver (instance methods) then the parameters; the receiver is
+    /// re-declared as `this` so the body's receiver-fallback operates exactly as
+    /// in a regular method body.
+    fn build_async_method_body(
+        &mut self,
+        md: &'a MethodDecl,
+        pty: &[Ty],
+        ret: &Ty,
+        is_static: bool,
+    ) {
+        let _ = self.map_ty(ret, md.span).map(|ir| self.fret = ir);
+        let env_ir = IrTy::Ptr;
+        let env_slot = self.new_slot(env_ir);
+        self.fparams.push(IrParam {
+            name: "env".to_string(),
+            ty: env_ir,
+        });
+        self.declare("env", env_slot);
+        let env_obj = self.load(env_slot);
+        let base = if is_static { 0usize } else { 1usize };
+        if !is_static {
+            let t = pty.get(0).cloned().unwrap_or(Ty::Unknown);
+            match self.field_read(md.span, env_obj, &t, 1) {
+                Ok(v) => {
+                    let ir = self.map_ty(&t, md.span).unwrap_or(IrTy::Ptr);
+                    let slot = self.new_slot(ir);
+                    self.instr(IrInstr::StoreSlot { slot, v });
+                    self.declare("this", slot);
+                }
+                Err(()) => return,
+            }
+        }
+        for (i, p) in md.params.iter().enumerate() {
+            let t = pty.get(base + i).cloned().unwrap_or(Ty::Unknown);
+            let v = match self.field_read(p.span, env_obj, &t, 1 + base + i) {
+                Ok(v) => v,
+                Err(()) => return,
+            };
+            let ir = self.map_ty(&t, p.span).unwrap_or(IrTy::Ptr);
+            let slot = self.new_slot(ir);
+            self.instr(IrInstr::StoreSlot { slot, v });
+            self.declare(&p.name, slot);
+        }
+let _ = self.emit_body(&md.body);
     }
 
     /// Declare function parameters as slots 0..n (used by top-level fns).
@@ -11390,13 +11665,7 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 format!("no declaration for generic function `{name}`"),
             );
         };
-        if f.is_async {
-            return self.bad(
-                span,
-                format!("generic async function `{name}` is not lowered yet"),
-            );
-        }
-        if f.params.iter().any(|p| p.default.is_some() || p.rest) {
+if f.params.iter().any(|p| p.default.is_some() || p.rest) {
             return self.bad(
                 span,
                 format!(
@@ -11421,10 +11690,79 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 .collect::<Vec<_>>()
                 .join("_")
         );
-        let mut n = 0;
+let mut n = 0;
         while self.module.funcs.iter().any(|f| f.symbol == symbol) {
             n += 1;
             symbol = format!("{symbol}_v{n}");
+        }
+        if f.is_async {
+            // The instantiation is the wrapper; a hidden future body (with the
+            // lambda ABI) is registered first so the wrapper can name it. Both
+            // carry the substitution, mirroring the non-generic pair.
+            let hidden_symbol = format!("{symbol}__future");
+            let hidden = FuncId(self.module.funcs.len());
+            self.module.funcs.push(IrFunc {
+                name: format!("{}__future", name),
+                symbol: hidden_symbol,
+                params: Vec::new(),
+                ret: IrTy::Unit,
+                slots: Vec::new(),
+                entry: BlockId(0),
+                blocks: Vec::new(),
+                is_main: false,
+                is_test: false,
+                tags: Vec::new(),
+            });
+            self.fid_list.push(hidden);
+            self.fsource.insert(
+                hidden,
+                FnSource::AsyncBody {
+                    f,
+                    pty: params.iter().map(|p| p.ty.clone()).collect(),
+                    ret: ret.clone(),
+                },
+            );
+            let mut hidden_info = info.clone();
+            hidden_info.params = Vec::new();
+            self.finfo.insert(hidden, hidden_info);
+            self.instanton_subst.insert(hidden, map.clone());
+            self.fid_generics.insert(
+                hidden,
+                f.generics.iter().map(|g| g.name.clone()).collect(),
+            );
+
+            let wfid = FuncId(self.module.funcs.len());
+            self.module.funcs.push(IrFunc {
+                name: name.clone(),
+                symbol,
+                params: Vec::new(),
+                ret: IrTy::Unit,
+                slots: Vec::new(),
+                entry: BlockId(0),
+                blocks: Vec::new(),
+                is_main: false,
+                is_test: false,
+                tags: Vec::new(),
+            });
+            self.fid_list.push(wfid);
+            self.fsource.insert(wfid, FnSource::AsyncFn { f, hidden });
+            self.finfo.insert(
+                wfid,
+                CallableInfo {
+                    params: params.clone(),
+                    ret: ret.clone(),
+                    ..info.clone()
+                },
+            );
+            self.src_param_tys.insert(
+                wfid,
+                params.iter().map(|p| p.ty.clone()).collect(),
+            );
+            self.instanton_subst.insert(wfid, map.clone());
+            self.fid_generics
+                .insert(wfid, f.generics.iter().map(|g| g.name.clone()).collect());
+            self.instantiations.insert(key.clone(), wfid);
+            return Ok(wfid);
         }
         let fid = FuncId(self.module.funcs.len());
         self.module.funcs.push(IrFunc {

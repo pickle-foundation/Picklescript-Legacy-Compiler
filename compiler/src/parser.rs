@@ -2221,6 +2221,16 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Ident("task".to_string()),
                 })
             }
+            Tok::Async if self.peek_at(1) == &Tok::Fn => self.parse_async_lambda(start),
+            Tok::Async => {
+                // `async` not followed by `fn` in expression position is just
+                // the contextual identifier.
+                self.bump();
+                Ok(Expr {
+                    span: start.to(self.prev_span()),
+                    kind: ExprKind::Ident("async".to_string()),
+                })
+            }
             Tok::Ident(_) => {
                 if matches!(
                     self.generic_call_flavor(),
@@ -2479,6 +2489,57 @@ impl<'a> Parser<'a> {
                 return_ty,
                 is_async: false,
                 body,
+            },
+        })
+    }
+
+    /// Parses `async fn (...) [-> R] { ... }` / `=> expr` as a lambda that
+    /// yields a future. Lowered here into two nested ordinary lambdas, so the
+    /// existing closure machinery handles everything downstream:
+    ///
+    /// ```text
+    /// async fn (p1, ...) -> R { body }
+    ///   == fn (p1, ...) { fn () -> R { body } }
+    /// ```
+    ///
+    /// Calling the outer lambda returns the inner zero-argument closure (the
+    /// future) without running `body`; `await` drives it.
+    fn parse_async_lambda(&mut self, start: Span) -> PResult<Expr> {
+        self.expect(&Tok::Async)?;
+        self.expect(&Tok::Fn)?;
+        let params = self.parse_param_list()?;
+        let return_ty = self.parse_optional_return_type()?;
+        let body = self.parse_fn_body()?;
+        let end = self.prev_span();
+        // Inner lambda: user's return annotation and body. Its span is the
+        // body's own span so checker/emit keying stays distinct.
+        let inner_span = match &body {
+            FnBody::Block(b) => b.span,
+            FnBody::Expr(e) => e.span,
+        };
+        let inner = Expr {
+            span: inner_span,
+            kind: ExprKind::Lambda {
+                params: Vec::new(),
+                return_ty,
+                is_async: false,
+                body,
+            },
+        };
+        // Outer lambda carries the user's parameters; its body is exactly the
+        // inner lambda, so calling it builds the future.
+        let outer_body_span = start.to(end);
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Lambda {
+                params,
+                return_ty: None,
+                is_async: false,
+                body: FnBody::Block(Box::new(Block {
+                    stmts: Vec::new(),
+                    expr: Some(Box::new(inner)),
+                    span: outer_body_span,
+                })),
             },
         })
     }
@@ -2950,6 +3011,7 @@ impl<'a> Parser<'a> {
         let mut is_static = false;
         let mut is_override = false;
         let mut is_const = false;
+        let mut is_async = false;
 
         loop {
             match self.kind().clone() {
@@ -2968,6 +3030,10 @@ impl<'a> Parser<'a> {
                 Tok::Static => {
                     self.bump();
                     is_static = true;
+                }
+                Tok::Async => {
+                    self.bump();
+                    is_async = true;
                 }
                 Tok::Override => {
                     self.bump();
@@ -3044,6 +3110,7 @@ impl<'a> Parser<'a> {
             (false, Tok::Fn) => {
                 let mut m = self.parse_method(is_override)?;
                 m.is_static = is_static;
+                m.is_async = is_async;
                 m.visibility = visibility;
                 Ok(ClassMember::Method(m))
             }
