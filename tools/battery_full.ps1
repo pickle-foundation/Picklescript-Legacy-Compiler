@@ -300,4 +300,49 @@ foreach ($m in $g11tests) {
 }
 Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files): PASS=$g11ok FAIL=$g11fail"
 
+# ---- GATE 12: ported AOT build — source -> IR -> x64 -> COFF -> PE-link, all in the port ----
+# Deepest build-path proof (PICKLE_AUDIT 17.2): cli-selfhost/build.pkl is AOT-built to a
+# native driver (Rust only bootstraps that link), then with no Rust compiler in the loop it
+# lowers every battery main to a real PE .exe via the ported x64 backend, COFF writer, and
+# ported PE linker (compiler.linklib) against the nostd runtime archive. Each produced exe
+# must then run with stdout byte-identical to the Rust JIT oracle for the same source.
+$pklcBuild = "tools\diff\port\pklc_build.exe"
+& $cli build "cli-selfhost\build.pkl" -o $pklcBuild 2>&1 | Out-Null
+if (-not (Test-Path -LiteralPath $pklcBuild)) {
+    Write-Output "GATE12 PORTED BUILD: DRIVER BUILD FAILED"
+} else {
+    $combinedCand = @(
+        "$env:TEMP\opencode\rarc\combined.lib"
+        "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $combinedCand) {
+        Write-Output "GATE12 PORTED BUILD: COMBINED LIB MISSING (rebuild via tools\build_combined_lib.ps1)"
+    } else {
+        $g12dir = "tools\diff\g12"
+        New-Item -ItemType Directory -Path $g12dir -Force | Out-Null
+        $g12ok = 0; $g12fail = 0; $g12skip = 0
+        foreach ($m in $mains) {
+            if ($m.BaseName -eq "os_args_main") { $g12skip++; continue }
+            $target = "tests\pickle\$($m.BaseName).pkl"
+            $exe = Join-Path $g12dir "$($m.BaseName).exe"
+            # AOT-built drivers receive argv directly (no `--` — that separator is
+            # only consumed by `pickle run <driver> -- <args>` under the JIT).
+            & $pklcBuild $target $combinedCand $exe 2>&1 | Out-Null
+            $bc = $LASTEXITCODE
+            if ($bc -ne 0 -or -not (Test-Path -LiteralPath $exe)) {
+                $g12fail++; Write-Output "GATE12 $($m.BaseName): build exit=$bc"; continue
+            }
+            cmd /c "`"$cli`" run `"$target`" > `"$g12dir\rust.txt`" 2>nul"
+            $rc = $LASTEXITCODE
+            cmd /c "`"$exe`" > `"$g12dir\port.txt`" 2>nul"
+            $ic = $LASTEXITCODE
+            $r = [System.IO.File]::ReadAllText((Resolve-Path "$g12dir\rust.txt"))
+            $p = [System.IO.File]::ReadAllText((Resolve-Path "$g12dir\port.txt"))
+            if ($rc -eq $ic -and $r -eq $p) { $g12ok++ }
+            else { $g12fail++; Write-Output "GATE12 $($m.BaseName): exit=$rc/$ic stdout_match=$($r -eq $p)" }
+        }
+        Write-Output "GATE12 PORTED BUILD (exe stdout+exit, $($mains.Count) mains, skip=$g12skip): PASS=$g12ok FAIL=$g12fail"
+    }
+}
+
 Write-Output "===== BATTERY COMPLETE ====="

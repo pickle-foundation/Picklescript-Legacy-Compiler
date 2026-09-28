@@ -315,6 +315,28 @@ A future is a zero-argument function value (a closure over `f`'s arguments);
 are runtime handles. `task` and `channel` otherwise still lex and bind as
 ordinary identifiers.
 
+The `async` surface covers the whole function family:
+
+- **Module and top-level** `async fn name(...) -> T { body }` (including generic
+  `async fn name<T>(...) -> T`); a call builds the future without running the
+  body, and each call's future captures its own argument values.
+- **Methods**: an `async` modifier on a method (`async fn m(...) -> T`) that can
+  be dispatched virtually, overridden (`override async fn ...`), and declared
+  static (`static async fn ...`). A call resolves through the ordinary vtable
+  machinery: the table entry is a wrapper that captures the receiver and any
+  arguments into a future closure, and `await` drives it. Generic classes can
+  declare async methods too; instantiating the class instantiates the wrapper
+  and its hidden future body.
+- **Async lambdas**: `async fn (p1, ...) [-> R] { body }` and the arrow form
+  `async fn (...) -> R => expr` are lowered into two nested ordinary lambdas
+  (`fn (p1, ...) { fn () -> R { body } }`): calling the outer lambda builds the
+  future, `await` drives the inner one. A zero-argument async lambda is an
+  already-built future.
+
+Every path lowers to the same shape — a wrapper function that returns a
+zero-argument closure, plus a hidden function containing the deferred body —
+so `await` is always a dynamic call of a `() -> R` closure.
+
 `from` is reserved exclusively for the import grammar (`import x from mod`).
 `use` is **no longer a keyword**: the old `use a.b.item` import syntax was
 replaced by `import item from a.b`, and `use` now lexes and binds as an

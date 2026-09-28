@@ -59,6 +59,14 @@ thread maintains its own shadow stack, GC ids, and heap-affiliated data.
   can be stored, passed around, awaited any number of times (each drive
   re-runs the body), and handed to `thread_spawn` to be driven on another
   thread by joining it with `thread_join`.
+- The same one-shape lowering covers the whole surface: `async fn` methods
+  (the wrapper captures the receiver plus the arguments, and the closure slot
+  0 ABI is the ordinary method-trampoline path), `override async fn` virtual
+  dispatch, `static async fn`, async methods on generic class
+  instantiations, generic async functions, and async lambdas (an
+  `async fn (...) -> R { }` lambda parses into two nested ordinary lambdas, so
+  no runtime distinction remains). All futures are indistinguishable at the
+  runtime level from a zero-argument closure.
 - Channels are rendezvous buffers with a bounded queue: `channel(T, cap)`,
   `send` (blocking/`trySend`), `receive`/`tryReceive`/`select`.
 - A program-wide work-stealing pool backs `parallel { }` blocks:

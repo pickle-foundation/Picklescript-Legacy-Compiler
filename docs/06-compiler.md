@@ -153,6 +153,19 @@ slice ABI follows the same
 path: `pickle_map_new` / `set` / `get_boxed` / `has` / `len` / `keys` /
 `values`.
 
+### Ported build path (17.2)
+
+A self-hosted `pickle build` exists independently of the Rust JIT/AOT:
+`cli-selfhost/build.pkl` runs source → IR → x64 → COFF → PE-link entirely in
+the ported toolchain, producing a real runnable `.exe` without Rust in the
+loop (Rust only bootstraps the AOT link of the driver itself). It is checked
+by GATE12 in the battery: every main compiles through the ported path and its
+exe output is byte-identical to the Rust JIT oracle. The ported linker lives
+in `compiler-selfhost/linklib.pkl` (importable, no `fn main`) with
+`linker.pkl` kept as a thin driver; drivers import `compiler.linklib` rather
+than `compiler.linker` because importing a module that declares `main`
+breaks entry-point detection.
+
 One design note on `Map<K, V>`: to keep object reads cheap and GC-safe, an
 index read passes an explicit *default* value down to `pickle_map_get_boxed`
 (the value type's zero — `0`/`0.0`/`false`, an interned empty string, or
@@ -433,15 +446,24 @@ The inferred instantiation is exactly the explicit one (`pkl_id_fn__int` is
   to that factory; a named constructor creates no cell and no per-class state.
 - Instance methods compile to `pkl_<TypeName>_<m>`, with the receiver passed
   first as a managed pointer (IR param slot 0, declared as `this`); static
-  methods compile to `pkl_<TypeName>_sm_<m>` with no receiver. Async/body-less
+  methods compile to `pkl_<TypeName>_sm_<m>` with no receiver. Body-less
   methods and methods with default/rest params are skipped like top-level
-  functions with those shapes; an `async fn` top-level declaration instead
-  registers two functions — a visible wrapper returning a closure over its
-  parameters and a hidden 0-arg body the wrapper boxes into that closure —
-  and `override fn` methods lower with the same shape (and
-  drive the dispatch cascade described above). Methods of a generic class
-  instantiation follow the same shapes under the mangled symbols above
-  (`pkl_Box_read_int`, `pkl_<T>_sm_<m>_<suffix>`).
+  functions with those shapes; `async fn` methods instead register two
+  functions — a visible wrapper (dimensioned like a class method and stored in
+  the method table for virtual dispatch) that captures the receiver and any
+  arguments into a closure over `(this?, params)`, and a hidden 0-arg future
+  body the wrapper boxes into that closure — and `override async fn` methods
+  lower with the same shape under the override dispatch cascade described
+  above, exactly as their synchronous counterparts do.
+- A top-level `async fn` registers the same wrapper/hidden pair without a
+  receiver ("`pkl_<name>`" wrapper, "`pkl_<name>__future`" hidden body); a
+  generic `async fn` / async method instantiation registers the pair under the
+  instantiated symbol (`pkl_<name>__<T>__future`). `await <future>` is a
+  dynamic 0-argument call against the closure (fn-value call through
+  `pickle_obj_slot_get` on slot 0), so awaiting is just driving the captured
+  zero-arg function to completion.
+- Methods of a generic class instantiation follow the same shapes under the
+  mangled symbols above (`pkl_Box_read_int`, `pkl_<T>_sm_<m>_<suffix>`).
 - `this` loads the receiver slot. An undefined identifier inside an instance
   method falls back to `this.<name>`; `obj.field` read/write and compound
   assigns (`+=`) lower through `pickle_obj_slot_get`/`pickle_obj_slot_set`
