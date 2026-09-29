@@ -381,7 +381,7 @@ if (-not (Invoke-BuildDriver "cli-selfhost\main.pkl" $pklcMain)) {
     $g13dir = "tools\diff\g13"
     New-Item -ItemType Directory -Path $g13dir -Force | Out-Null
     $g13ok = 0; $g13fail = 0
-    foreach ($argv in @(@("-V"), @("--version"), @("jar"))) {
+    foreach ($argv in @(@("-V"), @("--version"), @("jar"), @("history"))) {
         $argStr = $argv -join " "
         cmd /c "`"$cli`" $argStr > `"$g13dir\rust.txt`" 2>nul"
         $rc = $LASTEXITCODE
@@ -394,6 +394,16 @@ if (-not (Invoke-BuildDriver "cli-selfhost\main.pkl" $pklcMain)) {
     }
     Write-Output "CLI PERSONALITY (fixed-output commands, $($g13ok + $g13fail) cases): PASS=$g13ok FAIL=$g13fail"
 }
+
+# ---- Crash-stanza personality: an uncaught throw in a self-host compiled exe
+# (selfhost-linked against combined.lib) must match the Rust oracle on all three
+# channels byte for byte — exit code, stdout, and stderr. ----
+$g14out = & (Join-Path $PSScriptRoot "uncaught_parity.ps1") -SelfhostLink 2>&1
+$g14fail = $LASTEXITCODE
+$g14pass = @($g14out | Select-String -Pattern "^PASS ").Count
+$g14fails = @($g14out | Select-String -Pattern "^FAIL ").Count
+Write-Output "UNCAUGHT PARITY (selfhost link, fixtures=$($g14pass + $g14fails)): PASS=$g14pass FAIL=$g14fails"
+if ($g14fail -ne 0) { Write-Output "uncaught_parity.ps1 -SelfhostLink failed (exit $g14fail)" }
 
 $batterySw.Stop()
 Write-Output "===== BATTERY COMPLETE ($([math]::Round($batterySw.Elapsed.TotalMinutes, 2)) min) ====="
