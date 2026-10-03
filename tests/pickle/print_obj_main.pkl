@@ -1,0 +1,58 @@
+module main
+
+class Point {
+    var x = 0
+    var y = 0
+}
+
+enum Color {
+    Red
+    Green
+    Blue(v: int)
+}
+
+/// A generic parameter has no static rep, so the argument is boxed. That is the
+/// only way to reach the BOX_* arms of print_obj from source.
+fn show<T>(x: T) {
+    print(x)
+    println("")
+}
+
+fn main() {
+    print("hello")
+    println("")
+    print("")
+    var xs: List<int> = [1, 2, 3]
+    print(xs)
+    println("")
+    var es = range(0)
+    print(es)
+    println("")
+    var m: Map<string, int> = {"a": 1, "b": 2}
+    print(m)
+    println("")
+    print(Color.Red)
+    println("")
+    print(Color.Green)
+    println("")
+    print(Color.Blue(7))
+    println("")
+    var ts: List<(int, string)> = [(1, "a"), (2, "b")]
+    print(...ts)
+    println("")
+    var p = Point()
+    p.x = 3
+    print(p)
+    println("")
+    show(42)
+    show(-42)
+    show(1.25)
+    show(0.1)
+    show(-0.0)
+    show(1e308 * 10.0)
+    show(true)
+    show(false)
+    show('q')
+    show('Z')
+    show("\u{00e9}")
+}

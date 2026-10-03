@@ -249,7 +249,11 @@ mod tests {
                 }
                 std::thread::yield_now();
             }
-            assert_eq!(arrived.load(Ordering::Acquire), 4, "all workers reached the lock");
+            assert_eq!(
+                arrived.load(Ordering::Acquire),
+                4,
+                "all workers reached the lock"
+            );
             // None of them may be inside the critical section: the lock this
             // thread holds must have excluded them.
             assert_eq!(
@@ -263,7 +267,10 @@ mod tests {
         assert_eq!(done.load(Ordering::Acquire), 4);
         assert_eq!(overlap.load(Ordering::Acquire), 0, "two owners at once");
         assert_eq!(peak.load(Ordering::Acquire), 1);
-        assert!(blocked.load(Ordering::Acquire) > 0, "the workers had to wait");
+        assert!(
+            blocked.load(Ordering::Acquire) > 0,
+            "the workers had to wait"
+        );
         // A session that ends at thread exit (no `release`) must not wedge the
         // next thread either.
         std::thread::spawn(|| {

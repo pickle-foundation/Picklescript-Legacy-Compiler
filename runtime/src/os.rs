@@ -6,13 +6,13 @@
 //! forwards the CLI's trailing `--` arguments. `args()` snapshots it as a
 //! fresh `List<string>` (program name excluded, matching `argv[1..]`).
 
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::Mutex;
 use crate::object::PickleObject;
 use crate::strings::string_from_bytes;
 use alloc::vec::Vec;
 #[cfg(not(feature = "nostd"))]
 use std::sync::Mutex;
-#[cfg(feature = "nostd")]
-use crate::nostd::sync::Mutex;
 
 /// Owned copy of the program's arguments, excluding the program name.
 static PROGRAM_ARGS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -128,7 +128,20 @@ pub extern "C" fn pickle_args() -> *mut PickleObject {
 pub extern "C" fn pickle_exit(code: i64) -> ! {
     crate::console::pickle_flush();
     #[cfg(not(feature = "nostd"))]
-    std::process::exit(code.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+std::process::exit(code.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     #[cfg(feature = "nostd")]
-    unsafe { crate::nostd::ExitProcess(code.clamp(0, u32::MAX as i64) as u32) }
-}
+    unsafe {
+    crate::nostd::ExitProcess(code.clamp(0, u32::MAX as i64) as u32)
+    }
+    }
+
+/// `current_dir()`: the process working directory, or `none`.
+///
+/// The body lives in `process` for `std` builds and in `nostd` for freestanding
+/// ones. `declare_abi!` can only name each ABI symbol once -- its name list
+/// ignores the per-entry `#[cfg]`, so listing the same name twice would trip the
+/// uniqueness check -- so the table points here and this module picks the arm.
+#[cfg(not(feature = "nostd"))]
+pub use crate::process::pickle_current_dir;
+#[cfg(feature = "nostd")]
+pub use crate::nostd::pickle_current_dir;

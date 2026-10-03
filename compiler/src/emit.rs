@@ -102,6 +102,9 @@ pub fn emit_ir(
         types,
         module: IrModule::default(),
         consts_inits: HashMap::new(),
+        global_ids: HashMap::new(),
+        global_decls: HashMap::new(),
+        global_failures: Vec::new(),
         class_consts: HashMap::new(),
         const_inlining: Vec::new(),
         fid_list: Vec::new(),
@@ -176,14 +179,21 @@ pub fn emit_ir(
         failed: false,
     };
     em.emit();
-    if em.failed {
+    // Globals that could not be lowered are reported here rather than at the
+    // registration site so the rest of the program still emits (and so the
+    // diagnostic can be emitted without borrowing conflicts).
+    for (_name, span, msg) in &em.global_failures {
+        em.diags
+            .emit(Diagnostic::error_at(*span, msg.clone()));
+    }
+    if em.failed || em.diags.any_error() {
         None
     } else {
         Some(em.module)
     }
 }
 
-    /// A `break`/`continue` target pair.
+/// A `break`/`continue` target pair.
 struct LoopCtx {
     continue_target: BlockId,
     break_target: BlockId,
@@ -208,8 +218,6 @@ struct HandlerCtx {
     own_finally: bool,
 }
 
-
-
 /// Where a registered function's body and signature come from.
 #[derive(Clone)]
 enum FnSource<'a> {
@@ -218,7 +226,7 @@ enum FnSource<'a> {
     /// A lambda expression's hoisted body: slot 0 is the closure object, whose
     /// slots 1..N hold the captured values copied in at entry; the lambda's own
     /// parameters come after the closure object.
-Lambda {
+    Lambda {
         lambda: &'a Expr,
         captures: Vec<Capture>,
         /// The lambda's parameter types (substituted under the enclosing
@@ -235,7 +243,11 @@ Lambda {
     /// The hidden 0-arg future body of an `async fn`, sharing the hoisted
     /// lambda ABI: slot 0 is the closure object whose slots 1..N hold the async
     /// fn's parameters, read as named captures inside the body.
-    AsyncBody { f: &'a FnDecl, pty: Vec<Ty>, ret: Ty },
+    AsyncBody {
+        f: &'a FnDecl,
+        pty: Vec<Ty>,
+        ret: Ty,
+    },
     /// A visible `async` method: the method itself, with its real
     /// (receiver-first for instance methods) ABI, building a closure over
     /// `this` (if any) plus the call parameters — the future — and returning
@@ -378,33 +390,32 @@ const MAX_LAMBDA_CAPTURES: usize = 8;
 /// Runtime symbol names used to build and call closure values.
 const CLOSURE_CLASS_PREFIX: &str = "__closure_";
 
-    /// The slot holding the hoisted body's code address inside a closure object.
-    const CLOSURE_FN_SLOT: usize = 0;
+/// The slot holding the hoisted body's code address inside a closure object.
+const CLOSURE_FN_SLOT: usize = 0;
 
-    /// Runtime symbols for cooperative exception propagation. See the module
-    /// docs: a throw raises a per-thread flag that enclosing frames observe
-    /// after each call, and `finally` is lowered by duplication.
-    mod exc {
-        /// Publish `payload` and raise this thread's pending flag.
-        pub const THROW: &str = "pickle_exc_throw";
-        /// Is a throw in flight on this thread?
-        pub const PENDING: &str = "pickle_exc_pending";
-        /// Consume the in-flight throw, returning its payload.
-        pub const TAKE: &str = "pickle_exc_take";
-    }
+/// Runtime symbols for cooperative exception propagation. See the module
+/// docs: a throw raises a per-thread flag that enclosing frames observe
+/// after each call, and `finally` is lowered by duplication.
+mod exc {
+    /// Publish `payload` and raise this thread's pending flag.
+    pub const THROW: &str = "pickle_exc_throw";
+    /// Is a throw in flight on this thread?
+    pub const PENDING: &str = "pickle_exc_pending";
+    /// Consume the in-flight throw, returning its payload.
+    pub const TAKE: &str = "pickle_exc_take";
+}
 
-    /// How control leaves a block once its `finally` chain has run.
-    enum Exit {
-        /// Leave the function with this value.
-        Return(Option<Temp>),
-        /// Jump to an existing block (a `break`/`continue` target).
-        Branch(BlockId),
-        /// Leave the function because a throw is propagating. A function with a
-        /// result must still produce one, so a zero of that type is returned;
-        /// the caller checks the pending flag before it reads the value.
-        Propagate,
-    }
-
+/// How control leaves a block once its `finally` chain has run.
+enum Exit {
+    /// Leave the function with this value.
+    Return(Option<Temp>),
+    /// Jump to an existing block (a `break`/`continue` target).
+    Branch(BlockId),
+    /// Leave the function because a throw is propagating. A function with a
+    /// result must still produce one, so a zero of that type is returned;
+    /// the caller checks the pending flag before it reads the value.
+    Propagate,
+}
 
 /// The number of parameters on a lambda expression.
 fn params_len(lambda: &Expr) -> usize {
@@ -558,6 +569,13 @@ struct Emitter<'a> {
     module: IrModule,
     /// Top-level `const` name -> its initializer (inlined at use sites).
     consts_inits: HashMap<String, &'a Expr>,
+    /// Top-level `var` name -> global id. Kept separate from `consts_inits`
+    /// because a global is *not* inlined: it becomes a data symbol.
+    global_ids: HashMap<String, usize>,
+    /// Top-level `var` declarations by name, for type lookup during emission.
+    global_decls: HashMap<String, &'a GlobalDecl>,
+    /// Globals whose init could not be reduced to bytes, for diagnostics.
+    global_failures: Vec<(String, Span, String)>,
     /// `(class id, const name)` -> declared info + initializer, inlined at use
     /// sites (`Type.NAME`, or the bare name inside the class body).
     class_consts: HashMap<(u32, String), (FieldInfo, &'a Expr)>,
@@ -796,11 +814,27 @@ struct SpreadCall<'a> {
     args: &'a [CallArg],
 }
 
+/// The receiver plus generic-instantiation context for one async method.
+///
+/// Grouped for the same reason as [`SpreadCall`]: carrying these as loose
+/// parameters made `register_async_method` an eleven-argument list whose call
+/// sites had to be read against the signature to tell `args` from `generics`.
+struct AsyncRecv<'a> {
+    class: &'a str,
+    cid: u32,
+    args: &'a [Ty],
+    is_struct: bool,
+    generics: Vec<String>,
+}
+
 impl<'a> Emitter<'a> {
     fn emit(&mut self) {
         for item in &self.prog.items {
             if let ItemKind::Const(c) = &item.kind {
                 self.consts_inits.insert(c.name.clone(), &c.value);
+            }
+            if let ItemKind::Global(g) = &item.kind {
+                self.global_decls.insert(g.name.clone(), g);
             }
             if let ItemKind::Fn(f) | ItemKind::Test(f) = &item.kind {
                 self.fn_decls.insert(f.name.clone(), f);
@@ -810,6 +844,9 @@ impl<'a> Emitter<'a> {
             }
         }
         let prog = self.prog;
+        // Globals must be registered before any body is walked, because a body
+        // may read or write one by bare name.
+        self.register_globals();
         for item in &prog.items {
             match &item.kind {
                 ItemKind::Fn(f) => self.register_fn(f, false, &item.attrs),
@@ -1658,7 +1695,7 @@ impl<'a> Emitter<'a> {
         out
     }
 
-fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
+    fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
         if !f.generics.is_empty() {
             return;
         }
@@ -1679,11 +1716,11 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
             return;
         }
         if f.is_async {
-            self.register_async_fn(f, is_test, attrs, &info);
+            self.register_async_fn(f, is_test, attrs, info);
             return;
         }
         let fid = FuncId(self.module.funcs.len());
-        let symbol = self.symbol_for(&f.name, is_test);
+        let symbol = self.symbol_for_attrs(&f.name, is_test, attrs);
         self.module.funcs_by_name.insert(f.name.clone(), fid);
         self.module.funcs.push(IrFunc {
             name: f.name.clone(),
@@ -1727,7 +1764,9 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
         let hidden_name = format!("{}__future", f.name);
         let hidden_symbol = format!("{symbol}__future");
         let hidden = FuncId(self.module.funcs.len());
-        self.module.funcs_by_name.insert(hidden_name.clone(), hidden);
+        self.module
+            .funcs_by_name
+            .insert(hidden_name.clone(), hidden);
         self.module.funcs.push(IrFunc {
             name: hidden_name,
             symbol: hidden_symbol,
@@ -1767,7 +1806,7 @@ fn register_fn(&mut self, f: &'a FnDecl, is_test: bool, attrs: &[Attribute]) {
             is_test,
             tags: self.item_tags(attrs),
         });
-self.fid_list.push(wfid);
+        self.fid_list.push(wfid);
         self.fsource.insert(wfid, FnSource::AsyncFn { f, hidden });
         self.finfo.insert(wfid, info.clone());
         self.src_param_tys
@@ -1792,17 +1831,17 @@ self.fid_list.push(wfid);
     /// signature when the receiver class is a generic instantiation.
     fn register_async_method(
         &mut self,
-        class: &str,
+        recv: &AsyncRecv<'_>,
         table: &ClassTable,
         md: &'a MethodDecl,
         info: &CallableInfo,
-        cid: u32,
-        args: &[Ty],
-        is_struct: bool,
         suffix: &str,
         subst: Option<HashMap<String, Ty>>,
-        generics: Vec<String>,
     ) {
+        let class = recv.class;
+        let cid = recv.cid;
+        let args = recv.args;
+        let is_struct = recv.is_struct;
         let this_ty = if info.is_static {
             None
         } else if is_struct {
@@ -1837,7 +1876,7 @@ self.fid_list.push(wfid);
         self.fid_owner.insert(hidden, cid as i64);
         if let Some(s) = subst.clone() {
             self.instanton_subst.insert(hidden, s.clone());
-            self.fid_generics.insert(hidden, generics.clone());
+            self.fid_generics.insert(hidden, recv.generics.clone());
         }
 
         let wfid = self.push_class_func(
@@ -1859,7 +1898,7 @@ self.fid_list.push(wfid);
         self.fid_owner.insert(wfid, cid as i64);
         if let Some(s) = subst {
             self.instanton_subst.insert(wfid, s);
-            self.fid_generics.insert(wfid, generics);
+            self.fid_generics.insert(wfid, recv.generics.clone());
         }
     }
 
@@ -2740,7 +2779,7 @@ self.fid_list.push(wfid);
             ClassMember::Method(md) => Some(md),
             _ => None,
         }) {
-if md.body.is_none() || !md.generics.is_empty() {
+            if md.body.is_none() || !md.generics.is_empty() {
                 continue;
             }
             let Some(info) = table.methods.iter().find(|m| m.name == md.name) else {
@@ -2750,7 +2789,20 @@ if md.body.is_none() || !md.generics.is_empty() {
                 continue;
             }
             if md.is_async {
-                self.register_async_method(name, &table, md, &info, cid, &[], false, "", None, Vec::new());
+                self.register_async_method(
+                    &AsyncRecv {
+                        class: name,
+                        cid,
+                        args: &[],
+                        is_struct: false,
+                        generics: Vec::new(),
+                    },
+                    &table,
+                    md,
+                    info,
+                    "",
+                    None,
+                );
                 continue;
             }
             let symbol = if info.is_static {
@@ -3086,7 +3138,7 @@ if md.body.is_none() || !md.generics.is_empty() {
         self.fid_owner.insert(ctor_fid, cid as i64);
         self.fid_generics.insert(ctor_fid, table.generics.clone());
 
-for md in members.iter().filter_map(|m| match m {
+        for md in members.iter().filter_map(|m| match m {
             ClassMember::Method(md) => Some(md),
             _ => None,
         }) {
@@ -3112,19 +3164,23 @@ for md in members.iter().filter_map(|m| match m {
                     ret: info.ret.subst(&map),
                     ..info.clone()
                 };
-                let is_struct =
-                    matches!(self.resolved.types.get(name), Some(TypeTableEntry::Struct(_)));
+                let is_struct = matches!(
+                    self.resolved.types.get(name),
+                    Some(TypeTableEntry::Struct(_))
+                );
                 self.register_async_method(
-                    &display,
+                    &AsyncRecv {
+                        class: &display,
+                        cid,
+                        args,
+                        is_struct,
+                        generics: table.generics.clone(),
+                    },
                     &stable,
                     md,
                     &sub_info,
-                    cid,
-                    args,
-                    is_struct,
                     &format!("_{suffix}"),
                     Some(map.clone()),
-                    table.generics.clone(),
                 );
                 continue;
             }
@@ -3186,13 +3242,178 @@ for md in members.iter().filter_map(|m| match m {
         fid
     }
 
-    fn symbol_for(&self, name: &str, is_test: bool) -> String {
-        if is_test {
+    /// Linker symbol for a top-level `var`. The `pkl_global_` prefix is reserved:
+    /// a function named `global_x` would otherwise collide with a global `x`.
+    fn global_symbol(name: &str) -> String {
+        format!("pkl_global_{name}")
+    }
+
+    /// Source `Ty` -> IR slot type, or `None` when this slice has no lowering
+    /// for it yet.
+fn global_ir_ty(ty: &Ty) -> Option<IrTy> {
+match ty {
+Ty::Int => Some(IrTy::Int),
+_ => None,
+}
+}
+
+/// Slot type for a global declared without a `: T` annotation.
+///
+/// Inference is deliberately as narrow as `global_init_bytes`: only an integer
+/// literal (optionally negated) determines a type. Anything richer would have
+/// to be a general static-evaluator, which this slice does not have.
+fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
+match &e.kind {
+ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
+ExprKind::Unary { op: AstUnOp::Neg, operand } => match &operand.kind {
+ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
+_ => None,
+},
+_ => None,
+}
+}
+
+/// Build the module-level global table in source order.
+///
+/// Only *static* initializers are accepted, because these bytes are written
+/// into the image before `main` runs. Anything that needs a call, a load, or
+/// an allocation is rejected here with a diagnostic rather than being
+/// silently evaluated at some other time.
+fn register_globals(&mut self) {
+   let items: Vec<(String, GlobalDecl)> = self
+      .global_decls
+      .iter()
+      .map(|(k, v)| (k.clone(), (*v).clone()))
+      .collect();
+   // Source order, not hash order, so the data blob is reproducible.
+   let mut ordered: Vec<(String, GlobalDecl)> = Vec::new();
+   for item in &self.prog.items {
+      if let ItemKind::Global(g) = &item.kind {
+         ordered.push((g.name.clone(), g.clone()));
+      }
+   }
+   debug_assert_eq!(items.len(), ordered.len());
+   for (name, g) in ordered {
+      let declared = self
+         .resolved
+         .globals
+         .iter()
+         .find(|f| f.name == name)
+         .map(|f| f.ty.clone())
+         .unwrap_or(Ty::Unknown);
+let ty_explicit = g.ty.is_some();
+// An unannotated `var` takes its type from the initializer, but only when
+// that inference is unambiguous for this slice.
+let declared_ir = Self::global_ir_ty(&declared).or_else(|| {
+if ty_explicit {
+None
+} else {
+Self::global_infer_ir_ty(&g.value)
+}
+});
+match declared_ir {
+Some(it) => {
+            let init = match self.global_init_bytes(&g.value, it, &name) {
+               Ok(b) => b,
+               Err(msg) => {
+                  self.global_failures.push((name.clone(), g.span, msg));
+                  continue;
+               }
+            };
+            let id = self.module.globals.len();
+            self.module.globals.push(IrGlobal {
+               symbol: Self::global_symbol(&name),
+               ty: it,
+               ty_explicit,
+               init,
+            });
+            self.global_ids.insert(name, id);
+         }
+         None => {
+            self.global_failures.push((
+               name.clone(),
+               g.span,
+               format!("a top-level `var` of type `{}` is not supported yet; only `int64` slots have a lowering", declared),
+            ));
+         }
+      }
+   }
+}
+
+/// Reduce a global initializer to little-endian bytes, or explain why not.
+///
+/// The supported set is deliberately just integer literals (optionally
+/// negated): enough to prove the `.data` path end to end without inventing a
+/// general static-evaluator.
+fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option<Vec<u8>>, String> {
+   let lit = match &e.kind {
+      ExprKind::Lit(Lit::Int { value: v }) => Some(*v as i64),
+      ExprKind::Unary { op: crate::ast::UnOp::Neg, operand } => match &operand.kind {
+         ExprKind::Lit(Lit::Int { value: v }) => Some((*v as i64).wrapping_neg()),
+         _ => None,
+      },
+      _ => None,
+   };
+   let Some(v) = lit else {
+      return Err(format!(
+         "the initializer of top-level `var {name}` must be an integer literal; it runs before `main` and cannot call or read other globals yet"
+      ));
+   };
+   match ty {
+      IrTy::Int => Ok(Some(v.to_le_bytes().to_vec())),
+      IrTy::Unit => Ok(None),
+      other => Err(format!(
+         "a top-level `var {name}` of type `{other}` has no static initializer yet"
+      )),
+   }
+}
+
+fn symbol_for(&self, name: &str, is_test: bool) -> String {
+   if is_test {
             format!("pickle_test_{name}")
         } else if name == "main" {
             "pickle_main".to_string()
         } else {
             format!("pkl_{name}")
+        }
+    }
+
+    /// Collect an `#[symbol("...")]` override from an item's attributes, giving a
+    /// top-level function an exact C ABI symbol name instead of the `pkl_<name>`
+    /// default. This is what lets the ported runtime define `pickle_*` ABI
+    /// functions directly in Pickle. Returns `None` when absent.
+    fn item_symbol(&self, attrs: &[Attribute]) -> Option<String> {
+        for a in attrs {
+            if a.name != "symbol" {
+                continue;
+            }
+            for arg in &a.args {
+                if let ExprKind::Lit(Lit::String(parts)) = &arg.kind {
+                    if parts.iter().all(|p| matches!(p, StrPart::Text(_))) {
+                        let text: String = parts
+                            .iter()
+                            .map(|p| match p {
+                                StrPart::Text(t) => t.clone(),
+                                StrPart::Expr(_) => String::new(),
+                            })
+                            .collect();
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// `symbol_for`, but honoring an `#[symbol("...")]` attribute override so a
+    /// function can claim an exact ABI symbol (e.g. a ported runtime's
+    /// `pickle_str_len`).
+    fn symbol_for_attrs(&self, name: &str, is_test: bool, attrs: &[Attribute]) -> String {
+        match self.item_symbol(attrs) {
+            Some(s) => s,
+            None => self.symbol_for(name, is_test),
         }
     }
 
@@ -3260,7 +3481,7 @@ for md in members.iter().filter_map(|m| match m {
                 self.fret = self.map_ty(&info.ret, f.span).unwrap_or(IrTy::Unit);
                 self.emit_body(&f.body);
             }
-FnSource::Lambda {
+            FnSource::Lambda {
                 lambda,
                 captures,
                 pty,
@@ -3554,7 +3775,7 @@ FnSource::Lambda {
             }
         }
 
-let _ = self.emit_body(&Some(body.clone()));
+        let _ = self.emit_body(&Some(body.clone()));
     }
 
     /// Build the hidden future body of an `async fn`. It shares the hoisted
@@ -3659,7 +3880,7 @@ let _ = self.emit_body(&Some(body.clone()));
         let env_obj = self.load(env_slot);
         let base = if is_static { 0usize } else { 1usize };
         if !is_static {
-            let t = pty.get(0).cloned().unwrap_or(Ty::Unknown);
+            let t = pty.first().cloned().unwrap_or(Ty::Unknown);
             match self.field_read(md.span, env_obj, &t, 1) {
                 Ok(v) => {
                     let ir = self.map_ty(&t, md.span).unwrap_or(IrTy::Ptr);
@@ -3681,7 +3902,7 @@ let _ = self.emit_body(&Some(body.clone()));
             self.instr(IrInstr::StoreSlot { slot, v });
             self.declare(&p.name, slot);
         }
-let _ = self.emit_body(&md.body);
+        let _ = self.emit_body(&md.body);
     }
 
     /// Declare function parameters as slots 0..n (used by top-level fns).
@@ -4785,10 +5006,8 @@ let _ = self.emit_body(&md.body);
                     // option here would dereference null.
                     Pattern::Tuple(_) => {
                         let Some(e) = init else {
-                            return self.bad(
-                                *span,
-                                "destructuring patterns require an initializer",
-                            );
+                            return self
+                                .bad(*span, "destructuring patterns require an initializer");
                         };
                         let st = self.ty_of(&e.span).unwrap_or(Ty::Unknown);
                         let v = self.expr(e)?;
@@ -4881,7 +5100,8 @@ let _ = self.emit_body(&md.body);
         for s in rest {
             self.stmt(s)?;
         }
-        let Stmt::Try {            body,
+        let Stmt::Try {
+            body,
             binder,
             handler,
             finally,
@@ -5067,7 +5287,9 @@ let _ = self.emit_body(&md.body);
         // still runs it.
         self.finallys = chain;
 
-        self.term(IrTerm::Branch { target: handler.target });
+        self.term(IrTerm::Branch {
+            target: handler.target,
+        });
         self.cur = self.new_block();
         Ok(())
     }
@@ -5161,7 +5383,9 @@ let _ = self.emit_body(&md.body);
             // balanced by the time the body copy is emitted.
             self.finallys.pop();
             if handler.is_some() {
-                self.term(IrTerm::Branch { target: handler_fin_id });
+                self.term(IrTerm::Branch {
+                    target: handler_fin_id,
+                });
                 self.cur = handler_fin_id;
                 self.push_scope();
                 self.block_body_only(fin)?;
@@ -5351,7 +5575,7 @@ let _ = self.emit_body(&md.body);
                 return self.bad(
                     sequence.span,
                     "`for (x in ...)` over non-range, non-list sequences is not lowered yet",
-                )
+                );
             }
         };
         self.ensure_int(start)?;
@@ -5398,7 +5622,10 @@ let _ = self.emit_body(&md.body);
         });
         self.push_scope();
         let Pattern::Binding { name, .. } = pattern else {
-            return self.bad(span, "iteration patterns other than a binding are not lowered yet");
+            return self.bad(
+                span,
+                "iteration patterns other than a binding are not lowered yet",
+            );
         };
         self.declare(name, idx);
         self.block_body_only(body)?;
@@ -6089,12 +6316,20 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
         }
     }
 
-    fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
-        if let Some(slot) = self.lookup(name) {
-            return Ok(self.load(slot));
-        }
-        // Inline a top-level const initializer.
-        if let Some(init) = self.consts_inits.get(name).copied() {
+fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
+   if let Some(slot) = self.lookup(name) {
+      return Ok(self.load(slot));
+   }
+      // A top-level `var` is a real data slot: read it. This must be checked
+      // *before* the const inline so a global is never mistaken for a value.
+      if let Some(&id) = self.global_ids.get(name) {
+         let ty = self.module.globals[id].ty;
+         let dst = self.temp();
+         self.instr(IrInstr::LoadGlobal { dst, id, ty });
+         return Ok(dst);
+      }
+      // Inline a top-level const initializer.
+      if let Some(init) = self.consts_inits.get(name).copied() {
             if self.const_inlining.iter().any(|n| n == name) {
                 return self.bad(e.span, format!("cyclic `const` initialization of `{name}`"));
             }
@@ -6264,10 +6499,9 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                     vec![start, end1, one],
                 );
             }
-            AstBinOp::Send
-            | AstBinOp::Is
-            | AstBinOp::In
-            | AstBinOp::Pow => return self.bad(e.span, "this operator is not lowered yet"),
+            AstBinOp::Send | AstBinOp::Is | AstBinOp::In | AstBinOp::Pow => {
+                return self.bad(e.span, "this operator is not lowered yet")
+            }
             AstBinOp::Add if both_str => {
                 let a = self.expr(lhs)?;
                 let b = self.expr(rhs)?;
@@ -7028,9 +7262,35 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 }
             };
             self.instr(IrInstr::StoreSlot { slot, v: dst });
-            return Ok(dst);
-        }
-        // Inside an instance method a bare field name assigns `this.field`.
+return Ok(dst);
+         }
+         // A top-level `var` write goes to the data symbol. Compound forms
+         // are read-modify-write against the slot, so `g += 1` is a load then
+         // a store, never a blind store of `v`.
+         if let Some(&id) = self.global_ids.get(name) {
+            let ty = self.module.globals[id].ty;
+            let stored = if op == AssignOp::Assign {
+               v
+            } else {
+               let cur = self.temp();
+               self.instr(IrInstr::LoadGlobal { dst: cur, id, ty });
+               let dst = self.temp();
+               self.instr(IrInstr::BinOp {
+                  dst,
+                  op: assign_opcode(op),
+                  a: cur,
+                  b: v,
+               });
+               dst
+            };
+            self.instr(IrInstr::StoreGlobal {
+               id,
+               v: stored,
+               ty,
+            });
+            return Ok(stored);
+         }
+         // Inside an instance method a bare field name assigns `this.field`.
         if let Some(cid) = self.owner {
             if let Some(idx) = self.instance_field_index(cid, name) {
                 let field_ty = self.field_at(cid, idx).ty.clone();
@@ -7068,14 +7328,12 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                     if op != AssignOp::Assign {
                         // `Type.prop op= value`: read through the getter, combine,
                         // call the setter with the result.
-                        let Some(&get_fid) = self
-                            .static_property_ids
-                            .get(&(cid, name.to_string(), false))
+                        let Some(&get_fid) =
+                            self.static_property_ids
+                                .get(&(cid, name.to_string(), false))
                         else {
-                            return self.bad(
-                                e.span,
-                                format!("static property `{name}` has no getter"),
-                            );
+                            return self
+                                .bad(e.span, format!("static property `{name}` has no getter"));
                         };
                         let pty = self.property_ty_of(tname, name);
                         let cur = self.call_method(e, get_fid, &[], None)?;
@@ -7163,8 +7421,7 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 if op != AssignOp::Assign {
                     // `obj.prop op= value`: read through the getter, combine,
                     // call the setter with the result.
-                    let Some(&get_fid) =
-                        self.property_ids.get(&(cid, name.to_string(), false))
+                    let Some(&get_fid) = self.property_ids.get(&(cid, name.to_string(), false))
                     else {
                         return self.bad(e.span, format!("property `{name}` has no getter"));
                     };
@@ -7181,17 +7438,17 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                     } else {
                         dst
                     };
-                        let dsti = self.temp();
-                        self.instr(IrInstr::Call {
-                            dst: Some(dsti),
-                            callee: Callee::Func(fid),
-                            args: vec![obj, packed],
-                        });
-                        // As with the static setter: a throwing accessor has to
-                        // be noticed here, or the assignment looks successful
-                        // and the flag escapes to some unrelated later call.
-                        self.guard_propagation(fid, e.span)?;
-                        return Ok(dst);
+                    let dsti = self.temp();
+                    self.instr(IrInstr::Call {
+                        dst: Some(dsti),
+                        callee: Callee::Func(fid),
+                        args: vec![obj, packed],
+                    });
+                    // As with the static setter: a throwing accessor has to
+                    // be noticed here, or the assignment looks successful
+                    // and the flag escapes to some unrelated later call.
+                    self.guard_propagation(fid, e.span)?;
+                    return Ok(dst);
                 }
                 let obj = self.expr(object)?;
                 let v = self.expr(value)?;
@@ -9493,16 +9750,17 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
     /// Emit a block whose tail value (if any) is stored into `res_slot`.
     fn block_into_slot(&mut self, b: &Block, res_slot: Option<Slot>) -> Result<(), ()> {
         if let Some(slot) = res_slot {
-            let want = self.fslots.get(slot.0 as usize).copied().unwrap_or(IrTy::Unit);
+            let want = self
+                .fslots
+                .get(slot.0 as usize)
+                .copied()
+                .unwrap_or(IrTy::Unit);
             if let Some(try_slot) = self.stmts_with_try_tail(&b.stmts, want)? {
                 let t = self.load(try_slot);
                 self.instr(IrInstr::StoreSlot { slot, v: t });
                 return Ok(());
             }
-        } else if self
-            .stmts_with_try_tail(&b.stmts, IrTy::Unit)?
-            .is_some()
-        {
+        } else if self.stmts_with_try_tail(&b.stmts, IrTy::Unit)?.is_some() {
             return Ok(());
         }
         for s in &b.stmts {
@@ -9580,6 +9838,10 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                         | "captureBegin"
                         | "captureTake"
                         | "gcCollect"
+                        | "gcAllocationsSinceGc"
+                        | "gcBytesSinceGc"
+                        | "gcCollectionCount"
+                        | "gcSetThreshold"
                 ) {
                     return false;
                 }
@@ -10091,7 +10353,7 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
         Ok(dst)
     }
 
-/// A closure object holding `fid`'s code address (boxed) in slot 0 and the
+    /// A closure object holding `fid`'s code address (boxed) in slot 0 and the
     /// given captures (boxed like list elements) in slots 1..N. The slot layout
     /// must match the hoisted body's reads in `build_lambda_body`.
     fn closure_obj(&mut self, e: &Expr, fid: FuncId, captures: &[Capture]) -> Result<Temp, ()> {
@@ -10492,7 +10754,8 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                     if a.spread {
                         let a_ty = self.ty_of(&a.value.span);
                         let Some(Ty::List(inner)) = a_ty else {
-                            return self.bad(a.value.span, "spread argument in `print` must be a `List`")
+                            return self
+                                .bad(a.value.span, "spread argument in `print` must be a `List`");
                         };
                         let sp_t = self.expr(&a.value)?;
                         self.print_spread_list(a.value.span, sp_t, &inner)?;
@@ -11008,20 +11271,17 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 // the program cannot be spawned.
                 self.extern_call_t1(
                     "pickle_run_spawn",
-                    vec![
-                        IrTy::Ptr,
-                        IrTy::Ptr,
-                        IrTy::Ptr,
-                        IrTy::Ptr,
-                        IrTy::Ptr,
-                    ],
+                    vec![IrTy::Ptr, IrTy::Ptr, IrTy::Ptr, IrTy::Ptr, IrTy::Ptr],
                     IrTy::Ptr,
                     temps,
                 )
             }
             "proc_wait" | "proc_running" | "proc_code" | "proc_kill" | "proc_in_close" => {
                 if args.len() != 1 || args[0].name.is_some() || args[0].spread {
-                    return self.bad(e.span, format!("`{name}(handle)` takes exactly one argument"));
+                    return self.bad(
+                        e.span,
+                        format!("`{name}(handle)` takes exactly one argument"),
+                    );
                 }
                 let h = self.expr(&args[0].value)?;
                 // `proc_code` returns an `int` box or `null` (`none`); the
@@ -11096,18 +11356,14 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 }
             }
             "captureBegin" => {
-                if !args.is_empty()
-                    || args.iter().any(|a| a.name.is_some() || a.spread)
-                {
+                if !args.is_empty() || args.iter().any(|a| a.name.is_some() || a.spread) {
                     return self.bad(e.span, "`captureBegin()` takes no arguments");
                 }
                 self.extern_call_void("pickle_test_capture_begin", vec![], vec![]);
                 Ok(self.unit_temp())
             }
             "captureTake" => {
-                if !args.is_empty()
-                    || args.iter().any(|a| a.name.is_some() || a.spread)
-                {
+                if !args.is_empty() || args.iter().any(|a| a.name.is_some() || a.spread) {
                     return self.bad(e.span, "`captureTake()` takes no arguments");
                 }
                 // Returns the captured failure message as a `string` object,
@@ -11150,7 +11406,7 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
     /// closure conversion or a boxing step, which is why it can be a table: the
     /// work is all in the runtime.
     fn flat_builtin(&self, name: &str) -> Option<FlatBuiltin> {
-        use IrTy::{Bool, Int, Ptr};
+        use IrTy::{Bool, Float, Int, Ptr};
         const INT: &[IrTy] = &[Int];
         const NONE: Option<IrTy> = None;
         Some(match name {
@@ -11158,9 +11414,19 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
             // to it: the new OS thread runs it, so the spawn cannot lower it.
             "thread_spawn" => ("pickle_thread_spawn", vec![Ptr], Some(Int), &["body"]),
             "thread_join" => ("pickle_thread_join", INT.to_vec(), Some(Bool), &["task"]),
-            "thread_finished" => ("pickle_thread_finished", INT.to_vec(), Some(Bool), &["task"]),
+            "thread_finished" => (
+                "pickle_thread_finished",
+                INT.to_vec(),
+                Some(Bool),
+                &["task"],
+            ),
             // A `string?` message: `null` when the task is running or was clean.
-            "thread_message" => ("pickle_thread_panic_message", INT.to_vec(), Some(Ptr), &["task"]),
+            "thread_message" => (
+                "pickle_thread_panic_message",
+                INT.to_vec(),
+                Some(Ptr),
+                &["task"],
+            ),
             "thread_count" => ("pickle_thread_count", vec![], Some(Int), &[]),
             "thread_current" => ("pickle_thread_current", vec![], Some(Int), &[]),
             "sleep_ms" => ("pickle_thread_sleep_ms", INT.to_vec(), NONE, &["ms"]),
@@ -11176,12 +11442,22 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
             "cond_wait" => ("pickle_cond_wait", vec![Int, Int], NONE, &["c", "m"]),
             "sem_new" => ("pickle_sem_new", INT.to_vec(), Some(Int), &["permits"]),
             "sem_acquire" => ("pickle_sem_acquire", vec![Int, Int], NONE, &["s", "n"]),
-            "sem_try_acquire" => ("pickle_sem_try_acquire", vec![Int, Int], Some(Bool), &["s", "n"]),
+            "sem_try_acquire" => (
+                "pickle_sem_try_acquire",
+                vec![Int, Int],
+                Some(Bool),
+                &["s", "n"],
+            ),
             "sem_release" => ("pickle_sem_release", vec![Int, Int], NONE, &["s", "n"]),
             "atomic_new" => ("pickle_atomic_new", INT.to_vec(), Some(Int), &["value"]),
             "atomic_load" => ("pickle_atomic_load", INT.to_vec(), Some(Int), &["a"]),
             "atomic_store" => ("pickle_atomic_store", vec![Int, Int], NONE, &["a", "value"]),
-            "atomic_add" => ("pickle_atomic_add", vec![Int, Int], Some(Int), &["a", "delta"]),
+            "atomic_add" => (
+                "pickle_atomic_add",
+                vec![Int, Int],
+                Some(Int),
+                &["a", "delta"],
+            ),
             "atomic_cas" => (
                 "pickle_atomic_cas",
                 vec![Int, Int, Int],
@@ -11190,22 +11466,58 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
             ),
             "once_new" => ("pickle_once_new", vec![], Some(Int), &[]),
             "once_done" => ("pickle_once_done", INT.to_vec(), Some(Bool), &["o"]),
-            "once_run" => ("pickle_once_run", vec![Int, Ptr], Some(Bool), &["o", "body"]),
+            "once_run" => (
+                "pickle_once_run",
+                vec![Int, Ptr],
+                Some(Bool),
+                &["o", "body"],
+            ),
             // Channels. Values cross the ABI as raw integers, boxed only by the
             // runtime when a receiver takes one out; a `try_recv` may come back
             // null (`none`).
             "channel_new" => ("pickle_channel_new", INT.to_vec(), Some(Int), &["cap"]),
             "channel_cap" => ("pickle_channel_cap", INT.to_vec(), Some(Int), &["ch"]),
             "channel_len" => ("pickle_channel_len", INT.to_vec(), Some(Int), &["ch"]),
-            "channel_send" => ("pickle_channel_send", vec![Int, Int], NONE, &["ch", "value"]),
-            "channel_try_send" => ("pickle_channel_try_send", vec![Int, Int], Some(Bool), &["ch", "value"]),
+            "channel_send" => (
+                "pickle_channel_send",
+                vec![Int, Int],
+                NONE,
+                &["ch", "value"],
+            ),
+            "channel_try_send" => (
+                "pickle_channel_try_send",
+                vec![Int, Int],
+                Some(Bool),
+                &["ch", "value"],
+            ),
             "channel_recv" => ("pickle_channel_recv", INT.to_vec(), Some(Int), &["ch"]),
             "channel_try_recv" => ("pickle_channel_try_recv", INT.to_vec(), Some(Ptr), &["ch"]),
             "channel_close" => ("pickle_channel_close", INT.to_vec(), NONE, &["ch"]),
             "channel_closed" => ("pickle_channel_closed", INT.to_vec(), Some(Bool), &["ch"]),
+                // Bit-reinterpret and class-name primitives. Both exist for the
+                // `pickle_print_obj` port in `pickle/runtime/abi_console.pkl`.
+                //
+                // `f64FromBits` has no source-level spelling: `x as float` is a
+                // *numeric* conversion, not a bitcast (verified - `1072693248 as
+                // float` yields `1072693248`, not `0.5`). It is the exact inverse
+                // of the boxing side, which stores `v.to_bits()`.
+                //
+                // `className` is the user-class fallback arm's lookup: the
+                // collector holds the descriptor name table, and without a symbol
+                // the arm had nothing to call. Returns a `string` object or
+                // `none`.
+                "f64FromBits" => ("pickle_f64_from_bits", INT.to_vec(), Some(Float), &["bits"]),
+                "className" => ("pickle_class_name", INT.to_vec(), Some(Ptr), &["classId"]),
             // Garbage collection. `bool` crosses the ABI as the C `bool` the
             // runtime extern takes, so it needs no boxing.
             "gcCollect" => ("pickle_gc_collect", vec![Bool], NONE, &["force"]),
+            // Observable GC contract: the counters/threshold that make the
+            // auto-collect decision drivable from Pickle (gc.rs:714/720/727).
+            // All three return/take `u32` across the ABI, so `Int` unboxed.
+            "gcAllocationsSinceGc" => ("pickle_gc_allocations_since_gc", vec![], Some(Int), &[]),
+            "gcBytesSinceGc" => ("pickle_gc_bytes_since_gc", vec![], Some(Int), &[]),
+            "gcCollectionCount" => ("pickle_gc_collection_count", vec![], Some(Int), &[]),
+            "gcSetThreshold" => ("pickle_gc_set_threshold", vec![Int], NONE, &["bytes"]),
             _ => return None,
         })
     }
@@ -11219,7 +11531,11 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
         params: &[&str],
     ) -> Result<Vec<Temp>, ()> {
         if args.len() != params.len() || args.iter().any(|a| a.name.is_some() || a.spread) {
-            let word = if params.len() == 1 { "argument" } else { "arguments" };
+            let word = if params.len() == 1 {
+                "argument"
+            } else {
+                "arguments"
+            };
             return self.bad(
                 e.span,
                 format!(
@@ -11353,14 +11669,14 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
             };
             arg_temps.push(t);
         }
-            let dst = self.temp();
-            self.instr(IrInstr::Call {
-                dst: Some(dst),
-                callee: Callee::Func(fid),
-                args: arg_temps,
-            });
-            self.guard_propagation(fid, e.span)?;
-            Ok(dst)
+        let dst = self.temp();
+        self.instr(IrInstr::Call {
+            dst: Some(dst),
+            callee: Callee::Func(fid),
+            args: arg_temps,
+        });
+        self.guard_propagation(fid, e.span)?;
+        Ok(dst)
     }
 
     /// Lower `name<Type,...>` used as a VALUE (not called): the explicit type
@@ -11636,14 +11952,14 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
             };
             arg_temps.push(t);
         }
-            let dst = self.temp();
-            self.instr(IrInstr::Call {
-                dst: Some(dst),
-                callee: Callee::Func(fid),
-                args: arg_temps,
-            });
-            self.guard_propagation(fid, e.span)?;
-            Ok(dst)
+        let dst = self.temp();
+        self.instr(IrInstr::Call {
+            dst: Some(dst),
+            callee: Callee::Func(fid),
+            args: arg_temps,
+        });
+        self.guard_propagation(fid, e.span)?;
+        Ok(dst)
     }
 
     /// Create the concrete instantiation of a generic function over `map`
@@ -11665,7 +11981,7 @@ ExprKind::Match { scrutinee, arms } => self.match_expr(e, scrutinee, arms),
                 format!("no declaration for generic function `{name}`"),
             );
         };
-if f.params.iter().any(|p| p.default.is_some() || p.rest) {
+        if f.params.iter().any(|p| p.default.is_some() || p.rest) {
             return self.bad(
                 span,
                 format!(
@@ -11690,7 +12006,7 @@ if f.params.iter().any(|p| p.default.is_some() || p.rest) {
                 .collect::<Vec<_>>()
                 .join("_")
         );
-let mut n = 0;
+        let mut n = 0;
         while self.module.funcs.iter().any(|f| f.symbol == symbol) {
             n += 1;
             symbol = format!("{symbol}_v{n}");
@@ -11726,10 +12042,8 @@ let mut n = 0;
             hidden_info.params = Vec::new();
             self.finfo.insert(hidden, hidden_info);
             self.instanton_subst.insert(hidden, map.clone());
-            self.fid_generics.insert(
-                hidden,
-                f.generics.iter().map(|g| g.name.clone()).collect(),
-            );
+            self.fid_generics
+                .insert(hidden, f.generics.iter().map(|g| g.name.clone()).collect());
 
             let wfid = FuncId(self.module.funcs.len());
             self.module.funcs.push(IrFunc {
@@ -11754,10 +12068,8 @@ let mut n = 0;
                     ..info.clone()
                 },
             );
-            self.src_param_tys.insert(
-                wfid,
-                params.iter().map(|p| p.ty.clone()).collect(),
-            );
+            self.src_param_tys
+                .insert(wfid, params.iter().map(|p| p.ty.clone()).collect());
             self.instanton_subst.insert(wfid, map.clone());
             self.fid_generics
                 .insert(wfid, f.generics.iter().map(|g| g.name.clone()).collect());
@@ -12140,7 +12452,7 @@ let mut n = 0;
                             .get(&fid)
                             .map(|i| i.ret.clone())
                             .unwrap_or(Ty::Unknown);
-return self.spread_static_call(
+                        return self.spread_static_call(
                             e,
                             SpreadCall {
                                 span: e.span,
@@ -12239,7 +12551,9 @@ return self.spread_static_call(
                             return self.bad(e.span, "`has` takes one argument");
                         }
                         let kt = self.expr(&args[0].value)?;
-                        let a_ty = self.ty_of(&args[0].value.span).unwrap_or_else(|| (*ktype).clone());
+                        let a_ty = self
+                            .ty_of(&args[0].value.span)
+                            .unwrap_or_else(|| (*ktype).clone());
                         let key = self.pack_map_key(&krep, kt, &a_ty, args[0].value.span)?;
                         self.extern_call_t1(
                             "pickle_map_has",
@@ -12253,7 +12567,9 @@ return self.spread_static_call(
                             return self.bad(e.span, "`get` takes one argument (a key)");
                         }
                         let k = self.expr(&args[0].value)?;
-                        let a_ty = self.ty_of(&args[0].value.span).unwrap_or_else(|| (*ktype).clone());
+                        let a_ty = self
+                            .ty_of(&args[0].value.span)
+                            .unwrap_or_else(|| (*ktype).clone());
                         let key = self.pack_map_key(&krep, k, &a_ty, args[0].value.span)?;
                         // Null when absent, else the stored boxed-scalar or
                         // managed pointer — exactly the `T?` representation,
@@ -12270,7 +12586,9 @@ return self.spread_static_call(
                             return self.bad(e.span, "`remove` takes one argument (a key)");
                         }
                         let k = self.expr(&args[0].value)?;
-                        let a_ty = self.ty_of(&args[0].value.span).unwrap_or_else(|| (*ktype).clone());
+                        let a_ty = self
+                            .ty_of(&args[0].value.span)
+                            .unwrap_or_else(|| (*ktype).clone());
                         let key = self.pack_map_key(&krep, k, &a_ty, args[0].value.span)?;
                         // The runtime returns the stored pointer (a boxed
                         // scalar or managed value) or null — exactly the `T?`
@@ -12647,9 +12965,7 @@ return self.spread_static_call(
             let src = self.src_param_tys.get(&fid).and_then(|v| v.get(i)).cloned();
             let mut t = self.borrow_arg(src.as_ref(), a)?;
             let fparam = self.callee_param_ir(fid, base + i, i, a.value.span);
-            if !matches!(src.as_ref(), Some(Ty::Ref(_)))
-                && matches!(fparam, Some(IrTy::Ptr))
-            {
+            if !matches!(src.as_ref(), Some(Ty::Ref(_))) && matches!(fparam, Some(IrTy::Ptr)) {
                 let vt = self.ty_of(&a.value.span).unwrap_or(Ty::Unknown);
                 t = self.option_wrap(t, &vt, a.value.span)?;
             }
@@ -12755,7 +13071,8 @@ return self.spread_static_call(
             v: zero,
         });
         let seq_l = self.load(seq_slot);
-        let len_t = self.extern_call_t1("pickle_list_len", vec![IrTy::Ptr], IrTy::Int, vec![seq_l])?;
+        let len_t =
+            self.extern_call_t1("pickle_list_len", vec![IrTy::Ptr], IrTy::Int, vec![seq_l])?;
         self.instr(IrInstr::StoreSlot {
             slot: len_slot,
             v: len_t,

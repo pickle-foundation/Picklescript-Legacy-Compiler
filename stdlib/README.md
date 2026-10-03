@@ -9,7 +9,7 @@ Seeds (see `docs/08-stdlib.md`, office `port/` tracker):
 - `text/` — string/byte builder, UTF-8 helpers, format; first seed
   `text/lexer.pkl` (the compiler lexer's scanner; validated at the time on the
   battery — see `tools/diff/port/`). The lexer seed is now legacy: the port's
-  flat `compiler-selfhost/{lexer,parser,resolve,check,emit}.pkl` slices took
+  flat `pickle/compiler/{lexer,parser,resolve,check,emit}.pkl` slices took
   over lexing/parsing/checking, and this tree is where `std.*`/`runtime.*`
   seeds live (`text/{utf8,stringbuilder,format}`, `collections/*`, `fs`, `os`,
   `json`, `io`, `process`, `test`).

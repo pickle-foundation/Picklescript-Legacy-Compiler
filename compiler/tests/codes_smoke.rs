@@ -358,6 +358,66 @@ fn real_diagnostics_carry_the_expected_code() {
     assert_eq!(diags[0].code, Some(ErrorCode::Index));
 }
 
+// ---- regression: `&&`/`||` must not re-check their operands -----------------
+//
+// `check_binary` already computes `lt`/`rt` via `check_expr(lhs)`/`check_expr(rhs)`.
+// An earlier version *also* called `check_bool_cond` on both operands, which made a
+// left-leaning `a || b || c` chain satisfy T(n) = 2*T(n-1): 20 terms took ~0.3s here
+// and ~8.2s in the self-hosted compiler, so real modules stopped compiling at all.
+// The same redundant walk also re-emitted any diagnostic the operands had already
+// produced, so `(1 + "x") || true` reported the inner `Add` error twice.
+
+#[test]
+fn logical_or_reports_each_operand_error_once() {
+    // Two bad operands: one condition error per operand, and nothing else.
+    let d = check_str("fn main() { let b = 1 || 2 }");
+    let diags = d.diagnostics.borrow();
+    assert_eq!(diags.len(), 2, "one condition error per operand: {diags:?}");
+    assert!(diags
+        .iter()
+        .all(|d| d.message == "condition must be a `bool`"));
+    drop(diags);
+
+    // The inner error must appear exactly once: the operands are type-checked
+    // once, so a nested error is not duplicated by the boolean context.
+    let d = check_str(r#"fn main() { let b = (1 + "x") || true }"#);
+    let diags = d.diagnostics.borrow();
+    let adds: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("operator `Add`"))
+        .collect();
+    assert_eq!(
+        adds.len(),
+        1,
+        "nested operand error must not be duplicated: {diags:?}"
+    );
+    assert_eq!(adds[0].code, Some(ErrorCode::Operator));
+    let conds: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message == "condition must be a `bool`")
+        .collect();
+    assert_eq!(conds.len(), 1, "one condition error for the `int` side");
+    drop(diags);
+}
+
+#[test]
+fn logical_chains_are_checked_once_per_operand() {
+    // A long chain is the shape that used to blow up exponentially. Keep it long
+    // enough that a reintroduced double-walk is unmistakable, and assert it stays
+    // linear-ish by bounding the work rather than the clock (no timing asserts).
+    let terms = (0..64).map(|i| format!("s == \"t{i}\"")).collect::<Vec<_>>();
+    let src = format!(
+        "fn pick(s: string) -> bool {{ {} }}",
+        terms.join(" || ")
+    );
+    let d = check_str(&src);
+    let diags = d.diagnostics.borrow();
+    assert!(
+        diags.is_empty(),
+        "a well-typed 64-term chain must check clean: {diags:?}"
+    );
+}
+
 #[test]
 fn parse_and_lex_errors_get_e0111_and_e0101() {
     let d = check_str("fn main() { let = }");

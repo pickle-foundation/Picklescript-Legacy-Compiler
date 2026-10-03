@@ -29,6 +29,11 @@ const CELL_BYTES: u32 = 8;
 /// Alignment of compiled code chunks inside the executable mapping.
 const CODE_ALIGN: usize = 16;
 
+/// Slot width for a top-level `var` cell in the JIT mapping. Every global is
+/// padded to this so a load/store of any supported scalar type stays in bounds
+/// even when its initializer is shorter.
+const DATA_ALIGN: usize = 8;
+
 fn align_up(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
 }
@@ -302,6 +307,16 @@ fn analyze(func: &IrFunc, module: &IrModule) -> Plan {
                 IrInstr::LoadRaw { dst, ty, .. } => {
                     tt.insert(dst.0, *ty);
                 }
+                // The address of a global is a raw code/data pointer, so it is
+                // tagged `Int` deliberately: a data symbol must never land in
+                // the shadow frame as a managed pointer.
+                IrInstr::GlobalAddr { dst, .. } => {
+                    tt.insert(dst.0, IrTy::Int);
+                }
+                IrInstr::LoadGlobal { dst, ty, .. } => {
+                    tt.insert(dst.0, *ty);
+                }
+                IrInstr::StoreGlobal { .. } => {}
                 IrInstr::StoreRaw { .. } => {}
                 IrInstr::Call { dst, callee, .. } => {
                     let ret = match callee {
@@ -379,6 +394,30 @@ fn extern_pair(
     (sr, gv)
 }
 
+/// A `GlobalValue` for a module data symbol (a `pkl_strdata_*` or
+/// `pkl_global_*` block). Separate from [`extern_pair`] because the cache key
+/// is the symbol alone: data has no signature, and reusing a function
+/// signature here would be meaningless.
+fn data_pair(
+    builder: &mut FunctionBuilder,
+    cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
+    symbol: &str,
+) -> GlobalValue {
+    if let Some(p) = cache.get(symbol) {
+        return p.1;
+    }
+    let sig = extern_signature(&[], IrTy::Unit);
+    let sr = builder.import_signature(sig.clone());
+    let gv = builder.create_global_value(GlobalValueData::Symbol {
+        name: ExternalName::testcase(symbol),
+        offset: Imm64::new(0),
+        colocated: false,
+        tls: false,
+    });
+    cache.insert(symbol.to_string(), (sr, gv, sig));
+    gv
+}
+
 /// Store `v` into the shadow frame cell of managed temp `dst`.
 fn write_through(
     builder: &mut FunctionBuilder,
@@ -391,6 +430,14 @@ fn write_through(
         let fr = frame.expect("managed temp implies shadow frame");
         builder.ins().stack_store(v, fr, cell_offset(cell));
     }
+}
+
+/// `PKL_GC_CHECK` call-chain hook installed by [`Jit::link`].
+///
+/// # Safety
+/// Called by the runtime from inside a JIT'd frame with a live stack pointer.
+unsafe extern "C" fn gc_check_caller_hook(sp: usize, tag_ptr: usize, tag_len: usize) {
+    crate::iced::print_call_chain(sp, tag_ptr, tag_len);
 }
 
 /// A single compiled function: its bytes and the absolute relocations against
@@ -421,6 +468,17 @@ impl Jit {
         flag_builder
             .set("is_pic", "false")
             .with_context(|| "cannot set is_pic=false")?;
+        // `opt_level=speed` was tried and measured against `irxonly.pkl` on
+        // `pickle/compiler/check.pkl` with a warm lowering cache, three runs
+        // each: JIT 0.92-0.96s at the default `none` versus 1.68s at `speed`,
+        // and the guest phase was no better either (5.75-5.89s versus
+        // 6.56-6.91s). The extra passes cost more to run than they save, so the
+        // default stays `none`. `PKL_JIT_OPT=speed` re-runs the experiment, and
+        // is also the knob to bisect a miscompile against optimized code.
+        let opt_level = std::env::var("PKL_JIT_OPT").unwrap_or_else(|_| "none".to_string());
+        flag_builder
+            .set("opt_level", &opt_level)
+            .with_context(|| "cannot set opt_level")?;
         // Compile speed matters more than catching backend bugs we have
         // already exercised: the verifier re-checks every CLIF function and
         // adds noticeable fixed cost per function for large modules (e.g.
@@ -660,7 +718,7 @@ const SLOT_BYTES: i64 = 8;
 /// bookkeeping), `Ok(false)` when the caller should fall through to the
 /// generic indirect-call path.
 #[allow(clippy::too_many_arguments)]
-  fn try_inline_extern_call(
+fn try_inline_extern_call(
     plan: &Plan,
     builder: &mut FunctionBuilder,
     frame: Option<StackSlot>,
@@ -693,15 +751,26 @@ const SLOT_BYTES: i64 = 8;
             let slot = iargs[1];
             let zero = builder.ins().iconst(types::I64, 0);
             let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
-            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
-            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let nonneg = builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
+            let sz32 = builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                obj,
+                Offset32::new(OBJ_SIZE_OFF as i32),
+            );
             let sz = builder.ins().uextend(types::I64, sz32);
             let c32 = builder.ins().iconst(types::I64, 32);
-            let big_enough = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let big_enough = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
             let sz_m32 = builder.ins().isub(sz, c32);
             let c3 = builder.ins().iconst(types::I64, 3);
             let slots = builder.ins().ushr(sz_m32, c3);
-            let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
+            let in_bounds = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
             let nn = builder.ins().band(not_null, nonneg);
             let be = builder.ins().band(big_enough, in_bounds);
             let valid = builder.ins().band(nn, be);
@@ -709,9 +778,16 @@ const SLOT_BYTES: i64 = 8;
             let sh = builder.ins().ishl(slot, c3);
             let inner = builder.ins().iadd(off, sh);
             let addr = builder.ins().iadd(obj, inner);
-            let merge = emit_guarded_load(builder, call_cache, symbol, params, ret, iargs, valid, |b| {
-                b.ins().load(types::I64, MemFlags::trusted(), addr, 0)
-            });
+            let merge = emit_guarded_load(
+                builder,
+                call_cache,
+                symbol,
+                params,
+                ret,
+                iargs,
+                valid,
+                |b| b.ins().load(types::I64, MemFlags::trusted(), addr, 0),
+            );
             finish(builder, values, builder.block_params(merge)[0]);
             Ok(true)
         }
@@ -721,15 +797,26 @@ const SLOT_BYTES: i64 = 8;
             let slot = iargs[1];
             let zero = builder.ins().iconst(types::I64, 0);
             let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
-            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
-            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let nonneg = builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, slot, zero);
+            let sz32 = builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                obj,
+                Offset32::new(OBJ_SIZE_OFF as i32),
+            );
             let sz = builder.ins().uextend(types::I64, sz32);
             let c32 = builder.ins().iconst(types::I64, 32);
-            let big_enough = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let big_enough = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
             let sz_m32 = builder.ins().isub(sz, c32);
             let c3 = builder.ins().iconst(types::I64, 3);
             let slots = builder.ins().ushr(sz_m32, c3);
-            let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
+            let in_bounds = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThanOrEqual, slot, slots);
             let nn = builder.ins().band(not_null, nonneg);
             let be = builder.ins().band(big_enough, in_bounds);
             let valid = builder.ins().band(nn, be);
@@ -737,7 +824,9 @@ const SLOT_BYTES: i64 = 8;
             let sh = builder.ins().ishl(slot, c3);
             let inner = builder.ins().iadd(off, sh);
             let addr = builder.ins().iadd(obj, inner);
-            emit_guarded_store(builder, call_cache, symbol, params, ret, iargs, valid, addr, iargs[2]);
+            emit_guarded_store(
+                builder, call_cache, symbol, params, ret, iargs, valid, addr, iargs[2],
+            );
             Ok(true)
         }
         // `pickle_enum_tag(obj) -> int`: unguarded load of the tag i64 at +24.
@@ -754,11 +843,20 @@ const SLOT_BYTES: i64 = 8;
             let idx = iargs[1];
             let zero = builder.ins().iconst(types::I64, 0);
             let not_null = builder.ins().icmp(IntCC::NotEqual, obj, zero);
-            let nonneg = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx, zero);
-            let sz32 = builder.ins().load(types::I32, MemFlags::trusted(), obj, Offset32::new(OBJ_SIZE_OFF as i32));
+            let nonneg = builder
+                .ins()
+                .icmp(IntCC::SignedGreaterThanOrEqual, idx, zero);
+            let sz32 = builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                obj,
+                Offset32::new(OBJ_SIZE_OFF as i32),
+            );
             let sz = builder.ins().uextend(types::I64, sz32);
             let c32 = builder.ins().iconst(types::I64, 32);
-            let sz_ge_32 = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
+            let sz_ge_32 = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, sz, c32);
             let sz_m32 = builder.ins().isub(sz, c32);
             let sat = builder.ins().select(sz_ge_32, sz_m32, zero);
             let c3 = builder.ins().iconst(types::I64, 3);
@@ -766,13 +864,22 @@ const SLOT_BYTES: i64 = 8;
             let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, count);
             let nn = builder.ins().band(not_null, nonneg);
             let valid = builder.ins().band(nn, in_bounds);
-            let off = builder.ins().iconst(types::I64, OBJ_PAYLOAD_OFF + SLOT_BYTES);
+            let off = builder
+                .ins()
+                .iconst(types::I64, OBJ_PAYLOAD_OFF + SLOT_BYTES);
             let sh = builder.ins().ishl(idx, c3);
             let inner = builder.ins().iadd(off, sh);
             let addr = builder.ins().iadd(obj, inner);
-            let merge = emit_guarded_load(builder, call_cache, symbol, params, ret, iargs, valid, |b| {
-                b.ins().load(types::I64, MemFlags::trusted(), addr, 0)
-            });
+            let merge = emit_guarded_load(
+                builder,
+                call_cache,
+                symbol,
+                params,
+                ret,
+                iargs,
+                valid,
+                |b| b.ins().load(types::I64, MemFlags::trusted(), addr, 0),
+            );
             finish(builder, values, builder.block_params(merge)[0]);
             Ok(true)
         }
@@ -787,7 +894,13 @@ const SLOT_BYTES: i64 = 8;
             let slow = builder.create_block();
             let merge = builder.create_block();
             builder.append_block_param(merge, types::I64);
-            builder.ins().brif(not_null, merge, &[BlockArg::Value(fast)], slow, &[] as &[BlockArg]);
+            builder.ins().brif(
+                not_null,
+                merge,
+                &[BlockArg::Value(fast)],
+                slow,
+                &[] as &[BlockArg],
+            );
             builder.switch_to_block(slow);
             let slow_v = call_extern_value(builder, call_cache, symbol, params, ret, iargs);
             builder.ins().jump(merge, &[BlockArg::Value(slow_v)]);
@@ -803,7 +916,7 @@ const SLOT_BYTES: i64 = 8;
 /// case loads via `addr` and the cold case calls the original native. Returns
 /// the merge block whose first parameter is the result.
 #[allow(clippy::too_many_arguments)]
-  fn emit_guarded_load(
+fn emit_guarded_load(
     builder: &mut FunctionBuilder,
     call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
     symbol: &str,
@@ -817,7 +930,13 @@ const SLOT_BYTES: i64 = 8;
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
     let fast = fast_load(builder);
-    builder.ins().brif(valid, merge, &[BlockArg::Value(fast)], slow, &[] as &[BlockArg]);
+    builder.ins().brif(
+        valid,
+        merge,
+        &[BlockArg::Value(fast)],
+        slow,
+        &[] as &[BlockArg],
+    );
     builder.switch_to_block(slow);
     let slow_v = call_extern_value(builder, call_cache, symbol, params, ret, iargs);
     builder.ins().jump(merge, &[BlockArg::Value(slow_v)]);
@@ -828,7 +947,7 @@ const SLOT_BYTES: i64 = 8;
 /// Shared tail of the guarded-store inline paths: store through `addr` on the
 /// fast path, call the original native on the cold path.
 #[allow(clippy::too_many_arguments)]
-  fn emit_guarded_store(
+fn emit_guarded_store(
     builder: &mut FunctionBuilder,
     call_cache: &mut HashMap<String, (SigRef, GlobalValue, Signature)>,
     symbol: &str,
@@ -842,7 +961,9 @@ const SLOT_BYTES: i64 = 8;
     let fast = builder.create_block();
     let slow = builder.create_block();
     let done = builder.create_block();
-    builder.ins().brif(valid, fast, &[] as &[BlockArg], slow, &[] as &[BlockArg]);
+    builder
+        .ins()
+        .brif(valid, fast, &[] as &[BlockArg], slow, &[] as &[BlockArg]);
     builder.switch_to_block(fast);
     builder.ins().store(MemFlags::trusted(), value, addr, 0);
     builder.ins().jump(done, &[] as &[BlockArg]);
@@ -853,7 +974,7 @@ const SLOT_BYTES: i64 = 8;
 }
 
 #[allow(clippy::too_many_arguments)]
-  fn lower_instr(
+fn lower_instr(
     module: &IrModule,
     func: &IrFunc,
     plan: &Plan,
@@ -1068,7 +1189,12 @@ const SLOT_BYTES: i64 = 8;
             // (Was the missing `write_through` here that made the selfhost emit
             // non-deterministic under auto-GC: a slot-reuse pattern left a map
             // key/holder only in a CLIF register at a safe point.)
-            if is_managed(func.slots.get(slot.0 as usize).copied().unwrap_or(IrTy::Ptr)) {
+            if is_managed(
+                func.slots
+                    .get(slot.0 as usize)
+                    .copied()
+                    .unwrap_or(IrTy::Ptr),
+            ) {
                 write_through(builder, plan, frame, dst.0, v);
             }
         }
@@ -1098,6 +1224,27 @@ const SLOT_BYTES: i64 = 8;
         IrInstr::StoreRaw { addr, v, ty } => {
             let a = *values.get(&addr.0).context("storeraw address")?;
             let x = *values.get(&v.0).context("storeraw value")?;
+            builder.ins().store(MemFlags::trusted(), x, a, 0);
+            let _ = ty;
+        }
+        IrInstr::GlobalAddr { dst, id } => {
+            let gv = data_pair(builder, call_cache, &module.globals[*id].symbol);
+            let v = builder.ins().symbol_value(types::I64, gv);
+            values.insert(dst.0, v);
+        }
+        IrInstr::LoadGlobal { dst, id, ty } => {
+            let gv = data_pair(builder, call_cache, &module.globals[*id].symbol);
+            let a = builder.ins().symbol_value(types::I64, gv);
+            let v = builder.ins().load(clif_ty(*ty), MemFlags::trusted(), a, 0);
+            values.insert(dst.0, v);
+            if is_managed(*ty) {
+                write_through(builder, plan, frame, dst.0, v);
+            }
+        }
+        IrInstr::StoreGlobal { id, v, ty } => {
+            let gv = data_pair(builder, call_cache, &module.globals[*id].symbol);
+            let a = builder.ins().symbol_value(types::I64, gv);
+            let x = *values.get(&v.0).context("storeglobal value")?;
             builder.ins().store(MemFlags::trusted(), x, a, 0);
             let _ = ty;
         }
@@ -1132,16 +1279,7 @@ const SLOT_BYTES: i64 = 8;
             }
             if let Callee::Extern(_) = callee {
                 if try_inline_extern_call(
-                    plan,
-                    builder,
-                    frame,
-                    &name,
-                    &params,
-                    ret,
-                    &iargs,
-                    values,
-                    call_cache,
-                    *dst,
+                    plan, builder, frame, &name, &params, ret, &iargs, values, call_cache, *dst,
                 )? {
                     return Ok(());
                 }
@@ -1305,7 +1443,11 @@ fn runtime_addr(name: &str) -> Option<usize> {
 /// Register every runtime ABI function into the crash reporter so native
 /// pickle_* frames get names in backtraces. Call once at startup.
 pub fn register_runtime_symbols() {
-    for name in pickle_runtime::ALL_ABI_NAMES.iter().copied().chain(["pickle_fmod"]) {
+    for name in pickle_runtime::ALL_ABI_NAMES
+        .iter()
+        .copied()
+        .chain(["pickle_fmod"])
+    {
         if let Some(a) = runtime_addr(name) {
             crate::iced::register_native(name, a);
         }
@@ -1456,6 +1598,15 @@ impl Jit {
             str_offs.push(cursor);
             cursor += s.len();
         }
+        // Top-level `var` slots. Unlike the string blobs these are *written*,
+        // so each gets a full 8-byte cell regardless of how small the declared
+        // type looks; the init bytes are copied over the zeroed cell.
+        let mut glob_offs = Vec::with_capacity(module.globals.len());
+        for _g in &module.globals {
+            cursor = align_up(cursor, DATA_ALIGN);
+            glob_offs.push(cursor);
+            cursor += DATA_ALIGN;
+        }
         let total = align_up(cursor, CODE_ALIGN);
         let base = mem::alloc(total).with_context(|| "cannot allocate executable memory")?;
 
@@ -1476,6 +1627,27 @@ impl Jit {
                 std::ptr::copy_nonoverlapping(s.as_ptr(), base.add(str_offs[i]), s.len());
             }
         }
+        // The mapping is already zeroed by `mem::alloc`, so a global with no
+        // initializer needs no copy -- only an explicit one must be written,
+        // and it must never exceed its cell.
+        for (i, g) in module.globals.iter().enumerate() {
+            let Some(bytes) = &g.init else { continue };
+            assert!(
+                bytes.len() <= DATA_ALIGN,
+                "global `{}` initializer is {} bytes, over the {DATA_ALIGN}-byte cell",
+                g.symbol,
+                bytes.len()
+            );
+            // SAFETY: `bytes.len() <= DATA_ALIGN` and the cell is inside the
+            // mapping; the cell is distinct per global so no overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    base.add(glob_offs[i]),
+                    bytes.len(),
+                );
+            }
+        }
 
         // Symbol table over absolute addresses.
         let mut symbols: HashMap<String, usize> = HashMap::new();
@@ -1484,6 +1656,9 @@ impl Jit {
         }
         for (i, _s) in module.strings.iter().enumerate() {
             symbols.insert(format!("pkl_strdata_{i}"), base as usize + str_offs[i]);
+        }
+        for (i, g) in module.globals.iter().enumerate() {
+            symbols.insert(g.symbol.clone(), base as usize + glob_offs[i]);
         }
         for (i, f) in cf.iter().enumerate() {
             for r in &f.relocs {
@@ -1514,6 +1689,9 @@ impl Jit {
         // test runner, which addresses each test directly by symbol.
         let entry = symbols.get("pickle_main").copied().unwrap_or(0);
         crate::iced::register_code_range(base as usize, total, symbols.clone());
+        // `PKL_GC_CHECK` probes report the JIT call chain of a dead/mistyped
+        // managed argument; this is the only symbol resolver they can reach.
+        pickle_runtime::abi::pickle_gc_set_caller_hook(gc_check_caller_hook as *const () as usize);
         Ok(JitProgram {
             base,
             len: total,

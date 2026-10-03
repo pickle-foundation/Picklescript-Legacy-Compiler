@@ -32,6 +32,56 @@ const INITIAL_CAP: usize = 16;
 const MAX_LOAD: f64 = 0.7;
 
 /// FNV-1a over a string's bytes.
+/// Debug probe (`PKL_GC_CHECK`): a managed container argument must still be a
+/// live heap block *of the expected builtin class*. Enabled builds turn a
+/// premature free — or a pointer of the wrong shape, which reads as garbage
+/// header fields — into a named panic at the argument site instead of a
+/// mistyped pointer read further down.
+#[inline]
+fn gc_check_obj(p: *const PickleObject, what: &str) {
+    if !crate::gc::gc_check_enabled() || p.is_null() {
+        return;
+    }
+    if core::ptr::eq(p, nil_sentinel()) || core::ptr::eq(p, none_key()) {
+        return;
+    }
+    let gc = crate::gc::gc_mut();
+    if !gc.heap.debug_live_block(p) {
+        crate::gc::report_call_site(what);
+        panic!("pickle: UAF: {what} argument {p:?} is not a live heap block");
+    }
+    let class_id = unsafe { (*p).class_id };
+    if !matches!(
+        class_id,
+        crate::object::PICKLE_CLASS_STRING
+            | crate::object::PICKLE_CLASS_LIST
+            | crate::object::PICKLE_CLASS_MAP
+            | crate::object::PICKLE_CLASS_TUPLE
+            | crate::object::PICKLE_CLASS_ENUM
+            | crate::object::PICKLE_CLASS_BOX_INT
+            | crate::object::PICKLE_CLASS_BOX_FLOAT
+            | crate::object::PICKLE_CLASS_BOX_BOOL
+            | crate::object::PICKLE_CLASS_BOX_CHAR
+            | crate::object::PICKLE_CLASS_STREAM
+    ) {
+        crate::gc::report_call_site(what);
+        panic!("pickle: bad argument: {what} argument {p:?} has class {class_id}");
+    }
+}
+
+/// Debug probe for a container argument whose class the caller requires.
+#[inline]
+fn gc_check_map(p: *const PickleObject, what: &str) {
+    gc_check_obj(p, what);
+    if crate::gc::gc_check_enabled() && !p.is_null() {
+        let class_id = unsafe { (*p).class_id };
+        if class_id != crate::object::PICKLE_CLASS_MAP {
+            crate::gc::report_call_site(what);
+            panic!("pickle: bad argument: {what} argument {p:?} is class {class_id}, not a map");
+        }
+    }
+}
+
 fn fnv1a(bytes: *const u8, len: usize) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     unsafe {
@@ -52,6 +102,8 @@ fn fnv1a(bytes: *const u8, len: usize) -> u64 {
 /// back to *root-identity* hashing: identity is the one strength-safe
 /// semantics for cyclic structures.
 fn key_hash(key: *const PickleObject) -> u64 {
+    gc_check_obj(key, "map key_hash");
+
     unsafe {
         // A `none` key (null to the outside, the canonical sentinel to the
         // table) is one distinguished identity: its hash matches the fixed
@@ -131,8 +183,9 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
         // observed in the selfhost build). Hash by identity instead of
         // trampling a free-list block; lookups then miss rather than corrupt.
         if class_id == crate::heap::FREE_SENTINEL {
-            let eh =
-                0xcbf29ce484222325u64 ^ (class_id as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ (obj as u64);
+            let eh = 0xcbf29ce484222325u64
+                ^ (class_id as u64).wrapping_mul(0x9e3779b97f4a7c15)
+                ^ (obj as u64);
             return (eh.wrapping_mul(0x100000001b3), false);
         }
         let mut h: u64 = 0xcbf29ce484222325;
@@ -220,7 +273,7 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
                 // User class/struct/interface instance: class identity + slots.
                 mix(&mut h, class_id as u64);
                 let size = (*obj).size as usize;
-                let header = crate::object::pickle_header_size() as usize;
+                let header = crate::object::pickle_header_size();
                 // A block header reporting an absurd size is a stale/reused key
                 // (freed at a collection, reallocated since). Hashing its raw
                 // slots would walk arbitrary memory (previously a misaligned
@@ -231,7 +284,7 @@ fn deep_hash(obj: *const PickleObject, path: &mut Vec<*const PickleObject>) -> (
                         ^ (obj as u64);
                     return (eh.wrapping_mul(0x100000001b3), false);
                 }
-                let slots = size.saturating_sub(crate::object::pickle_header_size() as usize) / 8;
+                let slots = size.saturating_sub(crate::object::pickle_header_size()) / 8;
                 let mut i = 0usize;
                 while i < slots {
                     let (sh, sc) = deep_hash((*obj).slot(i), path);
@@ -518,7 +571,9 @@ fn rehash(
     gc: &mut Gc,
 ) -> *mut MapEntry {
     unsafe {
-        let fresh = gc.heap.raw_alloc(new_cap * core::mem::size_of::<MapEntry>());
+        let fresh = gc
+            .heap
+            .raw_alloc(new_cap * core::mem::size_of::<MapEntry>());
         core::ptr::write_bytes(fresh, 0, new_cap * core::mem::size_of::<MapEntry>());
         let fresh = fresh as *mut MapEntry;
         for i in 0..old_cap {
@@ -578,6 +633,9 @@ pub fn map_set(
 
 /// Look up `key`; returns null when absent.
 pub fn map_get(map: *const PickleObject, key: *const PickleObject) -> *mut PickleObject {
+    gc_check_map(map, "map_get");
+    gc_check_obj(key, "map_get key");
+
     unsafe {
         let key = if key.is_null() { none_key() } else { key };
         let key_hash = key_hash(key);
@@ -629,13 +687,17 @@ pub fn map_remove(map: *mut PickleObject, key: *const PickleObject) -> *mut Pick
 
 /// Number of live entries.
 pub fn map_len_of(map: *const PickleObject) -> usize {
+    gc_check_map(map, "map_len_of");
+
     map_len(map)
 }
 
 /// Materialize the live keys (or values) as a fresh `List`.
 fn map_snapshot(map: *const PickleObject, want_keys: bool) -> *mut PickleObject {
+    gc_check_map(map, "map_snapshot");
     let gc = crate::gc::gc_mut();
     let l = crate::list::list_new(0, gc);
+    gc_check_map(map, "map_snapshot/after list_new");
     let cap = map_cap(map);
     let entries = map_entries(map);
     unsafe {

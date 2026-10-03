@@ -75,9 +75,7 @@ fn a_program_with_no_throw_references_no_exception_symbol() {
 
 #[test]
 fn a_call_to_a_throwing_function_gets_a_check() {
-    let m = lower(
-        "fn boom() -> int { throw \"x\" }\nfn main() { println(boom()) }",
-    );
+    let m = lower("fn boom() -> int { throw \"x\" }\nfn main() { println(boom()) }");
     assert_eq!(
         pending_checks(&m),
         1,

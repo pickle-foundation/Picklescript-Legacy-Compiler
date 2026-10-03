@@ -171,6 +171,11 @@ pub struct IrFunc {
     /// `true` for tests.
     pub is_test: bool,
     /// `#[tag("…")]` tags carried by test items (empty for non-tests).
+    /// `#[tag("…")]` filters, hex-encoded by `irx_serialize` and whitespace
+    /// delimited on the `tags` line. A tag must therefore be non-empty: an
+    /// empty one serializes to a bare trailing space that the reader tokenizes
+    /// away, and the round trip would fail the tag count. The emitter drops
+    /// empty tags rather than writing one.
     pub tags: Vec<String>,
 }
 
@@ -252,6 +257,24 @@ pub enum IrInstr {
         dst: Temp,
         slot: Slot,
     },
+    /// Raw address (`Int`) of the data symbol backing global `id`. The escape
+    /// route to `&g`, and what makes a global reachable by the GC root scan.
+    GlobalAddr {
+        dst: Temp,
+        id: usize,
+    },
+    /// Read global `id` as `ty`.
+    LoadGlobal {
+        dst: Temp,
+        id: usize,
+        ty: IrTy,
+    },
+    /// Write `v` into global `id` as `ty`.
+    StoreGlobal {
+        id: usize,
+        v: Temp,
+        ty: IrTy,
+    },
     /// Load a scalar of `ty` through a raw address (`Int`) temp.
     LoadRaw {
         dst: Temp,
@@ -298,6 +321,23 @@ pub enum IrTerm {
     Unreachable,
 }
 
+/// A top-level mutable slot: one data symbol with an optional initializer.
+///
+/// `init` is a *constant* expression (never a load from another global)
+/// because it runs before `main`, in program order, with no frame to evaluate
+/// in. That restriction keeps the image a pure data blob and makes ordering
+/// cycles impossible rather than merely diagnosed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrGlobal {
+   /// Linker-facing symbol, e.g. `pkl_global_<module>_<name>`.
+   pub symbol: String,
+   pub ty: IrTy,
+   /// Whether `ty` came from an explicit annotation (drives width of the slot).
+   pub ty_explicit: bool,
+   /// Little-endian initial bytes. `Some(empty)` means zero-init (`.bss`).
+   pub init: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IrModule {
     pub funcs: Vec<IrFunc>,
@@ -306,6 +346,8 @@ pub struct IrModule {
     pub funcs_by_name: HashMap<String, FuncId>,
     /// String literal data.
     pub strings: Vec<Vec<u8>>,
+    /// Top-level mutable slots, emitted into `.data`/`.bss`.
+    pub globals: Vec<IrGlobal>,
 }
 
 impl IrModule {
@@ -438,6 +480,21 @@ impl fmt::Display for IrInstr {
                     temp_name(*v),
                     temp_name(*addr)
                 )
+            }
+            IrInstr::GlobalAddr { dst, id } => {
+                write!(f, "gaddr {} -> global#{}", temp_name(*dst), id)
+            }
+            IrInstr::LoadGlobal { dst, id, ty } => {
+                write!(
+                    f,
+                    "loadglobal.{} global#{} -> {}",
+                    ty,
+                    id,
+                    temp_name(*dst)
+                )
+            }
+            IrInstr::StoreGlobal { id, v, ty } => {
+                write!(f, "storeglobal.{} {} -> global#{}", ty, temp_name(*v), id)
             }
             IrInstr::Call { dst, callee, args } => {
                 let callee = match callee {
@@ -628,6 +685,21 @@ pub fn irx_serialize(m: &IrModule) -> String {
     for (i, s) in m.strings.iter().enumerate() {
         out.push_str(&format!("string {i} {}\n", hex(s)));
     }
+    out.push_str(&format!("irx globals {}\n", m.globals.len()));
+    for (i, g) in m.globals.iter().enumerate() {
+        out.push_str(&format!(
+            "global {i} {} {} {}\n",
+            tok_text(&g.symbol),
+            usize::from(g.ty_explicit),
+            g.ty
+        ));
+        match &g.init {
+            // `-` means zero-init (emitted into .bss); anything else is
+            // little-endian init bytes (.data).
+            None => out.push_str("ginit -\n"),
+            Some(b) => out.push_str(&format!("ginit {}\n", hex(b))),
+        }
+    }
     out.push_str(&format!("irx funcs {}\n", m.funcs.len()));
     for (i, f) in m.funcs.iter().enumerate() {
         out.push_str(&format!(
@@ -724,9 +796,16 @@ fn irx_instr_str(i: IrInstr) -> String {
         IrInstr::LoadRaw { dst, addr, ty } => {
             format!("loadraw {} {} {}", tok_temp(dst), ty, tok_temp(addr))
         }
-        IrInstr::StoreRaw { addr, v, ty } => {
-            format!("storeraw {} {} {}", ty, tok_temp(v), tok_temp(addr))
-        }
+IrInstr::StoreRaw { addr, v, ty } => {
+              format!("storeraw {} {} {}", ty, tok_temp(v), tok_temp(addr))
+          }
+          IrInstr::GlobalAddr { dst, id } => format!("gaddr {} {}", tok_temp(dst), id),
+          IrInstr::LoadGlobal { dst, id, ty } => {
+              format!("loadglobal {} {} {}", tok_temp(dst), id, ty)
+          }
+          IrInstr::StoreGlobal { id, v, ty } => {
+              format!("storeglobal {} {} {}", id, ty, tok_temp(v))
+          }
         IrInstr::Call { dst, callee, args } => {
             let cal = match callee {
                 Callee::Func(id) => format!("fn {id}"),
@@ -800,6 +879,7 @@ impl IrModule {
             externs: Vec::new(),
             funcs_by_name: HashMap::new(),
             strings: Vec::new(),
+            globals: Vec::new(),
         };
         let mut cur_func: Option<usize> = None;
         for (lineno, raw) in text.lines().enumerate() {
@@ -827,12 +907,20 @@ impl IrModule {
                             let n: usize = toks[2].parse().map_err(|_| err("bad funcs count"))?;
                             module.funcs.reserve(n);
                         }
+                        "globals" => {
+                            let n: usize = toks[2].parse().map_err(|_| err("bad globals count"))?;
+                            module.globals.reserve(n);
+                        }
                         v => return Err(err(&format!("unknown irx section {v}"))),
                     }
                 }
                 // `extern <i> <hexsymbol>` then `esig <p1> <p2> ... <ret>`.
                 "extern" => {
-                    let _id: usize = toks[1].parse().map_err(|_| err("bad extern id"))?;
+                    let _id: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad extern id"))?
+                        .parse()
+                        .map_err(|_| err("bad extern id"))?;
                     let sym = unhex(toks.get(2).copied().unwrap_or(""))
                         .and_then(|b| String::from_utf8(b).ok())
                         .ok_or_else(|| err("bad extern symbol"))?;
@@ -843,6 +931,9 @@ impl IrModule {
                     });
                 }
                 "esig" => {
+                    if toks.len() < 2 {
+                        return Err(err("esig needs a ret ty"));
+                    }
                     let ret = parse_irx_ty(toks.last().copied().unwrap_or(""))
                         .ok_or_else(|| err("bad esig ret"))?;
                     let mut params = Vec::new();
@@ -857,24 +948,76 @@ impl IrModule {
                     ex.ret = ret;
                 }
                 "string" => {
-                    let _id: usize = toks[1].parse().map_err(|_| err("bad string id"))?;
+                    let _id: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad string id"))?
+                        .parse()
+                        .map_err(|_| err("bad string id"))?;
                     let bytes = unhex(toks.get(2).copied().unwrap_or(""))
                         .ok_or_else(|| err("bad string bytes"))?;
                     module.strings.push(bytes);
                 }
+                // `global <i> <hexsymbol> <typedeclared> <ty>` then `ginit -` or `ginit <hex>`.
+                "global" => {
+                    let _id: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad global id"))?
+                        .parse()
+                        .map_err(|_| err("bad global id"))?;
+                    let symbol = unhex(toks.get(2).copied().unwrap_or(""))
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .ok_or_else(|| err("bad global symbol"))?;
+                    let explicit = toks.get(3).ok_or_else(|| err("bad global flag"))?;
+                    let ty = parse_irx_ty(toks.get(4).copied().unwrap_or(""))
+                        .ok_or_else(|| err("bad global ty"))?;
+                    module.globals.push(IrGlobal {
+                        symbol,
+                        ty,
+                        ty_explicit: *explicit == "1",
+                        init: None,
+                    });
+                }
+                "ginit" => {
+                    // Strict on token count: silently ignoring trailing bytes
+                    // would apply a truncated initializer and hand the global
+                    // the wrong value.
+                    if toks.len() != 2 {
+                        return Err(err("ginit takes exactly one value"));
+                    }
+                    let payload = toks[1];
+                    let g = module
+                        .globals
+                        .last_mut()
+                        .ok_or_else(|| err("ginit before global"))?;
+                    g.init = if payload == "-" {
+                        None
+                    } else {
+                        Some(unhex(payload).ok_or_else(|| err("bad ginit bytes"))?)
+                    };
+                }
                 "func" => {
                     // `func <i> <hexname> <hexsymbol> <main01> <test01> <entry> <ret>`
-                    let _id: usize = toks[1].parse().map_err(|_| err("bad func id"))?;
+                    let _id: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad func id"))?
+                        .parse()
+                        .map_err(|_| err("bad func id"))?;
                     let name = unhex(toks.get(2).copied().unwrap_or(""))
                         .and_then(|b| String::from_utf8(b).ok())
                         .ok_or_else(|| err("bad func name"))?;
                     let symbol = unhex(toks.get(3).copied().unwrap_or(""))
                         .and_then(|b| String::from_utf8(b).ok())
                         .ok_or_else(|| err("bad func symbol"))?;
-                    let is_main: bool = toks[4] == "1";
-                    let is_test: bool = toks[5] == "1";
-                    let entry: u32 = toks[6].parse().map_err(|_| err("bad entry"))?;
-                    let ret = parse_irx_ty(toks[7]).ok_or_else(|| err("bad func ret"))?;
+                    // The two flags are `== "1"`, so anything else reads as false;
+                    // a short line is an error rather than a defaulted func.
+                    let main_flag = toks.get(4).ok_or_else(|| err("bad func main flag"))?;
+                    let test_flag = toks.get(5).ok_or_else(|| err("bad func test flag"))?;
+                    let entry = toks.get(6).ok_or_else(|| err("bad entry"))?;
+                    let ret_tok = toks.get(7).ok_or_else(|| err("bad func ret"))?;
+                    let is_main: bool = *main_flag == "1";
+                    let is_test: bool = *test_flag == "1";
+                    let entry: u32 = entry.parse().map_err(|_| err("bad entry"))?;
+                    let ret = parse_irx_ty(ret_tok).ok_or_else(|| err("bad func ret"))?;
                     module.funcs.push(IrFunc {
                         name,
                         symbol,
@@ -895,14 +1038,19 @@ impl IrModule {
                 }
                 "params" => {
                     let f = cur_func.ok_or_else(|| err("params outside func"))?;
-                    let n: usize = toks[1].parse().map_err(|_| err("bad params count"))?;
+                    let n: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad params count"))?
+                        .parse()
+                        .map_err(|_| err("bad params count"))?;
                     let mut params = Vec::with_capacity(n);
                     let mut i = 2;
                     while i < toks.len() {
                         let name = unhex(toks[i])
                             .and_then(|b| String::from_utf8(b).ok())
                             .ok_or_else(|| err("bad param name"))?;
-                        let ty = parse_irx_ty(toks[i + 1]).ok_or_else(|| err("bad param ty"))?;
+                        let ty_tok = toks.get(i + 1).ok_or_else(|| err("bad param ty"))?;
+                        let ty = parse_irx_ty(ty_tok).ok_or_else(|| err("bad param ty"))?;
                         params.push(IrParam { name, ty });
                         i += 2;
                     }
@@ -913,9 +1061,13 @@ impl IrModule {
                 }
                 "slots" => {
                     let f = cur_func.ok_or_else(|| err("slots outside func"))?;
-                    let n: usize = toks[1].parse().map_err(|_| err("bad slots count"))?;
+                    let n: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad slots count"))?
+                        .parse()
+                        .map_err(|_| err("bad slots count"))?;
                     let mut slots = Vec::with_capacity(n);
-                    for t in &toks[2..] {
+                    for t in toks.get(2..).unwrap_or_default() {
                         slots.push(parse_irx_ty(t).ok_or_else(|| err("bad slot ty"))?);
                     }
                     if slots.len() != n {
@@ -925,9 +1077,13 @@ impl IrModule {
                 }
                 "tags" => {
                     let f = cur_func.ok_or_else(|| err("tags outside func"))?;
-                    let n: usize = toks[1].parse().map_err(|_| err("bad tags count"))?;
+                    let n: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad tags count"))?
+                        .parse()
+                        .map_err(|_| err("bad tags count"))?;
                     let mut tags = Vec::with_capacity(n);
-                    for t in &toks[2..] {
+                    for t in toks.get(2..).unwrap_or_default() {
                         let s = unhex(t)
                             .and_then(|b| String::from_utf8(b).ok())
                             .ok_or_else(|| err("bad tag"))?;
@@ -940,12 +1096,20 @@ impl IrModule {
                 }
                 "blocks" => {
                     let f = cur_func.ok_or_else(|| err("blocks outside func"))?;
-                    let n: usize = toks[1].parse().map_err(|_| err("bad blocks count"))?;
+                    let n: usize = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad blocks count"))?
+                        .parse()
+                        .map_err(|_| err("bad blocks count"))?;
                     module.funcs[f].blocks = Vec::with_capacity(n);
                 }
                 "block" => {
                     let f = cur_func.ok_or_else(|| err("block outside func"))?;
-                    let id: u32 = toks[1].parse().map_err(|_| err("bad block id"))?;
+                    let id: u32 = toks
+                        .get(1)
+                        .ok_or_else(|| err("bad block id"))?
+                        .parse()
+                        .map_err(|_| err("bad block id"))?;
                     module.funcs[f].blocks.push(IrBlock {
                         id: BlockId(id),
                         instrs: Vec::new(),
@@ -953,7 +1117,8 @@ impl IrModule {
                     });
                 }
                 "const" | "unop" | "binop" | "copy" | "itof" | "ftoi" | "chartoi" | "itochar"
-                | "load" | "store" | "addr" | "loadraw" | "storeraw" | "call" | "callind" => {
+                | "load" | "store" | "addr" | "loadraw" | "storeraw" | "call" | "callind"
+                  | "gaddr" | "loadglobal" | "storeglobal" => {
                     let f = cur_func.ok_or_else(|| err("instruction outside func"))?;
                     let block_last = module.funcs[f]
                         .blocks
@@ -1026,23 +1191,60 @@ fn parse_irx_instr(line: &str) -> Result<IrInstr, String> {
             let d = temp(rest[0], "const dst")?;
             let kind = rest[1];
             let c = match kind {
-                "int" => IrConst::Int(rest[2].parse().map_err(|_| "bad int const")?),
+                // Every kind but `null` carries a value token; a short line is an
+                // error, not a defaulted value.
+                "int" => IrConst::Int(
+                    rest.get(2)
+                        .ok_or_else(|| "int const needs a value".to_string())?
+                        .parse()
+                        .map_err(|_| "bad int const")?,
+                ),
                 "float" => IrConst::Float(
-                    rest[2]
+                    rest.get(2)
+                        .ok_or_else(|| "float const needs a value".to_string())?
                         .parse::<f64>()
                         .map_err(|_| "bad float literal")?
                         .to_bits(),
                 ),
-                "bool" => match rest[2] {
-                    "true" => IrConst::Bool(true),
-                    "false" => IrConst::Bool(false),
+                "bool" => match rest.get(2).copied() {
+                    Some("true") => IrConst::Bool(true),
+                    Some("false") => IrConst::Bool(false),
                     _ => return Err("bad bool const".to_string()),
                 },
-                "char" => IrConst::Char(rest[2].parse().map_err(|_| "bad char const")?),
+                "char" => {
+                    // A char const is a Unicode scalar: the emitter only ever
+                    // writes one the frontend parsed, and an out-of-range or
+                    // surrogate value has no UTF-8 encoding to print, so reject
+                    // it here rather than hand it to the JIT.
+                    let v: u32 = rest
+                        .get(2)
+                        .ok_or_else(|| "char const needs a value".to_string())?
+                        .parse()
+                        .map_err(|_| "bad char const")?;
+                    if char::from_u32(v).is_none() {
+                        return Err(format!("char const {v} is not a Unicode scalar"));
+                    }
+                    IrConst::Char(v)
+                }
                 "null" => IrConst::Null,
-                "str" => IrConst::Str(StrId(rest[2].parse().map_err(|_| "bad str id")?)),
-                "straddr" => IrConst::StrAddr(StrId(rest[2].parse().map_err(|_| "bad straddr")?)),
-                "fnaddr" => IrConst::FuncAddr(FuncId(rest[2].parse().map_err(|_| "bad fnaddr")?)),
+                "str" => IrConst::Str(StrId(
+                    rest.get(2)
+                        .ok_or_else(|| "str const needs a value".to_string())?
+                        .parse()
+                        .map_err(|_| "bad str id")?,
+                )),
+                "straddr" => IrConst::StrAddr(StrId(
+                    rest.get(2)
+                        .ok_or_else(|| "straddr const needs a value".to_string())?
+                        .parse()
+                        .map_err(|_| "bad straddr")?,
+                )),
+                "fnaddr" => IrConst::FuncAddr(FuncId(
+                    rest.get(2)
+                        .ok_or_else(|| "fnaddr const needs a value".to_string())?
+                        .parse()
+                        .map_err(|_| "bad fnaddr")?,
+                )),
                 _ => return Err(format!("bad const kind {kind}")),
             };
             Ok(IrInstr::Const { dst: d, c })
@@ -1131,6 +1333,35 @@ fn parse_irx_instr(line: &str) -> Result<IrInstr, String> {
                 Ok(IrInstr::StoreRaw { addr, v, ty: t })
             }
         }
+            "gaddr" => {
+                // `gaddr <dst> <id>`
+                if rest.len() != 2 {
+                    return Err("gaddr needs dst id".to_string());
+                }
+                let d = temp(rest[0], "gaddr dst")?;
+                let id = rest[1].parse().map_err(|_| "bad global id")?;
+                Ok(IrInstr::GlobalAddr { dst: d, id })
+            }
+            "loadglobal" => {
+                // `loadglobal <dst> <id> <ty>`
+                if rest.len() != 3 {
+                    return Err("loadglobal needs dst id ty".to_string());
+                }
+                let d = temp(rest[0], "loadglobal dst")?;
+                let id = rest[1].parse().map_err(|_| "bad global id")?;
+                let t = ty(rest[2], "loadglobal")?;
+                Ok(IrInstr::LoadGlobal { dst: d, id, ty: t })
+            }
+            "storeglobal" => {
+                // `storeglobal <id> <ty> <v>`
+                if rest.len() != 3 {
+                    return Err("storeglobal needs id ty v".to_string());
+                }
+                let id = rest[0].parse().map_err(|_| "bad global id")?;
+                let t = ty(rest[1], "storeglobal")?;
+                let v = temp(rest[2], "storeglobal v")?;
+                Ok(IrInstr::StoreGlobal { id, v, ty: t })
+            }
         "call" => {
             // `call <dst|- `> <fn|extern> <id> <arg>...`
             if rest.len() < 3 {
@@ -1171,16 +1402,28 @@ fn parse_irx_instr(line: &str) -> Result<IrInstr, String> {
             let fn_addr = temp(rest[1], "callind fn_addr")?;
             let ret = ty(rest[2], "callind ret")?;
             let nparams: usize = rest[3].parse().map_err(|_| "bad nparams".to_string())?;
-            let params = rest[4..4 + nparams]
+            // The count is attacker-controlled, so bound it before slicing:
+            // `4 + nparams` can overflow and `rest` may be shorter than claimed.
+            let after_params = 4usize
+                .checked_add(nparams)
+                .ok_or_else(|| "callind nparams overflows".to_string())?;
+            let param_slice = rest
+                .get(4..after_params)
+                .ok_or_else(|| format!("callind nparams {nparams} exceeds the line"))?;
+            let params = param_slice
                 .iter()
                 .map(|s| ty(s, "callind param"))
                 .collect::<Result<Vec<_>, _>>()?;
-            let after = &rest[4 + nparams..];
+            let after = rest.get(after_params..).unwrap_or(&[]);
             if after.is_empty() {
                 return Err("callind missing nargs".to_string());
             }
             let nargs: usize = after[0].parse().map_err(|_| "bad nargs".to_string())?;
-            let args = after[1..=nargs]
+            // `nargs == 0` is the empty-arg indirect call the emitter writes.
+            let arg_slice = after
+                .get(1..=nargs)
+                .ok_or_else(|| format!("callind nargs {nargs} exceeds the line"))?;
+            let args = arg_slice
                 .iter()
                 .map(|s| temp(s, "callind arg"))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1276,6 +1519,7 @@ mod tests {
             externs: Vec::new(),
             funcs_by_name: HashMap::new(),
             strings: vec![b"hi \xC3\xA9".to_vec()],
+            globals: Vec::new(),
         };
         let ex = m.extern_id(IrExtern {
             symbol: "pickle_str_len".to_string(),
@@ -1326,6 +1570,143 @@ mod tests {
         m
     }
 
+    /// A func header with no body lines, so one line can be replaced at a time.
+    const HEAD: &str = "irx externs 0\nirx strings 0\nirx funcs 1\nfunc 0 6d 6d 1 0 0 unit\nparams 0 \nslots 0 \ntags 0 \nblocks 1\nblock 0\n";
+
+    fn line(text: &str) -> String {
+        format!("{HEAD}{text}\nreturn 0\n")
+    }
+
+    /// Malformed IRX must come back as `Err`, never as a panic. The reader used
+    /// to index tokens and slice ranges without bounds checks, so a truncated
+    /// line crashed the compiler instead of reporting the bad line.
+    #[test]
+    fn from_irx_rejects_short_lines_without_panicking() {
+        let bad = [
+            "extern",
+            "esig",
+            "string",
+            "func",
+            "func 0",
+            "func 0 6d",
+            "func 0 6d 6d",
+            "func 0 6d 6d 1",
+            "func 0 6d 6d 1 0",
+            "func 0 6d 6d 1 0 0",
+            "params",
+            "params 1",
+            "params 1 61",
+            "slots",
+            "slots 1",
+            "tags",
+            "tags 1",
+            "blocks",
+            "block",
+            "const 0 int",
+            "const 0 float",
+            "const 0 bool",
+            "const 0 char",
+            "const 0 str",
+            "const 0 straddr",
+            "const 0 fnaddr",
+            "callind 0 1 int64 9 0",
+            "callind 0 1 int64 0 5 0",
+            "callind 0 1 int64 18446744073709551615 0",
+            "callind 0 1 int64 0 18446744073709551615 1",
+            "irx",
+            "irx externs",
+            // Not Unicode scalars: no UTF-8 encoding, so they must not reach
+            // the JIT as a char.
+            "const 0 char 55296",
+            "const 0 char 57343",
+            "const 0 char 1114112",
+        ];
+        for src in bad {
+            let full = line(src);
+            assert!(
+                IrModule::from_irx(&full).is_err(),
+                "expected an error for {src:?}"
+            );
+        }
+    }
+
+    /// Lines that used to be fine must keep parsing: the guards added to make
+    /// the reader total cannot be over-tight.
+    #[test]
+    fn from_irx_still_accepts_the_awkward_valid_lines() {
+        let ok = [
+            "params 0 ",
+            "params 1 61 int64",
+            "slots 0 ",
+            "slots 2 int64 ptr",
+            "tags 0 ",
+            "tags 1 c3a9",
+            "const 0 null",
+            "const 0 int 0 junk",
+            "callind - 3 unit 0 0",
+            "callind 0 1 int64 2 int64 ptr 2 4 5",
+            "callind 0 1 int64 0 0",
+        ];
+        for src in ok {
+            let full = line(src);
+            assert!(
+                IrModule::from_irx(&full).is_ok(),
+                "expected success for {src:?}"
+            );
+        }
+        // `esig` needs its `extern` first, and a bare ret ty is the one-token form.
+        let with_extern = "irx externs 1\nirx strings 0\nirx funcs 0\nextern 0 61\nesig unit\n";
+        assert!(IrModule::from_irx(with_extern).is_ok());
+        assert!(IrModule::from_irx("irx externs 1\nextern 0 61\nesig\n").is_err());
+    }
+
+    /// The zero-arg indirect call is exactly what the emitter writes, so it has
+    /// to survive a serialize/parse round trip.
+    #[test]
+    fn irx_roundtrips_zero_arg_callind() {
+        let mut m = IrModule {
+            funcs: Vec::new(),
+            externs: Vec::new(),
+            funcs_by_name: HashMap::new(),
+            strings: Vec::new(),
+            globals: Vec::new(),
+        };
+        m.funcs.push(IrFunc {
+            name: "f".to_string(),
+            symbol: "pkl_f".to_string(),
+            params: Vec::new(),
+            ret: IrTy::Unit,
+            slots: Vec::new(),
+            entry: BlockId(0),
+            blocks: vec![IrBlock {
+                id: BlockId(0),
+                instrs: vec![IrInstr::CallInd {
+                    dst: None,
+                    fn_addr: Temp(0),
+                    params: Vec::new(),
+                    ret: IrTy::Unit,
+                    args: Vec::new(),
+                }],
+                term: IrTerm::Unreachable,
+            }],
+            is_main: false,
+            is_test: false,
+            tags: Vec::new(),
+        });
+        let text = irx_serialize(&m);
+        let parsed = IrModule::from_irx(&text).expect("zero-arg callind round trip");
+        match &parsed.funcs[0].blocks[0].instrs[0] {
+            IrInstr::CallInd {
+                dst, params, args, ..
+            } => {
+                assert!(dst.is_none());
+                assert!(params.is_empty());
+                assert!(args.is_empty());
+            }
+            other => panic!("expected the callind back, got {other:?}"),
+        }
+    }
+
     #[test]
     fn irx_roundtrip() {
         let m = sample();
@@ -1358,5 +1739,71 @@ mod tests {
         assert_eq!(bits, (-0.5f64).to_bits());
         assert_eq!(pf.blocks[0].term, IrTerm::Return { v: Some(Temp(1)) });
         assert_eq!(pf.tags, vec!["solo"]);
+    }
+
+    /// Globals are the one piece of module state that is not reachable from a
+    /// function body, so nothing else in these tests exercises it. If the IRX
+    /// round trip loses a data symbol, every downstream global silently
+    /// becomes a zero slot -- which still *runs*, so no execution test catches
+    /// it. Hence an explicit round trip for the whole table.
+    #[test]
+    fn irx_roundtrips_globals() {
+        let mut m = IrModule {
+            funcs: Vec::new(),
+            externs: Vec::new(),
+            funcs_by_name: HashMap::new(),
+            strings: Vec::new(),
+            globals: Vec::new(),
+        };
+        m.globals.push(IrGlobal {
+            symbol: "pkl_global_main_counter".to_string(),
+            ty: IrTy::Int,
+            ty_explicit: true,
+            init: Some(7i64.to_le_bytes().to_vec()),
+        });
+        m.globals.push(IrGlobal {
+            symbol: "pkl_global_main_scratch".to_string(),
+            ty: IrTy::Ptr,
+            ty_explicit: false,
+            // zero-init: must come back as `.bss`, not `.data`
+            init: None,
+        });
+        // An empty-but-present init would collapse into `.bss` if we were not
+        // careful, so pin the distinction at the encoder level.
+        let text = irx_serialize(&m);
+        assert!(text.contains("\nglobal 0 "), "{text}");
+        assert!(text.contains("\nginit 0700000000000000\n"), "{text}");
+        assert!(text.contains("\nginit -\n"), "{text}");
+
+        let back = IrModule::from_irx(&text).expect("globals must round trip");
+        assert_eq!(back.globals.len(), 2);
+        assert_eq!(back.globals[0].symbol, "pkl_global_main_counter");
+        assert_eq!(back.globals[0].ty, IrTy::Int);
+        assert!(back.globals[0].ty_explicit);
+        assert_eq!(
+            back.globals[0].init.as_deref(),
+            Some(7i64.to_le_bytes().as_slice())
+        );
+        assert_eq!(back.globals[1].symbol, "pkl_global_main_scratch");
+        assert_eq!(back.globals[1].ty, IrTy::Ptr);
+        assert!(!back.globals[1].ty_explicit);
+        assert_eq!(back.globals[1].init, None);
+        // Serializing the parsed copy must be byte-identical, not merely equal.
+        assert_eq!(irx_serialize(&back), text);
+    }
+
+    /// A `ginit` payload that is not hex must be rejected rather than silently
+    /// producing an empty init (which would turn `.data` into `.bss`).
+    #[test]
+    fn irx_rejects_malformed_ginit() {
+        let head = "irx externs 0\nirx strings 0\nirx globals 1\nglobal 0 61 1 int64\n";
+        assert!(IrModule::from_irx(&format!("{head}ginit -\n")).is_ok());
+        assert!(IrModule::from_irx(&format!("{head}ginit 0700000000000000\n")).is_ok());
+        assert!(IrModule::from_irx(&format!("{head}ginit zz\n")).is_err());
+        assert!(IrModule::from_irx(&format!("{head}ginit 07 09\n")).is_err());
+        assert!(IrModule::from_irx(&format!("{head}ginit\n")).is_err());
+        assert!(IrModule::from_irx(&format!("{head}ginit -\nextra\n")).is_err());
+        // ginit before any global would attach to the wrong slot.
+        assert!(IrModule::from_irx("irx globals 0\nginit -\n").is_err());
     }
 }

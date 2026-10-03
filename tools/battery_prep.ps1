@@ -37,7 +37,7 @@ function Invoke-Raw([string]$outPath, [string]$exe, [string[]]$argv) {
     if ($LASTEXITCODE -ne 0) { throw "PREP FAILED: $exe $($argv -join ' ') (exit $LASTEXITCODE)" }
 }
 
-# 13 self targets: 12 compiler-selfhost modules + cli-selfhost/main.
+# 13 self targets: 12 pickle\compiler modules + pickle\cli/main.
 # Every source is passed in its absolute spelling. The JIT refuses to recompile a target
 # whose path string is exactly the relative import path of an already-loaded module
 # (compiler.resolve, compiler.front, cli.main) - it crashes or returns an error module.
@@ -45,8 +45,8 @@ function Invoke-Raw([string]$outPath, [string]$exe, [string[]]$argv) {
 $Targets = @("ast", "check", "diag", "emit", "error", "front", "ir", "lexer", "parser", "resolve", "token", "ty", "main")
 
 function TargetPath([string]$t) {
-    if ($t -eq "main") { return (Join-Path $repoAbs "cli-selfhost\main.pkl") }
-    return (Join-Path $repoAbs "compiler-selfhost\$t.pkl")
+    if ($t -eq "main") { return (Join-Path $repoAbs "pickle\cli\main.pkl") }
+    return (Join-Path $repoAbs "pickle\compiler\$t.pkl")
 }
 
 # Rust oracles for the 13 self targets and the gen2 driver.
@@ -56,7 +56,7 @@ foreach ($t in $Targets) {
     Invoke-Raw "tools\diff\oracle\$t.pkl_gen.ir"  $cli @("ir", $src)
     Invoke-Raw "tools\diff\oracle\$t.pkl_gen.irx" $cli @("irx", $src)
 }
-$gen2 = Join-Path $repoAbs "cli-selfhost\gen2_run_one.pkl"
+$gen2 = Join-Path $repoAbs "pickle\cli\gen2_run_one.pkl"
 Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.ir"  $cli @("ir", $gen2)
 Invoke-Raw "tools\diff\oracle\gen2_run_one.pkl.irx" $cli @("irx", $gen2)
 Write-Output "PREP oracles (14 IR/IRX pairs): $($sw.Elapsed.TotalSeconds.ToString('F1'))s"
@@ -69,7 +69,7 @@ Write-Output "PREP oracles (14 IR/IRX pairs): $($sw.Elapsed.TotalSeconds.ToStrin
 # compiled driver emits byte-identical artifacts to the JIT).
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $pklcRunone = "tools\diff\port\pklc_runone.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\run_one_self.pkl" $pklcRunone)) {
+if (-not (Invoke-BuildDriver "pickle\cli\run_one_self.pkl" $pklcRunone)) {
     throw "PREP FAILED: could not AOT-build run_one_self.pkl"
 }
 foreach ($t in $Targets) {

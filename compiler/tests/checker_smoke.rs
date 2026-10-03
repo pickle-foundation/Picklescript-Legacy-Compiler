@@ -2545,7 +2545,9 @@ fn rejects_bare_scalar_stored_refs() {
     let msgs = error_msgs(&d);
     assert!(has_errors(&d), "expected errors, got none");
     assert!(
-        msgs.contains("`&T` references may only be formed from an existing `&T` value or a managed referent"),
+        msgs.contains(
+            "`&T` references may only be formed from an existing `&T` value or a managed referent"
+        ),
         "expected stored-ref diagnostics (field/return/let/const/assignment), got:\n{msgs}"
     );
     assert!(
@@ -2614,7 +2616,9 @@ fn rejects_bare_scalar_method_and_lambda_ref_returns() {
     let msgs = error_msgs(&d);
     assert!(has_errors(&d), "expected errors, got none");
     assert!(
-        msgs.contains("`&T` references may only be formed from an existing `&T` value or a managed referent"),
+        msgs.contains(
+            "`&T` references may only be formed from an existing `&T` value or a managed referent"
+        ),
         "expected stored-ref diagnostics for method/lambda returns, got:\n{msgs}"
     );
 }

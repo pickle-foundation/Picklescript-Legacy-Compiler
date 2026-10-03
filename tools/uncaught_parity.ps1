@@ -25,7 +25,7 @@ achieved by both sides being wrong in the same way:
 
 .PARAMETER SelfhostLink
 Link with the self-hosted linker against `combined.lib` instead of `rustc` and
-a shim. Exercises `compiler-selfhost/linker.pkl` rather than the Rust toolchain.
+a shim. Exercises `pickle\compiler/linker.pkl` rather than the Rust toolchain.
 
 .PARAMETER Filter
 Only run fixtures whose name contains this substring.
@@ -160,7 +160,7 @@ foreach ($f in $fixtures) {
     $nat = Invoke-Captured -Exe $Cli -ExeArgs @("run", $f.FullName) -WorkingDir $Root -Tag "nat_$stem"
 
     # ---- self-host: source -> IR -> x64 -> COFF ----
-    $drv = & $Cli run cli-selfhost\x64_real_run.pkl -- $f.FullName $probe 2>&1
+    $drv = & $Cli run pickle\cli\x64_real_run.pkl -- $f.FullName $probe 2>&1
     if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
         Write-Output "FAIL $stem : lowering failed"
         Write-Output ($drv -join "`n")
@@ -173,7 +173,7 @@ foreach ($f in $fixtures) {
     # ---- link ----
     $exe = Join-Path $probe "$prefix.exe"
     if ($SelfhostLink) {
-        $lk = & $Cli run compiler-selfhost\linker.pkl -- $obj $Combined $exe 2>&1
+        $lk = & $Cli run pickle\compiler\linker.pkl -- $obj $Combined $exe 2>&1
         if ($LASTEXITCODE -ne 0 -or (($lk -join "`n") -notmatch "LINKER WROTE")) {
             Write-Output "FAIL $stem : selfhost link failed"
             Write-Output ($lk -join "`n")

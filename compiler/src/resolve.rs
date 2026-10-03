@@ -146,21 +146,24 @@ impl TypeTableEntry {
 
 /// The result of resolving and declaring all names in one source file.
 pub struct ResolvedProgram {
-    pub types: HashMap<String, TypeTableEntry>,
-    pub fns: HashMap<String, Vec<CallableInfo>>,
-    pub consts: Vec<FieldInfo>,
-    pub import_aliases: HashMap<String, Vec<String>>,
-    pub module_path: Vec<String>,
+   pub types: HashMap<String, TypeTableEntry>,
+   pub fns: HashMap<String, Vec<CallableInfo>>,
+   pub consts: Vec<FieldInfo>,
+   /// Top-level `var` slots. Parallel to `consts` but with real storage.
+   pub globals: Vec<FieldInfo>,
+   pub import_aliases: HashMap<String, Vec<String>>,
+   pub module_path: Vec<String>,
 }
 
 pub struct Resolver<'a> {
-    pub diags: &'a DiagnosticSink,
-    types: HashMap<String, TypeTableEntry>,
-    fns: HashMap<String, Vec<CallableInfo>>,
-    consts: Vec<FieldInfo>,
-    import_aliases: HashMap<String, Vec<String>>,
-    module_path: Vec<String>,
-    file_roots: HashMap<FileId, String>,
+   pub diags: &'a DiagnosticSink,
+   types: HashMap<String, TypeTableEntry>,
+   fns: HashMap<String, Vec<CallableInfo>>,
+   consts: Vec<FieldInfo>,
+   globals: Vec<FieldInfo>,
+   import_aliases: HashMap<String, Vec<String>>,
+   module_path: Vec<String>,
+   file_roots: HashMap<FileId, String>,
 }
 
 impl<'a> Resolver<'a> {
@@ -179,6 +182,7 @@ impl<'a> Resolver<'a> {
             types: HashMap::new(),
             fns: HashMap::new(),
             consts: Vec::new(),
+            globals: Vec::new(),
             import_aliases: HashMap::new(),
             module_path: Vec::new(),
             file_roots,
@@ -218,6 +222,7 @@ impl<'a> Resolver<'a> {
         let mut nmap: HashMap<String, Span> = HashMap::new();
         let mut pending_fn: Vec<(&FnDecl, bool)> = Vec::new();
         let mut pending_const: Vec<&ConstDecl> = Vec::new();
+        let mut pending_global: Vec<&GlobalDecl> = Vec::new();
         let mut pending_kind: Vec<ItemKindDecl<'a>> = Vec::new();
         for item in &prog.items {
             let (name, kind) = match &item.kind {
@@ -227,6 +232,7 @@ impl<'a> Resolver<'a> {
                 ItemKind::Enum(e) => (e.name.clone(), Some(ItemKindDecl::Enum(e))),
                 ItemKind::Interface(i) => (i.name.clone(), Some(ItemKindDecl::Interface(i))),
                 ItemKind::Const(c) => (c.name.clone(), None),
+                ItemKind::Global(g) => (g.name.clone(), None),
                 ItemKind::Test(f) => (f.name.clone(), None),
             };
             if let Some(&first) = nmap.get(&name) {
@@ -262,6 +268,7 @@ impl<'a> Resolver<'a> {
                     ItemKind::Fn(f) => pending_fn.push((f, false)),
                     ItemKind::Test(f) => pending_fn.push((f, true)),
                     ItemKind::Const(c) => pending_const.push(c),
+                    ItemKind::Global(g) => pending_global.push(g),
                     _ => unreachable!(),
                 },
             }
@@ -274,6 +281,9 @@ impl<'a> Resolver<'a> {
         for c in pending_const {
             self.declare_const(c);
         }
+        for g in pending_global {
+            self.declare_global(g);
+        }
         for k in pending_kind {
             self.fill_kind(k);
         }
@@ -284,6 +294,7 @@ impl<'a> Resolver<'a> {
             types: std::mem::take(&mut self.types),
             fns: std::mem::take(&mut self.fns),
             consts: std::mem::take(&mut self.consts),
+            globals: std::mem::take(&mut self.globals),
             import_aliases: std::mem::take(&mut self.import_aliases),
             module_path: self.module_path,
         }
@@ -508,7 +519,12 @@ impl<'a> Resolver<'a> {
             // `proc_wait(h)` etc.: process-handle queries on a `Stream`.
             mk("proc_wait", vec![any("h")], Ty::Bool, true),
             mk("proc_running", vec![any("h")], Ty::Bool, true),
-            mk("proc_code", vec![any("h")], Ty::Option(Box::new(Ty::Int)), true),
+            mk(
+                "proc_code",
+                vec![any("h")],
+                Ty::Option(Box::new(Ty::Int)),
+                true,
+            ),
             mk("proc_kill", vec![any("h")], Ty::Bool, true),
             mk(
                 "proc_out_read",
@@ -546,7 +562,6 @@ impl<'a> Resolver<'a> {
             // `string`) by a dedicated rule; the loose declaration just makes
             // the name resolvable and dispatchable.
             mk("assert", vec![any("args")], Ty::Empty, true),
-
             // --- Tasks (see `docs/07-runtime.md`, "Tasks & scheduling") ---
             //
             // A task handle is a plain `int` naming a row in the runtime's task
@@ -567,7 +582,6 @@ impl<'a> Resolver<'a> {
             mk("thread_current", vec![], Ty::Int, false),
             mk("sleep_ms", vec![any("ms")], Ty::Empty, false),
             mk("thread_yield", vec![], Ty::Empty, false),
-
             // --- Garbage collection ---
             //
             // The delegation point from Pickle into the live collector. Named
@@ -575,7 +589,17 @@ impl<'a> Resolver<'a> {
             // `runtime.gc` already define their own `collect` and an overload
             // candidate by that name would be ambiguous at every call site.
             mk("gcCollect", vec![boolean("force")], Ty::Empty, false),
-
+            // The collector's OBSERVABLE contract. `gcCollect` alone cannot be
+            // driven from Pickle end-to-end because the auto-collect trigger is
+            // invisible: nothing in the language can observe bytes-since-GC, ask
+            // whether a collection is due, read the collection count, or pin the
+            // threshold. These three expose the existing `pickle_gc_*` counters
+            // (gc.rs:714/720/727) so a Pickle-side runtime can own the decision
+            // instead of mirroring it.
+            mk("gcAllocationsSinceGc", vec![], Ty::Int, false),
+            mk("gcBytesSinceGc", vec![], Ty::Int, false),
+            mk("gcCollectionCount", vec![], Ty::Int, false),
+            mk("gcSetThreshold", vec![int("bytes")], Ty::Empty, false),
             // --- Synchronisation ---
             //
             // Mutex/cond/semaphore/atomic/once handles are `int`s too. A handle
@@ -596,7 +620,12 @@ impl<'a> Resolver<'a> {
             mk("sem_release", vec![any("s"), any("n")], Ty::Empty, false),
             mk("atomic_new", vec![any("value")], Ty::Int, false),
             mk("atomic_load", vec![any("a")], Ty::Int, false),
-            mk("atomic_store", vec![any("a"), any("value")], Ty::Empty, false),
+            mk(
+                "atomic_store",
+                vec![any("a"), any("value")],
+                Ty::Empty,
+                false,
+            ),
             mk("atomic_add", vec![any("a"), any("delta")], Ty::Int, false),
             mk(
                 "atomic_cas",
@@ -607,7 +636,6 @@ impl<'a> Resolver<'a> {
             mk("once_new", vec![], Ty::Int, false),
             mk("once_done", vec![any("o")], Ty::Bool, false),
             mk("once_run", vec![any("o"), any("body")], Ty::Bool, false),
-
             // --- Channels ---
             //
             // --- Channels ---
@@ -645,6 +673,21 @@ impl<'a> Resolver<'a> {
             ),
             mk("channel_close", vec![any("ch")], Ty::Empty, false),
             mk("channel_closed", vec![any("ch")], Ty::Bool, false),
+            // --- Bit reinterpret + class names ---
+            //
+            // Both exist for the `pickle_print_obj` port in
+            // `pickle/runtime/abi_console.pkl`.
+            //
+            // `f64FromBits` has no source-level spelling and so cannot be
+            // written as user code: `x as float` is a *numeric* conversion, not
+            // a bitcast (verified - `1072693248 as float` yields `1072693248`,
+            // not `0.5`). It is the exact inverse of the boxing side, which
+            // stores `v.to_bits()`.
+            mk("f64FromBits", vec![int("bits")], Ty::Float, false),
+            // The user-class fallback arm of `pickle_print_obj` needs the
+            // collector's descriptor-name lookup, which had no symbol to call.
+            // Returns a `string` object, or `none` when the id has no descriptor.
+            mk("className", vec![int("classId")], Ty::String, false),
         ];
         for c in builtins {
             self.fns.entry(c.name.clone()).or_default().push(c);
@@ -713,6 +756,44 @@ impl<'a> Resolver<'a> {
             span: c.span,
         });
     }
+
+    /// A top-level `var` occupies real storage, so it is tracked in its own
+    /// table rather than `consts` (which is inlined at use sites). Keeping the
+    /// two separate is what lets the emitter decide "copy a literal" vs
+    /// "emit a load from a data symbol".
+    fn declare_global(&mut self, g: &GlobalDecl) {
+        self.globals.push(FieldInfo {
+            name: g.name.clone(),
+            visibility: g.visibility,
+            is_static: true,
+            mutable: true,
+            const_: false,
+            manual: false,
+ty: g
+.ty
+.as_ref()
+.map(|t| self.resolve_ty(t, &[]))
+.unwrap_or_else(|| infer_global_ty(&g.value)),
+span: g.span,
+});
+}
+}
+
+/// Type of a top-level `var` declared without a `: T` annotation.
+///
+/// Inference is deliberately limited to an integer literal (optionally
+/// negated) because that is the only initializer shape the emitter can turn
+/// into static data; anything else resolves to `Unknown` and is reported as
+/// unsupported later, at codegen, rather than silently guessing.
+fn infer_global_ty(value: &Expr) -> Ty {
+match &value.kind {
+ExprKind::Lit(Lit::Int { .. }) => Ty::Int,
+ExprKind::Unary { operand, .. } => match &operand.kind {
+ExprKind::Lit(Lit::Int { .. }) => Ty::Int,
+_ => Ty::Unknown,
+},
+_ => Ty::Unknown,
+}
 }
 
 fn render_path(path: &[String]) -> String {

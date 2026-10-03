@@ -59,6 +59,49 @@ pub fn latch_crash_env() {
     }
 }
 
+/// Scan upward from `sp` for return addresses that land in registered code and
+/// print them innermost-first. The runtime's `PKL_GC_CHECK` probes call this
+/// through `pickle_gc_set_caller_hook` when a managed argument turns out to be
+/// a dead or mistyped block: the stack is then a JIT frame deep and this is the
+/// only place the offending call site can be recovered, because a controlled
+/// panic unwinds before the crash reporter can walk anything.
+pub(crate) fn print_call_chain(sp: usize, tag_ptr: usize, tag_len: usize) {
+    if sp == 0 || tag_ptr == 0 {
+        return;
+    }
+    let tag = unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(tag_ptr as *const u8, tag_len))
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut last = String::new();
+    // 64 words is enough to walk out of the helper chain in JIT'd code and stop
+    // well before the Rust frames that hold no return addresses in JIT ranges.
+    for i in 0..64usize {
+        // SAFETY: `sp` is the address of a live local in the calling helper, and
+        // 512 bytes above it is still inside the frames of that call chain.
+        let word = unsafe { core::ptr::read_volatile((sp + i * 8) as *const usize) };
+        if word < 0x1000 {
+            continue;
+        }
+        let Some(name) = resolve(word) else { continue };
+        if name == last {
+            continue;
+        }
+        last = name.clone();
+        out.push(name);
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return;
+    }
+    eprintln!("[gc-check] call chain for {tag}:");
+    for (i, name) in out.iter().enumerate() {
+        eprintln!("[gc-check]   #{i} {name}");
+    }
+}
+
 /// Register a single native function that a compiled program can call into.
 pub fn register_native(name: &str, addr: usize) {
     let mut g = NATIVE.lock().unwrap();
@@ -95,7 +138,7 @@ pub fn register_code_range(base: usize, len: usize, symbols: HashMap<String, usi
 }
 
 /// Best-effort name for a code address inside a registered range.
-fn resolve(addr: usize) -> Option<String> {
+pub(crate) fn resolve(addr: usize) -> Option<String> {
     let g = CODE.lock().ok()?;
     for (base, len, syms) in g.iter() {
         let base = *base;
@@ -182,6 +225,12 @@ static CAUGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 /// and then spins, so its own stack usage stays in the overflow headroom.
 #[cfg(windows)]
 static CRASH_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The reporter thread, leaked and published once by `install` so a crash
+/// handler can wake it with `unpark`: allocation-free and O(1), which is the
+/// only thing a handler on a nearly-exhausted stack can afford.
+#[cfg(windows)]
+static REPORTER: std::sync::atomic::AtomicPtr<std::thread::Thread> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 #[cfg(windows)]
 static CRASH_RIP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(windows)]
@@ -387,20 +436,27 @@ pub fn install() {
     {
         // Reporter thread: on a fault the VEH handler and the faulting thread
         // have almost no stack left, so the real diagnostics (symbol
-        // resolution, stack walk) run here on a full stack.
-        std::thread::Builder::new()
+        // resolution, stack walk) run here on a full stack. It *parks* rather
+        // than polling: a `yield_now` loop here burns a whole core for the life
+        // of the process, which is pure waste on a machine running one compiler
+        // thread, and it shows up as phantom background CPU.
+        let handle = std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .name("iced-reporter".into())
             .spawn(|| loop {
+                std::thread::park();
                 let seq = CRASH_SEQ.load(std::sync::atomic::Ordering::SeqCst);
                 if seq == 0 {
-                    std::thread::yield_now();
                     continue;
                 }
                 report_crash(seq);
                 std::process::exit(101);
             })
             .expect("spawn iced-reporter");
+        REPORTER.store(
+            Box::into_raw(Box::new(handle.thread().clone())),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
     #[cfg(unix)]
     unix::install_signals();
@@ -997,6 +1053,18 @@ mod windows {
             super::CRASH_RCX.store(rcx as usize, std::sync::atomic::Ordering::SeqCst);
             let seq = super::CRASH_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             super::CRASH_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+            // The reporter is parked, not polling, so it has to be woken
+            // explicitly. `unpark` only touches an atomic, and it latches, so
+            // a wake that lands before the reporter parks is not lost.
+            {
+                let reporter = super::REPORTER.load(std::sync::atomic::Ordering::SeqCst);
+                if !reporter.is_null() {
+                    // SAFETY: `install` stores a leaked `Thread` that lives for
+                    // the rest of the process, and `unpark` is safe from any
+                    // thread.
+                    unsafe { (*reporter).unpark() };
+                }
+            }
             // Bound the spin so a missing reporter thread still exits. The
             // reporter exits the whole process once it has printed, so the
             // fallback here only runs if the report thread never woke up.

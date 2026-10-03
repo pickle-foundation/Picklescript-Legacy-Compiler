@@ -9,6 +9,7 @@ use pickle_compiler::front::{frontend, frontend_checked};
 use std::io::IsTerminal;
 
 mod build;
+mod cache;
 mod history_cli;
 mod iced;
 mod jit;
@@ -53,7 +54,7 @@ enum Command {
     /// Lower a checked module to the lossless, round-trippable IRX text
     /// format and print it. Unlike `ir`, IRX includes the full extern and
     /// string tables plus per-func slots/tags/entry, and re-parses back into
-    /// exactly the same module via `run-irx`.
+    /// exactly the same module via `irx-run`.
     Irx {
         /// Source file to lower
         file: PathBuf,
@@ -176,6 +177,56 @@ fn load(file: &PathBuf) -> Result<(String, SourceMap, DiagnosticSink)> {
     let map = SourceMap::default();
     let diags = DiagnosticSink::new();
     Ok((source, map, diags))
+}
+
+/// Lower `file` to a module, reusing the cached one when its sources are
+/// unchanged.
+///
+/// The cache is a shortcut, never a new failure mode: an entry that is missing,
+/// stale, or unreadable falls through to a full lowering, and so does one that
+/// no longer parses. Diagnostics are rendered here so that a cached run and a
+/// fresh one behave the same on failure.
+fn load_or_cached(file: &Path, colored: bool) -> Result<pickle_compiler::ir::IrModule> {
+    let timing = timing();
+    let clock = std::time::Instant::now();
+    if let Some(deps) = cache::recorded_deps(file) {
+        if let Some(irx) = cache::lookup(&deps) {
+            if let Ok(module) = pickle_compiler::ir::IrModule::from_irx(&irx) {
+                if timing {
+                    eprintln!(
+                        "[timing] cache hit: {} files, {:.2}s",
+                        deps.len(),
+                        clock.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(module);
+            }
+        }
+    }
+    let (source, mut map, diags) = load(&file.to_path_buf())?;
+    let module = frontend(&file.display().to_string(), &source, &mut map, &diags)
+        .and_then(|out| pickle_compiler::emit::emit_ir(&out.program, &out.resolved, &diags));
+    let rendered = diags.render_all(&map, colored);
+    if !rendered.is_empty() {
+        eprint!("{rendered}");
+    }
+    let module = module.context("frontend failed")?;
+    let irx = pickle_compiler::ir::irx_serialize(&module);
+    if timing {
+        eprintln!(
+            "[timing] lowered {} files to {:.1} MB IRX: {:.2}s",
+            map.files().len(),
+            irx.len() as f64 / 1e6,
+            clock.elapsed().as_secs_f64()
+        );
+    }
+    cache::store(file, &map, &irx);
+    Ok(module)
+}
+
+/// Whether to print phase timings to stderr (`PKL_TIMING=1`).
+fn timing() -> bool {
+    std::env::var_os("PKL_TIMING").is_some()
 }
 
 fn run() -> Result<()> {
@@ -371,16 +422,15 @@ fn run() -> Result<()> {
             pickle_runtime::abi::pickle_runtime_shutdown();
         }
         Command::Run { file, args } => {
-            let (source, mut map, diags) = load(file)?;
-            let module =
-                frontend(&file.display().to_string(), &source, &mut map, &diags).and_then(|out| {
-                    pickle_compiler::emit::emit_ir(&out.program, &out.resolved, &diags)
-                });
-            let rendered = diags.render_all(&map, colored);
-            if !rendered.is_empty() {
-                eprint!("{rendered}");
-            }
-            let module = module.context("frontend failed")?;
+            let timing = timing();
+            let clock = std::time::Instant::now();
+            let mark = |what: &str| {
+                if timing {
+                    eprintln!("[timing] {what}: {:.2}s", clock.elapsed().as_secs_f64());
+                }
+            };
+            let module = load_or_cached(file, colored)?;
+            mark("lowered");
             let runner = jit::Jit::new().with_context(|| "while setting up the JIT")?;
             jit::register_runtime_symbols();
             // Compiled pickle_* calls need the heap etc. alive while we run.
@@ -395,6 +445,7 @@ fn run() -> Result<()> {
             let program = runner
                 .compile(&module)
                 .with_context(|| "while JIT-compiling")?;
+            mark("jit");
             // SAFETY: runtime is initialised and pickle_main is a no-arg
             // void-returning host-convention function.
             let res = std::thread::Builder::new()
@@ -402,6 +453,7 @@ fn run() -> Result<()> {
                 .spawn(move || unsafe { program.run() })
                 .with_context(|| "while spawning run thread")?
                 .join();
+            mark("guest");
             let escaped = match res {
                 Ok(escaped) => escaped,
                 Err(_) => {
@@ -450,19 +502,14 @@ fn run() -> Result<()> {
             let runner = jit::Jit::new().with_context(|| "while setting up the JIT")?;
             let mut failed = false;
             for file in &files {
-                let (source, mut map, diags) = load(file)?;
-                let module = frontend(&file.display().to_string(), &source, &mut map, &diags)
-                    .and_then(|out| {
-                        pickle_compiler::emit::emit_ir(&out.program, &out.resolved, &diags)
-                    });
-                let rendered = diags.render_all(&map, colored);
-                if !rendered.is_empty() {
-                    eprint!("{rendered}");
-                }
-                let Some(module) = module else {
-                    eprintln!("error: {} failed to compile", file.display());
-                    failed = true;
-                    continue;
+                let module = match load_or_cached(file, colored) {
+                    Ok(module) => module,
+                    Err(e) => {
+                        eprintln!("error: {} failed to compile", file.display());
+                        eprintln!("{e:#}");
+                        failed = true;
+                        continue;
+                    }
                 };
                 let test_fns: Vec<&pickle_compiler::ir::IrFunc> =
                     module.funcs.iter().filter(|f| f.is_test).collect();
@@ -606,11 +653,49 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Stack for the thread that runs the compiler's own work.
+///
+/// Recursive lowering needs far more stack than any platform hands out by
+/// default: a function's frame grows with the module being lowered, because
+/// every managed value live in it needs a GC root cell. A few hundred levels
+/// of expression nesting exhausts the 1 MiB Windows default (`0xc00000fd`).
+///
+/// `build.rs` asks the Windows linker for a matching reserve, but a linker flag
+/// only sizes the *main* thread, and Unix has no link-time stack reserve at
+/// all -- there the main thread starts at whatever `ulimit -s` says. Running
+/// the work on a thread with an explicit stack is the one mechanism that
+/// behaves the same on every platform, so the size lives here and
+/// `tests/stack_reserve.rs` checks it against the linker reserves: the thread
+/// must not be the smaller of the two, or moving the work onto it would trade
+/// one exhaustion for another.
+const WORKER_STACK: usize = 256 * 1024 * 1024;
+
 fn main() {
+    // Deliberately on the main thread: `install` latches the crash env and
+    // starts the reporter thread, and it needs a full stack to do that.
     iced::install();
-    if let Err(e) = run() {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+    let worker = std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .name("pickle-work".into())
+        .spawn(|| {
+            if let Err(e) = run() {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+        });
+    match worker {
+        Ok(worker) => {
+            // `run` exits the process itself on failure, so getting here means
+            // it returned -- or it panicked. Re-raise, so a panic still unwinds
+            // out of `main` and reports exactly as it would without the thread.
+            if let Err(payload) = worker.join() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: cannot start the compiler thread: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

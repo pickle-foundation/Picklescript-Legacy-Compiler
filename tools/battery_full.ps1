@@ -27,7 +27,7 @@ try {
     exit 1
 }
 
-# ---- Battery targets: 13 self targets (12 compiler-selfhost + cli-selfhost/main) ----
+# ---- Battery targets: 13 self targets (12 pickle\compiler + pickle\cli/main) ----
 # Genuine oracles are regenerated from the Rust compiler for all 13
 # (tools/diff/oracle/<t>.pkl_gen.{ir,irx}) by tools/battery_prep.ps1 on every run.
 # NOTE (path-collision): the JIT refuses to re-compile a target whose path string is exactly
@@ -67,16 +67,16 @@ Write-Output "GATE1 PORT PARITY (13x2): PASS=$gate1ok FAIL=$gate1fail"
 # compiled driver emits the same artifacts as the JIT, so one run through the AOT
 # driver covers both old loops; Rust is used only to bootstrap-link.
 $pklc2 = "tools\diff\port\pklc_gen2.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\gen2_run_one.pkl" $pklc2)) {
+if (-not (Invoke-BuildDriver "pickle\cli\gen2_run_one.pkl" $pklc2)) {
     Write-Output "GATE2 AOT GEN2: DRIVER BUILD FAILED"
 } else {
     $gate2ok = 0; $gate2fail = 0
     foreach ($t in $Targets) {
         if ($t -eq "resolve" -or $t -eq "front" -or $t -eq "main") {
-            $src = Join-Path $repoAbs $(if ($t -eq "main") { "cli-selfhost\main.pkl" } else { "compiler-selfhost\$t.pkl" })
+            $src = Join-Path $repoAbs $(if ($t -eq "main") { "pickle\cli\main.pkl" } else { "pickle\compiler\$t.pkl" })
             & $pklc2 $src 2>&1 | Out-Null
         } else {
-            $src = if ($t -eq "main") { "cli-selfhost\main.pkl" } else { "compiler-selfhost\$t.pkl" }
+            $src = if ($t -eq "main") { "pickle\cli\main.pkl" } else { "pickle\compiler\$t.pkl" }
             & $pklc2 $src 2>&1 | Out-Null
         }
         $gen2Ir  = "tools\diff\gen2\${t}_gen2.ir"
@@ -106,7 +106,7 @@ Write-Output "GATE3 GEN2_DRIVER PARITY (2): ir=$g3ir irx=$g3irx"
 # against the Rust oracles. Rust becomes bootstrap-only here: the compiled driver
 # runs the full pipeline standalone and produces Rust-identical artifacts.
 $pklc = "tools\diff\port\pklc_main.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\main.pkl" $pklc)) {
+if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklc)) {
     Write-Output "GATE4 AOT DRIVER: BUILD FAILED"
 } else {
     $battery = @(Get-ChildItem "tests\pickle\*_main.pkl") + @(Get-ChildItem "tests\pickle\*_test.pkl")
@@ -135,7 +135,7 @@ if (-not (Invoke-BuildDriver "cli-selfhost\main.pkl" $pklc)) {
 # executes that artifact and its stdout must be byte-identical to the Rust
 # compiler's `pickle run` stdout for the same source. Two compilers, one behavior.
 $pklcIrx = "tools\diff\port\pklc_irx.exe"
-Invoke-BuildDriver "cli-selfhost\run_irx.pkl" $pklcIrx | Out-Null
+Invoke-BuildDriver "pickle\cli\run_irx.pkl" $pklcIrx | Out-Null
 $mains = @(Get-ChildItem "tests\pickle\*_main.pkl")
 $gate6ok = 0; $gate6fail = 0; $gate6skip = 0
 $g6dir = "tools\diff\g6"
@@ -161,12 +161,12 @@ foreach ($m in $mains) {
 Write-Output "GATE6 BEHAVIOR DIFF (mains, stdout byte-eq): PASS=$gate6ok FAIL=$gate6fail SKIP=$gate6skip"
 
 # ---- GATE 7: port-side unit suite — the port tests itself ----
-# `compiler-selfhost/*_test.pkl` import the ported components and assert on their
+# `pickle\compiler/*_test.pkl` import the ported components and assert on their
 # behavior via the `expect` DSL, run by the Rust test harness. This is the
 # "Compiler tests itself" track (checklist 91) — the port's own components
 # exercised in Pickle. GATE7 runs every port `_test.pkl` and requires 0 failures.
 $gate7ok = 0; $gate7fail = 0
-$portTests = @(Get-ChildItem "compiler-selfhost\*_test.pkl")
+$portTests = @(Get-ChildItem "pickle\compiler\*_test.pkl")
 foreach ($pt in $portTests) {
     $out = & $cli test $pt.FullName 2>&1
     if ($LASTEXITCODE -eq 0) { $gate7ok++ } else {
@@ -196,7 +196,7 @@ Write-Output "GATE8 TESTRUNNER BYTE-PARITY (stdout byte-eq vs Rust goldens): PAS
 # runner + describe/hook decoding. ----
 $g9tests = @(Get-ChildItem "tests\pickle\*_test.pkl")
 $pklcTest = "tools\diff\port\pklc_test.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\test.pkl" $pklcTest)) {
+if (-not (Invoke-BuildDriver "pickle\cli\test.pkl" $pklcTest)) {
     Write-Output "GATE9 TEST DRIVER: BUILD FAILED"
 } else {
     $g9dir = "tools\diff\g9"
@@ -223,13 +223,13 @@ if (-not (Invoke-BuildDriver "cli-selfhost\test.pkl" $pklcTest)) {
     Write-Output "GATE9 TEST BYTE-PARITY (stdout+exit, $($g9tests.Count) files): PASS=$g9ok FAIL=$g9fail"
 }
 
-# ---- GATE 10: runtime-selfhost unit suite — the ported runtime tested in Pickle ----
-# The runtime pillar's parallel to GATE7: every `runtime-selfhost/*_test.pkl` runs under
-# the Rust test harness (`pickle test runtime-selfhost` dir mode picks up all `*_test.pkl`)
+# ---- GATE 10: pickle\runtime unit suite — the ported runtime tested in Pickle ----
+# The runtime pillar's parallel to GATE7: every `pickle\runtime/*_test.pkl` runs under
+# the Rust test harness (`pickle test pickle\runtime` dir mode picks up all `*_test.pkl`)
 # and every file must report 0 failures. Like GATE7 this is a local-only gate: both
 # selfhost trees are gitignored by design until the switchover.
 $g10total = 0; $g10pass = 0; $g10fail = 0
-$out10 = & $cli test "runtime-selfhost" 2>&1
+$out10 = & $cli test "pickle\runtime" 2>&1
 foreach ($l in ($out10 | Select-String "test result:")) {
     if ($l.Line -match "test result: (\d+) passed; (\d+) failed") {
         $g10pass += [int]$matches[1]
@@ -237,7 +237,7 @@ foreach ($l in ($out10 | Select-String "test result:")) {
         $g10total += [int]$matches[1] + [int]$matches[2]
     }
 }
-Write-Output "GATE10 RUNTIME-SELFHOST SUITE (direct: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10fail -eq 0)"
+Write-Output "GATE10 PICKLE RUNTIME SUITE (direct: pass=$g10pass fail=$g10fail of $g10total): PASS=$($g10fail -eq 0)"
 
 # ---- GATE 11: stdlib byte-parity -- the ported test driver must reproduce the
 # Rust `pickle test` stdout+exit for every stdlib *_test.pkl at any depth
@@ -266,13 +266,13 @@ foreach ($m in $g11tests) {
 Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files): PASS=$g11ok FAIL=$g11fail"
 
 # ---- GATE 12: ported AOT build — source -> IR -> x64 -> COFF -> PE-link, all in the port ----
-# Deepest build-path proof (PICKLE_AUDIT 17.2): cli-selfhost/build.pkl is AOT-built to a
+# Deepest build-path proof (PICKLE_AUDIT 17.2): pickle\cli/build.pkl is AOT-built to a
 # native driver (Rust only bootstraps that link), then with no Rust compiler in the loop it
 # lowers every battery main to a real PE .exe via the ported x64 backend, COFF writer, and
 # ported PE linker (compiler.linklib) against the nostd runtime archive. Each produced exe
 # must then run with stdout byte-identical to the Rust JIT oracle for the same source.
 $pklcBuild = "tools\diff\port\pklc_build.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\build.pkl" $pklcBuild)) {
+if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
     Write-Output "GATE12 PORTED BUILD: DRIVER BUILD FAILED"
 } else {
     $combinedCand = @(
@@ -310,14 +310,14 @@ if (-not (Invoke-BuildDriver "cli-selfhost\build.pkl" $pklcBuild)) {
 }
 
 # ---- GATE 12b: ported run — compile -> COFF -> PE-link -> spawn, all in the port ----
-# The ported run driver (cli-selfhost/run.pkl, AOT-built the same way) goes one step
+# The ported run driver (pickle\cli/run.pkl, AOT-built the same way) goes one step
 # further than the build driver: it compiles the source, links the PE, then spawns the
 # exe and propagates its exit code — with zero Rust compiler or irx-run in the loop.
 # It also exercises real argv forwarding: the freestanding exe reads the process
 # command line via GetCommandLineW/CommandLineToArgvW (routed through shell32 by the
 # ported PE linker), so os_args_main runs WITH arguments here, unlike the build block.
 $pklcRun = "tools\diff\port\pklc_run.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\run.pkl" $pklcRun)) {
+if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
     Write-Output "GATE12b PORTED RUN: DRIVER BUILD FAILED"
 } else {
     $combinedCand = @(
@@ -375,7 +375,7 @@ if (-not (Invoke-BuildDriver "cli-selfhost\run.pkl" $pklcRun)) {
 # ---- CLI personality: the ported driver reproduces the toolchain's fixed-output
 # commands byte-for-byte (`-V`/`--version`, and the `jar` easter egg). ----
 $pklcMain = "tools\diff\port\pklc_cli.exe"
-if (-not (Invoke-BuildDriver "cli-selfhost\main.pkl" $pklcMain)) {
+if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklcMain)) {
     Write-Output "CLI PERSONALITY: DRIVER BUILD FAILED"
 } else {
     $g13dir = "tools\diff\g13"

@@ -302,7 +302,8 @@ mod tests {
         let _guard = setup();
         let s = string_from_bytes(b"hello".as_ptr(), 5, crate::gc::gc_mut());
         assert_eq!(string_bytes_len(s), 5);
-        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
         assert_eq!(bytes, b"hello");
     }
 
@@ -312,7 +313,8 @@ mod tests {
         let a = string_from_bytes(b"foo".as_ptr(), 3, crate::gc::gc_mut());
         let b = string_from_bytes(b"bar".as_ptr(), 3, crate::gc::gc_mut());
         let c = string_concat(a, b);
-        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(c), string_bytes_len(c)) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(string_bytes_ptr(c), string_bytes_len(c)) };
         assert_eq!(bytes, b"foobar");
     }
 
@@ -347,7 +349,8 @@ mod tests {
     fn float_format() {
         let _guard = setup();
         let s = float64_to_string(1.5);
-        let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
         assert_eq!(bytes, b"1.5");
     }
 }

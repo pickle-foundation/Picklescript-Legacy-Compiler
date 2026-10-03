@@ -156,12 +156,12 @@ path: `pickle_map_new` / `set` / `get_boxed` / `has` / `len` / `keys` /
 ### Ported build path (17.2)
 
 A self-hosted `pickle build` exists independently of the Rust JIT/AOT:
-`cli-selfhost/build.pkl` runs source → IR → x64 → COFF → PE-link entirely in
+`pickle/cli/build.pkl` runs source → IR → x64 → COFF → PE-link entirely in
 the ported toolchain, producing a real runnable `.exe` without Rust in the
 loop (Rust only bootstraps the AOT link of the driver itself). It is checked
 by GATE12 in the battery: every main compiles through the ported path and its
 exe output is byte-identical to the Rust JIT oracle. The ported linker lives
-in `compiler-selfhost/linklib.pkl` (importable, no `fn main`) with
+in `pickle/compiler/linklib.pkl` (importable, no `fn main`) with
 `linker.pkl` kept as a thin driver; drivers import `compiler.linklib` rather
 than `compiler.linker` because importing a module that declares `main`
 breaks entry-point detection.
@@ -615,7 +615,7 @@ the above.
   `isf=`, `int=`, `ch=`, `T("...")`/`E[tok; ...]` string segments, and a
   trailing `doc=` for doc-comment trivia). Newline and Eof tokens are
   included. The format is the serialized contract the self-hosted lexer
-  (`compiler-selfhost/lexer.pkl`) reproduces byte-for-byte, so `pickle lex`
+  (`pickle/compiler/lexer.pkl`) reproduces byte-for-byte, so `pickle lex`
   output on the Rust and self-hosted compilers diff cleanly.
 - `pickle ir`      — dump typed IR.
 - `pickle test`  — discover test modules under `tests/` (or a given path) and JIT-compile, run, report. Directory targets only pick up `*_test.pkl` / `*.test.pkl` files. Supports `test fn name()` and `test("desc", ...)`/`it` suites with `describe` groups and `beforeAll`/`beforeEach`/`afterEach`/`afterAll` hooks; `--filter` narrows by test-name substring (matches the desugared path, so `describe`/`test` names both filter). `#[tag("name")]` on a test item attaches test tags (repeatable); `--tag name` runs only tests carrying it (repeatable, any-tag match, AND-combined with `--filter`).

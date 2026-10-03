@@ -50,11 +50,11 @@ pub(crate) mod shadow;
 mod statics;
 mod stream;
 pub(crate) mod strings;
+mod sync;
 mod test;
 mod threads;
 mod trace;
 mod r#tuple;
-mod sync;
 #[cfg(not(feature = "nostd"))]
 pub mod world;
 
@@ -381,6 +381,7 @@ declare_abi! {
     pickle_class_implements => crate::class::pickle_class_implements,
     pickle_class_is => crate::class::pickle_class_is,
     pickle_class_new => crate::class::pickle_class_new,
+    pickle_class_name => crate::class::pickle_class_name,
     pickle_class_register => crate::class::pickle_class_register,
     pickle_iface_cast => crate::class::pickle_iface_cast,
     pickle_iface_method => crate::class::pickle_iface_method,
@@ -405,6 +406,7 @@ declare_abi! {
     pickle_box_char => crate::boxscalar::pickle_box_char,
     pickle_box_f64 => crate::boxscalar::pickle_box_f64,
     pickle_box_i64 => crate::boxscalar::pickle_box_i64,
+    pickle_f64_from_bits => crate::boxscalar::pickle_f64_from_bits,
     pickle_unbox_bool => crate::boxscalar::pickle_unbox_bool,
     pickle_unbox_char => crate::boxscalar::pickle_unbox_char,
     pickle_unbox_f64 => crate::boxscalar::pickle_unbox_f64,
@@ -453,13 +455,18 @@ declare_abi! {
     // row the JIT bails with "unresolved symbol" on the first call.
     pickle_gc_collect => crate::gc::pickle_gc_collect,
     pickle_gc_collection_count => crate::gc::pickle_gc_collection_count,
+    pickle_gc_set_caller_hook => crate::gc::pickle_gc_set_caller_hook,
+    // The observable GC contract. Without these rows the JIT reports
+    // "unresolved symbol" on the first call, exactly like `gcCollect` above.
+    pickle_gc_allocations_since_gc => crate::gc::pickle_gc_allocations_since_gc,
+    pickle_gc_bytes_since_gc => crate::gc::pickle_gc_bytes_since_gc,
+    pickle_gc_set_threshold => crate::gc::pickle_gc_set_threshold,
 
     pickle_args => crate::os::pickle_args,
     pickle_args_set => crate::os::pickle_args_set,
     pickle_exit => crate::os::pickle_exit,
 
-    #[cfg(not(feature = "nostd"))]
-    pickle_current_dir => crate::process::pickle_current_dir,
+    pickle_current_dir => crate::os::pickle_current_dir,
     #[cfg(not(feature = "nostd"))]
     pickle_proc_code => crate::process::pickle_proc_code,
     #[cfg(not(feature = "nostd"))]
@@ -594,7 +601,10 @@ mod tests {
         // reporter read, so a symbol that is not listed is not linkable.
         assert_eq!(
             ALL_ABI_NAMES.len(),
-            ALL_ABI_NAMES.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ALL_ABI_NAMES
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             "ABI names must be unique"
         );
     }

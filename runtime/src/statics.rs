@@ -7,10 +7,10 @@
 //! same representation rules as class instance slots and list elements: every
 //! cell holds a managed pointer (boxed scalars, strings, class instances…).
 
-#[cfg(not(feature = "nostd"))]
-use std::sync::Mutex;
 #[cfg(feature = "nostd")]
 use crate::nostd::sync::Mutex;
+#[cfg(not(feature = "nostd"))]
+use std::sync::Mutex;
 
 use crate::gc::pickle_gc_root_add;
 use crate::object::PickleObject;

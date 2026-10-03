@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)][string]$Target,
     [switch]$SelfhostLink
 )
@@ -24,7 +24,7 @@ try {
 # ---- 2. selfhost driver: source -> PickleIR -> x64 lower -> funcs.s ----
 Push-Location $Root
 try {
-    $drvOut = & $Cli run cli-selfhost\x64_real_run.pkl -- $Target $Probe 2>&1
+    $drvOut = & $Cli run pickle\cli\x64_real_run.pkl -- $Target $Probe 2>&1
     $drvOutTxt = $drvOut -join "`n"
     if ($LASTEXITCODE -ne 0) { Write-Output "DRIVER FAIL exit=$LASTEXITCODE"; Write-Output $drvOutTxt; exit 1 }
     if ($drvOutTxt -notmatch "X64REAL OK") { Write-Output $drvOutTxt; Write-Output "DRIVER: lowering failed"; exit 1 }
@@ -42,7 +42,7 @@ if ($SelfhostLink) {
         "$Env:TEMP\opencode\rarc\combined.lib"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $Combined) { Write-Output "COMBINED LIB NOT FOUND: $Temp\rarc\combined.lib (rebuild via cargo build -p pickle-runtime --features nostd + ar)"; exit 1 }
-    $drvOut = & $Cli run compiler-selfhost\linker.pkl -- $obj $Combined $exe 2>&1
+    $drvOut = & $Cli run pickle\compiler\linker.pkl -- $obj $Combined $exe 2>&1
     $drvOutTxt = $drvOut -join "`n"
     if ($LASTEXITCODE -ne 0 -or $drvOutTxt -notmatch "LINKER WROTE") { Write-Output "SELFHOST LINK FAIL exit=$LASTEXITCODE"; Write-Output $drvOutTxt; exit 1 }
     Write-Output "SELFHOST LINKED: $($drvOutTxt -replace '[\r\n]+','; ')"

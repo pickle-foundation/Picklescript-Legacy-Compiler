@@ -213,6 +213,19 @@ fn is_list_sortable(t: &Ty) -> bool {
     )
 }
 
+/// Whether `s` is a plain C identifier, i.e. usable verbatim as a linkable symbol
+/// name by `#[symbol("...")]`. Guards against a Pickle-level override that would
+/// either never resolve at link time or collide with the COFF symbol table.
+fn is_abi_symbol(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
 fn collect_manual_fns(prog: &Program) -> (HashSet<String>, HashMap<String, Vec<bool>>) {
     let mut rets = HashSet::new();
     let mut params = HashMap::new();
@@ -318,6 +331,50 @@ impl<'a> Checker<'a> {
                             self.err(a.span, "`#[manualAlloc]` takes no arguments");
                         }
                     }
+                    // Exact C ABI symbol name for a top-level fn. This is how the
+                    // ported runtime defines `pickle_*` ABI functions directly in
+                    // Pickle instead of linking the Rust archive.
+                    "symbol" if is_fn => {
+                        if a.args.len() != 1 {
+                            self.err(a.span, "`#[symbol(...)]` takes exactly one string literal");
+                        } else {
+                            match &a.args[0].kind {
+                                ExprKind::Lit(Lit::String(parts)) => {
+                                    let is_plain = parts
+                                        .iter()
+                                        .all(|p| matches!(p, crate::ast::StrPart::Text(_)));
+                                    let text: String = parts
+                                        .iter()
+                                        .map(|p| match p {
+                                            crate::ast::StrPart::Text(t) => t.clone(),
+                                            crate::ast::StrPart::Expr(_) => String::new(),
+                                        })
+                                        .collect();
+                                    if !is_plain || text.is_empty() {
+                                        self.err(
+                                            a.args[0].span,
+                                            "`#[symbol(...)]` requires a non-empty string literal",
+                                        );
+                                    } else if !is_abi_symbol(&text) {
+                                        self.err(
+                                            a.args[0].span,
+                                            "`#[symbol(...)]` must be a C identifier \
+                                             (letters, digits, underscore; not starting with a digit)",
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    self.err(
+                                        a.args[0].span,
+                                        "`#[symbol(...)]` requires a non-empty string literal",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    "symbol" => {
+                        self.err(a.span, "`#[symbol(...)]` is only allowed on functions");
+                    }
                     "tag" if is_test => {
                         if a.args.is_empty() {
                             self.err(a.span, "`#[tag(...)]` needs at least one tag");
@@ -380,6 +437,18 @@ impl<'a> Checker<'a> {
                 ItemKind::Class(c) => self.check_class_bodies(c),
                 ItemKind::Struct(s) => self.check_struct_bodies(s),
                 ItemKind::Enum(_) | ItemKind::Interface(_) => {}
+                ItemKind::Global(g) => {
+                    let ty = self
+                        .resolved
+                        .globals
+                        .iter()
+                        .find(|f| f.name == g.name)
+                        .map(|f| f.ty.clone())
+                        .unwrap_or(Ty::Unknown);
+                    let got = self.check_expr(&g.value);
+                    self.check_assignable(&ty, &got, g.span, "global initializer");
+                    self.guard_stored_ref(&ty, &got, g.span, "a `var` binding");
+                }
             }
         }
         self.check_interface_conformance();
@@ -635,8 +704,10 @@ impl<'a> Checker<'a> {
         // option rules (e.g. a `Map<int, V>` literal satisfies a
         // `Map<int?, V>` binding). Container covariance is otherwise rejected.
         if let (Ty::Map(kw, vw), Ty::Map(kg, vg)) = (want, got) {
-            let key_opt = matches!(kw.as_ref(), Ty::Option(_)) || matches!(kg.as_ref(), Ty::Option(_));
-            let val_opt = matches!(vw.as_ref(), Ty::Option(_)) || matches!(vg.as_ref(), Ty::Option(_));
+            let key_opt =
+                matches!(kw.as_ref(), Ty::Option(_)) || matches!(kg.as_ref(), Ty::Option(_));
+            let val_opt =
+                matches!(vw.as_ref(), Ty::Option(_)) || matches!(vg.as_ref(), Ty::Option(_));
             if (key_opt || val_opt) && self.ok_types(kw, kg) && self.ok_types(vw, vg) {
                 return true;
             }
@@ -2262,8 +2333,11 @@ impl<'a> Checker<'a> {
             let _ = e;
             return t;
         }
-        if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
+if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
             return c.ty.clone();
+        }
+        if let Some(g) = self.resolved.globals.iter().find(|g| g.name == name) {
+            return g.ty.clone();
         }
         // Implicit receiver: a bare field/property/method name inside a
         // class or struct body refers to `this.name`.
@@ -2718,10 +2792,7 @@ impl<'a> Checker<'a> {
                 if self.manual_ret_fns.contains(cname) {
                     self.pending_owned_calls.insert(e.span);
                 }
-                if first.is_async
-                    && first.generics.is_empty()
-                    && !matches!(first.ret, Ty::Empty)
-                {
+                if first.is_async && first.generics.is_empty() && !matches!(first.ret, Ty::Empty) {
                     // Calling an `async fn` does not run the body: it returns a
                     // captured 0-arg function (the future) typed `() -> R`,
                     // which `await` drives.
@@ -3879,8 +3950,25 @@ impl<'a> Checker<'a> {
                 Ty::Bool
             }
             And | Or => {
-                self.check_bool_cond(lhs);
-                self.check_bool_cond(rhs);
+                // `lt`/`rt` are already `check_expr(lhs)`/`check_expr(rhs)`.
+                // Calling `check_bool_cond` here would re-walk both operands,
+                // doubling the work at every level of a left-leaning
+                // `a || b || c` chain (T(n) = 2*T(n-1), i.e. exponential) and
+                // re-emitting any diagnostic the operands already produced.
+                if lt != Ty::Unknown && lt != Ty::Bool {
+                    self.err_note(
+                        lhs.span,
+                        "condition must be a `bool`",
+                        format!("found `{lt}`"),
+                    );
+                }
+                if rt != Ty::Unknown && rt != Ty::Bool {
+                    self.err_note(
+                        rhs.span,
+                        "condition must be a `bool`",
+                        format!("found `{rt}`"),
+                    );
+                }
                 Ty::Bool
             }
             Range | RangeIncl => Ty::Range(Box::new(lt)),
@@ -4074,6 +4162,25 @@ impl<'a> Checker<'a> {
         let moved_from = self.manual_move_source(value);
         match &target.kind {
             ExprKind::Ident(name) => {
+// A top-level `var` is assignable by name from anywhere in the
+                // module; there is no shadow-frame entry to consult.
+                if let Some(g) = self.resolved.globals.iter().find(|g| g.name == *name) {
+                    // `vt` is the type of `value` computed once above; checking
+                    // the expression again here would double-emit diagnostics.
+                    self.check_assignable(
+                        &g.ty,
+                        &vt,
+                        target.span,
+                        "assignment to a top-level `var`",
+                    );
+                    self.guard_stored_ref(
+                        &g.ty,
+                        &vt,
+                        target.span,
+                        "an assignment to a top-level `var`",
+                    );
+                    return Ty::Empty;
+                }
                 match self.lookup(name).cloned() {
                     Some(l) => {
                         if !l.mutable {
@@ -4130,7 +4237,12 @@ impl<'a> Checker<'a> {
                                         );
                                     }
                                     self.check_assignable(&f.0.ty, &vt, target.span, "assignment");
-                                    self.guard_stored_ref(&f.0.ty, &vt, target.span, "an assignment");
+                                    self.guard_stored_ref(
+                                        &f.0.ty,
+                                        &vt,
+                                        target.span,
+                                        "an assignment",
+                                    );
                                     return Ty::Empty;
                                 }
                             }
@@ -4762,7 +4874,10 @@ impl<'a> Checker<'a> {
         if !matches!(av, Ty::List(ref i) if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown))
             && !matches!(av, Ty::Unknown)
         {
-            self.err(args[0].value.span, "`run_cmd`'s `argv` must be a `List<string>`");
+            self.err(
+                args[0].value.span,
+                "`run_cmd`'s `argv` must be a `List<string>`",
+            );
             return Ty::Unknown;
         }
         // cwd?: string | none
@@ -4770,7 +4885,10 @@ impl<'a> Checker<'a> {
         if !matches!(cwd, Ty::String | Ty::Unknown | Ty::None)
             && !matches!(cwd, Ty::Option(ref i) if matches!(**i, Ty::String | Ty::Unknown))
         {
-            self.err(args[1].value.span, "`run_cmd`'s `cwd` must be a `string` or `none`");
+            self.err(
+                args[1].value.span,
+                "`run_cmd`'s `cwd` must be a `string` or `none`",
+            );
             return Ty::Unknown;
         }
         // envs?: Map<string, string> | none
@@ -4823,7 +4941,10 @@ impl<'a> Checker<'a> {
         if !matches!(mx, Ty::Int | Ty::Unknown | Ty::None)
             && !matches!(mx, Ty::Option(ref i) if matches!(**i, Ty::Int))
         {
-            self.err(args[5].value.span, "`run_cmd`'s `max_out` must be an `int` or `none`");
+            self.err(
+                args[5].value.span,
+                "`run_cmd`'s `max_out` must be an `int` or `none`",
+            );
             return Ty::Unknown;
         }
         // timeout_ms?: int | none
@@ -4840,7 +4961,10 @@ impl<'a> Checker<'a> {
         // inherit_io: bool
         let inh = self.check_expr(&args[7].value);
         if !matches!(inh, Ty::Bool | Ty::Unknown) {
-            self.err(args[7].value.span, "`run_cmd`'s `inherit_io` must be a `bool`");
+            self.err(
+                args[7].value.span,
+                "`run_cmd`'s `inherit_io` must be a `bool`",
+            );
             return Ty::Unknown;
         }
         Ty::Option(Box::new(Ty::Tuple(vec![
@@ -4868,14 +4992,20 @@ impl<'a> Checker<'a> {
         if !matches!(av, Ty::List(ref i) if matches!(**i, Ty::String) | matches!(**i, Ty::Unknown))
             && !matches!(av, Ty::Unknown)
         {
-            self.err(args[0].value.span, "`run_spawn`'s `argv` must be a `List<string>`");
+            self.err(
+                args[0].value.span,
+                "`run_spawn`'s `argv` must be a `List<string>`",
+            );
             return Ty::Unknown;
         }
         let cwd = self.check_expr(&args[1].value);
         if !matches!(cwd, Ty::String | Ty::Unknown | Ty::None)
             && !matches!(cwd, Ty::Option(ref i) if matches!(**i, Ty::String | Ty::Unknown))
         {
-            self.err(args[1].value.span, "`run_spawn`'s `cwd` must be a `string` or `none`");
+            self.err(
+                args[1].value.span,
+                "`run_spawn`'s `cwd` must be a `string` or `none`",
+            );
             return Ty::Unknown;
         }
         let envs = self.check_expr(&args[2].value);
@@ -4911,7 +5041,10 @@ impl<'a> Checker<'a> {
         if !matches!(mx, Ty::Int | Ty::Unknown | Ty::None)
             && !matches!(mx, Ty::Option(ref i) if matches!(**i, Ty::Int))
         {
-            self.err(args[4].value.span, "`run_spawn`'s `max_out` must be an `int` or `none`");
+            self.err(
+                args[4].value.span,
+                "`run_spawn`'s `max_out` must be an `int` or `none`",
+            );
             return Ty::Unknown;
         }
         Ty::Option(Box::new(Ty::Stream))
@@ -4921,7 +5054,10 @@ impl<'a> Checker<'a> {
     /// `proc_in_close(h)`: single-handle process queries.
     fn check_proc_handle(&mut self, e: &Expr, bname: &str, args: &[CallArg]) -> Ty {
         if args.len() != 1 || args[0].name.is_some() || args[0].spread {
-            self.err(e.span, format!("`{bname}(handle)` takes exactly one argument"));
+            self.err(
+                e.span,
+                format!("`{bname}(handle)` takes exactly one argument"),
+            );
             for a in args {
                 let _ = self.check_expr(&a.value);
             }
@@ -4939,15 +5075,19 @@ impl<'a> Checker<'a> {
     /// `thread_spawn(body)` and `once_run(o, body)`. `body_index` is the
     /// argument that has to be a zero-argument function: a lambda, or a name
     /// bound to one. The other arguments are handles (`int`).
-    fn check_task_body(&mut self, e: &Expr, bname: &str, args: &[CallArg], body_index: usize) -> Ty {
+    fn check_task_body(
+        &mut self,
+        e: &Expr,
+        bname: &str,
+        args: &[CallArg],
+        body_index: usize,
+    ) -> Ty {
         let label = if body_index == 0 {
             "`thread_spawn(body)`".to_string()
         } else {
             "`once_run(once, body)`".to_string()
         };
-        if args.len() != body_index + 1
-            || args.iter().any(|a| a.name.is_some() || a.spread)
-        {
+        if args.len() != body_index + 1 || args.iter().any(|a| a.name.is_some() || a.spread) {
             self.err(e.span, format!("{label} takes exactly one body argument"));
             for a in args {
                 let _ = self.check_expr(&a.value);
@@ -4983,10 +5123,7 @@ impl<'a> Checker<'a> {
             other => {
                 self.err(
                     args[body_index].value.span,
-                    format!(
-                        "{label}'s body must be a function, found `{}`",
-                        other
-                    ),
+                    format!("{label}'s body must be a function, found `{}`", other),
                 );
             }
         }
@@ -5001,7 +5138,10 @@ impl<'a> Checker<'a> {
     /// `List<byte>?`.
     fn check_proc_read(&mut self, e: &Expr, bname: &str, args: &[CallArg]) -> Ty {
         if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
-            self.err(e.span, format!("`{bname}(handle, n)` takes exactly two arguments"));
+            self.err(
+                e.span,
+                format!("`{bname}(handle, n)` takes exactly two arguments"),
+            );
             for a in args {
                 let _ = self.check_expr(&a.value);
             }
@@ -5012,7 +5152,10 @@ impl<'a> Checker<'a> {
         }
         let n = self.check_expr(&args[1].value);
         if !matches!(n, Ty::Int | Ty::Unknown) {
-            self.err(args[1].value.span, format!("`{bname}`'s `n` must be an `int`"));
+            self.err(
+                args[1].value.span,
+                format!("`{bname}`'s `n` must be an `int`"),
+            );
             return Ty::Unknown;
         }
         Ty::Option(Box::new(Ty::List(Box::new(Ty::Byte))))
@@ -5022,7 +5165,10 @@ impl<'a> Checker<'a> {
     /// returning the number of bytes written.
     fn check_proc_write(&mut self, e: &Expr, args: &[CallArg]) -> Ty {
         if args.len() != 2 || args.iter().any(|a| a.name.is_some() || a.spread) {
-            self.err(e.span, "`proc_in_write(handle, b)` takes exactly two arguments");
+            self.err(
+                e.span,
+                "`proc_in_write(handle, b)` takes exactly two arguments",
+            );
             for a in args {
                 let _ = self.check_expr(&a.value);
             }
@@ -5037,7 +5183,10 @@ impl<'a> Checker<'a> {
             Ty::List(ref i) if matches!(**i, Ty::Byte) | matches!(**i, Ty::Unknown)
         ) && !matches!(b, Ty::Unknown)
         {
-            self.err(args[1].value.span, "`proc_in_write`'s `b` must be a `List<byte>`");
+            self.err(
+                args[1].value.span,
+                "`proc_in_write`'s `b` must be a `List<byte>`",
+            );
             return Ty::Unknown;
         }
         Ty::Int

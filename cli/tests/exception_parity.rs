@@ -105,7 +105,10 @@ fn run_aot(source: &str, name: &str) -> (String, bool) {
 
     let (out, err, ok) = run(&["build", "-o", exe.to_str().unwrap(), src.to_str().unwrap()]);
     assert!(ok, "AOT build of {name} failed:\n{out}{err}");
-    assert!(Path::new(&exe).exists(), "AOT build produced no executable for {name}");
+    assert!(
+        Path::new(&exe).exists(),
+        "AOT build produced no executable for {name}"
+    );
 
     let out = Command::new(&exe)
         .output()

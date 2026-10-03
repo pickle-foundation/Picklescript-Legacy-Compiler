@@ -65,13 +65,17 @@ pub struct Attribute {
 
 #[derive(Debug, Clone)]
 pub enum ItemKind {
-    Fn(FnDecl),
-    Class(ClassDecl),
-    Struct(StructDecl),
-    Enum(EnumDecl),
-    Interface(InterfaceDecl),
-    Const(ConstDecl),
-    Test(FnDecl),
+   Fn(FnDecl),
+   Class(ClassDecl),
+   Struct(StructDecl),
+   Enum(EnumDecl),
+   Interface(InterfaceDecl),
+   Const(ConstDecl),
+   /// Top-level mutable storage. Unlike [`ConstDecl`] this has an address and
+   /// keeps state between calls, so it is lowered to a real data slot rather
+   /// than inlined at use sites.
+   Global(GlobalDecl),
+   Test(FnDecl),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,11 +508,22 @@ pub enum InterfaceMember {
 
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
-    pub name: String,
-    pub visibility: Visibility,
-    pub ty: Option<TypeExpr>,
-    pub value: Expr,
-    pub span: Span,
+   pub name: String,
+   pub visibility: Visibility,
+   pub ty: Option<TypeExpr>,
+   pub value: Expr,
+   pub span: Span,
+}
+
+/// A top-level `var name: T = expr`. One slot per declaration, initialized
+/// before `main`, addressable via `&name`.
+#[derive(Debug, Clone)]
+pub struct GlobalDecl {
+   pub name: String,
+   pub visibility: Visibility,
+   pub ty: Option<TypeExpr>,
+   pub value: Expr,
+   pub span: Span,
 }
 
 #[derive(Debug, Clone)]

@@ -7,6 +7,8 @@
 
 use crate::heap::{raw_free, Heap};
 use crate::layout::{list_data, map_entries};
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, Once};
 use crate::object::{
     DescriptorTable, PickleObject, RootCell, PICKLE_CLASS_FLAG_FINALIZER, PICKLE_CLASS_LIST,
     PICKLE_CLASS_MAP, PICKLE_CLASS_STRING, PICKLE_FLAG_MANUAL,
@@ -15,27 +17,102 @@ use crate::shadow;
 use crate::trace;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 #[cfg(not(feature = "nostd"))]
 use std::sync::{Mutex, Once};
-#[cfg(feature = "nostd")]
-use crate::nostd::sync::{Mutex, Once};
 
-/// `PKL_NO_AUTO_GC=1` suppresses automatic collections. It is read once, not
-/// per allocation: on Windows an environment probe costs ~190us, which would
-/// dwarf the allocation itself on any box/string/list churn workload.
+/// `PKL_NO_AUTO_GC=1` suppresses automatic collections, and
+/// `PKL_GC_THRESHOLD=<bytes>` overrides the auto-collect threshold. Both are
+/// read once, not per allocation: on Windows an environment probe costs ~190us,
+/// which would dwarf the allocation itself on any box/string/list churn
+/// workload. A threshold pinned from the environment disables the adaptive
+/// post-collect adjustment (like an explicit `pickle_gc_set_threshold`): a
+/// fixed test/debug policy is not a heuristic. A tiny value makes a collection
+/// happen on (nearly) every allocation, which is how a missing root shows up
+/// as a small reproducible failure instead of a rare one.
+static ENV_INIT: Once = Once::new();
+
 static NO_AUTO_GC: AtomicBool = AtomicBool::new(false);
-static NO_AUTO_GC_INIT: Once = Once::new();
+static THRESHOLD_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+fn env_init() {
+    #[cfg(feature = "nostd")]
+    let (no_auto, threshold) = (
+        crate::nostd::getenv_present("PKL_NO_AUTO_GC"),
+        crate::nostd::getenv_value("PKL_GC_THRESHOLD"),
+    );
+    #[cfg(not(feature = "nostd"))]
+    let (no_auto, threshold) = (
+        std::env::var_os("PKL_NO_AUTO_GC").is_some(),
+        std::env::var("PKL_GC_THRESHOLD").ok(),
+    );
+    NO_AUTO_GC.store(no_auto, Ordering::Relaxed);
+    if let Some(raw) = threshold {
+        if let Ok(n) = raw.trim().parse::<u32>() {
+            if n > 0 {
+                THRESHOLD_OVERRIDE.store(n, Ordering::Relaxed);
+                AUTO_THRESHOLD_MANUAL.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 fn no_auto_gc_once() -> bool {
-    NO_AUTO_GC_INIT.call_once(|| {
-        #[cfg(feature = "nostd")]
-        let present = crate::nostd::getenv_present("PKL_NO_AUTO_GC");
-        #[cfg(not(feature = "nostd"))]
-        let present = std::env::var_os("PKL_NO_AUTO_GC").is_some();
-        NO_AUTO_GC.store(present, Ordering::Relaxed);
-    });
+    ENV_INIT.call_once(env_init);
     NO_AUTO_GC.load(Ordering::Relaxed)
+}
+
+/// `PKL_GC_CHECK=1` turns managed-pointer arguments in the container helpers
+/// into a checked assertion: each one must still be a live heap block, so a
+/// collection that freed a still-in-use object is reported by name at the
+/// dereference site instead of surfacing later as a mistyped pointer read.
+static GC_CHECK: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn gc_check_enabled() -> bool {
+    static CHECK_INIT: Once = Once::new();
+    CHECK_INIT.call_once(|| {
+        #[cfg(feature = "nostd")]
+        let present = crate::nostd::getenv_present("PKL_GC_CHECK");
+        #[cfg(not(feature = "nostd"))]
+        let present = std::env::var_os("PKL_GC_CHECK").is_some();
+        GC_CHECK.store(present, Ordering::Relaxed);
+    });
+    GC_CHECK.load(Ordering::Relaxed)
+}
+
+/// Debug hook: when a container helper reports a bad argument under
+/// `PKL_GC_CHECK`, the JIT installs a `extern "C" fn(usize)` that walks the
+/// current stack and resolves every return address that lands in compiled code.
+/// The runtime cannot resolve symbols itself (no dependency on the JIT), so it
+/// only hands over its own stack pointer.
+static CALLER_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+#[no_mangle]
+pub extern "C" fn pickle_gc_set_caller_hook(hook: usize) {
+    CALLER_HOOK.store(hook, Ordering::Relaxed);
+}
+
+/// Report the current call chain through the host-installed hook, if any.
+/// `tag` is only used in the panic message the caller prints afterwards.
+pub fn report_call_site(tag: &str) {
+    if !gc_check_enabled() {
+        return;
+    }
+    let hook = CALLER_HOOK.load(Ordering::Relaxed);
+    if hook == 0 {
+        return;
+    }
+    // A local's address is inside the current frame, so scanning upward from
+    // it walks the callers of this helper. The host reads 8-byte words, so
+    // align the anchor first.
+    let anchor = 0u8;
+    let sp = (&anchor as *const u8 as usize) & !7;
+    // SAFETY: the CLI installs a plain `extern "C" fn(usize)` (see
+    // `pickle_gc_set_caller_hook`); the hook only reads the stack.
+    let f: unsafe extern "C" fn(usize, usize, usize) = unsafe { core::mem::transmute(hook) };
+    unsafe {
+        f(sp, tag.as_ptr() as usize, tag.len());
+    }
 }
 
 /// Static root cells (compiler-emitted global variables and class statics).
@@ -387,11 +464,8 @@ impl Gc {
         // were sweeping the whole arena after every 8 MiB of allocation; with
         // the threshold pinned to a multiple of the live set, collections
         // amortize instead of taking over the run time.
-        let next = DEFAULT_AUTO_COLLECT_THRESHOLD.max(
-            self.live_bytes
-                .load(Ordering::Relaxed)
-                .saturating_mul(2),
-        );
+        let next = DEFAULT_AUTO_COLLECT_THRESHOLD
+            .max(self.live_bytes.load(Ordering::Relaxed).saturating_mul(2));
         if !AUTO_THRESHOLD_MANUAL.load(Ordering::Relaxed) {
             AUTO_THRESHOLD.store(next.min(1 << 30), Ordering::Relaxed);
         }
@@ -399,9 +473,15 @@ impl Gc {
 
     /// Maybe collect if the allocation threshold has been crossed.
     pub fn maybe_collect(&mut self) {
-        if !no_auto_gc_once()
-            && BYTES_SINCE_GC.load(Ordering::Relaxed) >= AUTO_THRESHOLD.load(Ordering::Relaxed)
-        {
+        if no_auto_gc_once() {
+            return;
+        }
+        ENV_INIT.call_once(env_init);
+        let threshold = match THRESHOLD_OVERRIDE.load(Ordering::Relaxed) {
+            0 => AUTO_THRESHOLD.load(Ordering::Relaxed),
+            n => n,
+        };
+        if BYTES_SINCE_GC.load(Ordering::Relaxed) >= threshold {
             self.collect();
         }
     }
@@ -635,6 +715,16 @@ pub extern "C" fn pickle_gc_allocations_since_gc() -> u32 {
     ALLOC_SINCE_GC.load(Ordering::Relaxed)
 }
 
+/// Bytes allocated since the last collection. This is the quantity the
+/// auto-collect trigger actually compares against `AUTO_THRESHOLD` in
+/// `maybe_collect`, and it is what a self-hosted runtime must read to own the
+/// decision itself. `pickle_gc_allocations_since_gc` (a count) is deliberately
+/// distinct and is not interchangeable with this.
+#[no_mangle]
+pub extern "C" fn pickle_gc_bytes_since_gc() -> u32 {
+    BYTES_SINCE_GC.load(Ordering::Relaxed)
+}
+
 /// Number of completed collection cycles (debug/stats).
 #[no_mangle]
 pub extern "C" fn pickle_gc_collection_count() -> u32 {
@@ -659,6 +749,7 @@ pub(crate) fn reset() {
     BYTES_SINCE_GC.store(0, Ordering::Relaxed);
     AUTO_THRESHOLD.store(DEFAULT_AUTO_COLLECT_THRESHOLD, Ordering::Relaxed);
     AUTO_THRESHOLD_MANUAL.store(false, Ordering::Relaxed);
+    THRESHOLD_OVERRIDE.store(0, Ordering::Relaxed);
     COLLECTIONS.store(0, Ordering::Relaxed);
     // Drop roots left behind by the previous module (e.g. leaked static-field
     // cells) so they can never trace objects from a destroyed heap.

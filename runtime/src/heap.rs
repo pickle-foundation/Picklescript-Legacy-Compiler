@@ -182,6 +182,43 @@ impl Heap {
         }
     }
 
+    /// Debug: is `p` the start of a live heap block? Used by the UAF probe to
+    /// tell "managed argument that the collector already freed" apart from
+    /// "pointer that was never a heap object".
+    pub fn debug_live_block(&self, p: *const PickleObject) -> bool {
+        unsafe {
+            let mut seg = self.segments;
+            while !seg.is_null() {
+                let start = (*seg).data_base() as usize;
+                let end = start + (*seg).used;
+                let addr = p as usize;
+                if addr >= start && addr < end {
+                    let mut cur = self.segments;
+                    while !cur.is_null() {
+                        let base = (*cur).data_base() as usize;
+                        let top = base + (*cur).used;
+                        let mut c = base;
+                        while c < top {
+                            let obj = c as *mut PickleObject;
+                            let size = (*obj).size as usize;
+                            if size == 0 {
+                                return false;
+                            }
+                            if c == addr {
+                                return (*obj).class_id != FREE_SENTINEL;
+                            }
+                            c += size;
+                        }
+                        cur = (*cur).next;
+                    }
+                    return false;
+                }
+                seg = (*seg).next;
+            }
+            false
+        }
+    }
+
     /// Allocate an object of exactly `size` (>= header, multiple of 8) bytes.
     pub fn alloc_object(&mut self, size: usize) -> *mut PickleObject {
         let size = align8(size).max(MIN_OBJECT);
@@ -295,6 +332,10 @@ impl Heap {
                             flush_dead(self, &mut dead_start, &mut dead_len);
                             deferred.push(obj);
                         } else {
+                            if gc_trace_env() {
+                                let cid = (*obj).class_id;
+                                eprintln!("GCSWEEP - {:p} class={} size={}", obj, cid, size);
+                            }
                             if gc_trace_env()
                                 && (*obj).class_id == crate::object::PICKLE_CLASS_BOX_INT
                             {

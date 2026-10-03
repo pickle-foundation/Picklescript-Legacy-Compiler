@@ -6,8 +6,8 @@
 //! epilogue. The collector treats every registered thread's frame slots as
 //! roots.
 
-use alloc::boxed::Box;
 use crate::object::PickleObject;
+use alloc::boxed::Box;
 
 /// Layout of a shadow frame. Slots follow the header inline:
 ///
@@ -42,14 +42,14 @@ pub struct GcThread {
     pub next: *mut GcThread,
 }
 
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, MutexGuard};
 /// Serialises mutations of and walks over the thread registry (`THREAD_HEAD`)
 /// and each node's frame list. The collector takes it for the whole walk so a
 /// concurrent `register_thread`/`unregister_thread`/`pickle_shadow_push` cannot
 /// free or mutate a node while it is being traced.
 #[cfg(not(feature = "nostd"))]
 use std::sync::{Mutex, MutexGuard};
-#[cfg(feature = "nostd")]
-use crate::nostd::sync::{Mutex, MutexGuard};
 
 /// Serialises mutations of and walks over the thread registry (`THREAD_HEAD`)
 /// and each node's frame list. The collector takes it for the whole walk so a

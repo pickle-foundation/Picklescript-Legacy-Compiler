@@ -1,9 +1,8 @@
 # Local-only patch overrides
 
-`/compiler-selfhost/`, `/cli-selfhost/` and `/runtime-selfhost/` are gitignored
-(see `.gitignore`, "self-hosting port sources (local-only until the switchover;
-never pushed)"). Fixes to those sources therefore never show up in `git status`
-and are lost if the directory is regenerated.
+`/pickle/` is gitignored (see `.gitignore`, "self-hosting port sources (local-only
+until the switchover; never pushed)"). Fixes to those sources therefore never show
+up in `git status` and are lost if the directory is regenerated.
 
 This directory preserves such fixes as unified diffs against their repo-relative
 paths, so they can be reapplied after a regen.
@@ -24,10 +23,10 @@ git apply --check tools\patches\<patch>.patch
 
 ## Patches
 
-### `compiler-selfhost-x64-shadow-frame-overlap.patch`
+### `pickle-x64-shadow-frame-overlap.patch`
 
 Two bugs where the shadow frame overlaps other frame data in
-`compiler-selfhost\x64.pkl`. Both corrupt values only for *some* functions, which
+`pickle\compiler\x64.pkl`. Both corrupt values only for *some* functions, which
 is why the failures looked unrelated.
 
 **1. `rcx` clobbered before param spill.** Corrupted arguments at **param slot 0**

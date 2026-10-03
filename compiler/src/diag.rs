@@ -111,6 +111,15 @@ impl SourceMap {
     pub fn get(&self, id: FileId) -> &SourceFile {
         &self.files[id.0]
     }
+
+    /// Every file the frontend read, in load order.
+    ///
+    /// A build cache keys its entry on these: the lowered program depends on
+    /// the contents of all of them, and the entry file's own text is only
+    /// known to the frontend once it has read it.
+    pub fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

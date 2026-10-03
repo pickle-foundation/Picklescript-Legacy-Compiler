@@ -1557,7 +1557,7 @@ class Lexer {
 }
 
 fn lexSource(src: string) -> string {
-    let lx = Lexer(bytes(src), 0, 0, none, range(0), 0)
+    let lx = Lexer(bytes(src), 0, 0, none, range(0))
     let toks = lx.run()
     var out = ""
     for (t in toks) {

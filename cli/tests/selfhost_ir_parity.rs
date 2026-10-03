@@ -15,7 +15,7 @@
 //! axis that only a self-host build can catch.
 //!
 //! All three fixtures run in one test function on purpose. The self-host side is
-//! driven through `cli-selfhost/ir_one.pkl`, which is stateless and reads its
+//! driven through `pickle/cli/ir_one.pkl`, which is stateless and reads its
 //! target from argv, so this is about keeping one failure message that names
 //! every module that drifted, rather than a race on a shared scratch file.
 
@@ -102,7 +102,7 @@ fn selfhost_ir(module: &str) -> String {
     let rel = format!("tests/pickle/{module}");
     let out = Command::new(cli())
         .current_dir(repo_root())
-        .args(["run", "cli-selfhost/ir_one.pkl", "--", &rel])
+        .args(["run", "pickle/cli/ir_one.pkl", "--", &rel])
         .output()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", cli().display()));
     assert!(
@@ -147,10 +147,7 @@ fn first_difference(native: &str, selfhost: &str) -> String {
     let s: Vec<&str> = selfhost.lines().collect();
     for (i, (a, b)) in n.iter().zip(s.iter()).enumerate() {
         if a != b {
-            return format!(
-                "line {}:\n  native: {a}\n  self  : {b}",
-                i + 1
-            );
+            return format!("line {}:\n  native: {a}\n  self  : {b}", i + 1);
         }
     }
     format!(

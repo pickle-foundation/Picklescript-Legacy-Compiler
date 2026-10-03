@@ -12,6 +12,8 @@
 #[cfg(not(feature = "nostd"))]
 use crate::fs::path_of;
 use crate::layout::{list_data, list_len, STREAM_INNER_OFF, STREAM_OBJECT_SIZE};
+#[cfg(feature = "nostd")]
+use crate::nostd::BufferedFile;
 use crate::object::{PickleObject, PICKLE_CLASS_STREAM};
 #[cfg(feature = "nostd")]
 use alloc::{boxed::Box, vec::Vec};
@@ -19,8 +21,6 @@ use alloc::{boxed::Box, vec::Vec};
 use std::fs::File;
 #[cfg(not(feature = "nostd"))]
 use std::io::{BufReader, BufWriter, Read, Write};
-#[cfg(feature = "nostd")]
-use crate::nostd::BufferedFile;
 
 /// A buffered stream target held by a `Stream` value.
 ///
@@ -97,7 +97,10 @@ fn open_reader(path: *const PickleObject) -> Option<StreamTarget> {
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_read(path: *const PickleObject) -> *mut PickleObject {
     match open_reader(path) {
-        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        Some(target) => stream_new(StreamInner {
+            closed: false,
+            target: Some(target),
+        }),
         None => core::ptr::null_mut(),
     }
 }
@@ -121,7 +124,10 @@ fn open_writer_create(path: *const PickleObject) -> Option<StreamTarget> {
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_write(path: *const PickleObject) -> *mut PickleObject {
     match open_writer_create(path) {
-        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        Some(target) => stream_new(StreamInner {
+            closed: false,
+            target: Some(target),
+        }),
         None => core::ptr::null_mut(),
     }
 }
@@ -149,7 +155,10 @@ fn open_writer_append(path: *const PickleObject) -> Option<StreamTarget> {
 #[no_mangle]
 pub extern "C" fn pickle_stream_open_append(path: *const PickleObject) -> *mut PickleObject {
     match open_writer_append(path) {
-        Some(target) => stream_new(StreamInner { closed: false, target: Some(target) }),
+        Some(target) => stream_new(StreamInner {
+            closed: false,
+            target: Some(target),
+        }),
         None => core::ptr::null_mut(),
     }
 }

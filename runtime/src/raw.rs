@@ -7,8 +7,8 @@
 //! exactly like C).
 
 use alloc::alloc::{alloc, dealloc, Layout};
-use core::cell::RefCell;
 use alloc::collections::BTreeMap;
+use core::cell::RefCell;
 
 /// Alignment for every raw block. Covers all scalar sizes (1..=8) and any
 /// future pointer payloads, and keeps every element naturally aligned.

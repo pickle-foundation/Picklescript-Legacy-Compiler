@@ -1,0 +1,39 @@
+module main
+
+fn main() {
+    println("allocations since gc:", gcAllocationsSinceGc())
+    println("bytes since gc:", gcBytesSinceGc())
+    println("collection count:", gcCollectionCount())
+
+    // A list forces real object allocations, so both counters must move.
+    var keep = [0]
+    var i = 0
+    while (i < 32) {
+        keep.push(i * 3)
+        i = i + 1
+    }
+    println("after 32 pushes, allocs >= 32:", gcAllocationsSinceGc() >= 32)
+    println("bytes > 0:", gcBytesSinceGc() > 0)
+
+    // Force a collection and watch the counters reset and increment.
+    gcSetThreshold(4096)
+    gcCollect(true)
+    // Read the counters into locals BEFORE printing: `println` itself formats
+    // and allocates, so reading through a println argument would observe
+    // post-print allocation rather than the post-collect state.
+    let allocsAfter = gcAllocationsSinceGc()
+    let bytesAfter = gcBytesSinceGc()
+    let cycles = gcCollectionCount()
+    println("after collect, collection count >= 1:", cycles >= 1)
+    println("after collect, bytes since gc < 4096 threshold:", bytesAfter < 4096)
+    println("after collect, allocs reset below pre-collect:", allocsAfter < 33)
+    // Assert rather than print: a regression that breaks the contract must fail
+    // the run, not merely print a changed line the parity gate would accept.
+    assert(cycles >= 1, "collection count did not advance after gcCollect")
+    assert(bytesAfter < 4096, "bytes-since-GC exceeded the threshold we just set")
+    assert(len(keep) == 33, "surviving list was damaged by the collection")
+
+    // Surviving objects must still be intact after the collection ran.
+    println("list len:", len(keep))
+    println("keep[0]:", keep[0], " keep[31]:", keep[31])
+}

@@ -1,0 +1,71 @@
+module main
+
+// Every float comparison operator, over values chosen so that each branch of
+// each lowering is taken: equal, unequal, less, greater, negative, positive
+// zero, and the f64 boundaries.
+//
+// This exists because the port backend had a real bug here that no other test
+// caught: float Eq/Ne/Lt/Le emitted `setcc` twice with ModRM 0xC0 (always AL),
+// so the second clobbered the first and the trailing `0x20 0xC8` / `0x08 0xC8`
+// combined against an undefined CL. `!=` became always true and `<` / `<=`
+// always false. A byte-exact unit test in `x64_test.pkl` had *pinned the buggy
+// encoding as expected*, and the Rust-side suite passed throughout because Rust
+// uses Cranelift. Only a test that runs through the port's own x64 encoder can
+// see this class of bug, so this one prints results rather than bytes.
+//
+// Rows are keyed by an index, not by the float values: printing a subnormal
+// expands to hundreds of digits and would bloat the goldens.
+
+fn b(v: bool): string {
+    if (v) { "T" } else { "F" }
+}
+
+fn row(n: int, a: float, c: float) {
+    println("r", n, " ", b(a == c), b(a != c), b(a < c), b(a <= c), b(a > c), b(a >= c))
+}
+
+fn main() {
+    // eq ne lt le gt ge
+    row(0, 1.0, 1.0)
+    row(1, 1.0, 2.0)
+    row(2, 2.0, 1.0)
+    row(3, -1.0, 1.0)
+    row(4, -2.0, -1.0)
+    row(5, -1.0, -2.0)
+    row(6, 0.0, 0.0)
+    row(7, 0.0, -0.0)
+    row(8, -0.0, 0.0)
+    row(9, 0.5, -0.5)
+    // Subnormals: equal and ordered but with no implicit leading 1.
+    row(10, 1.0e-320, 1.0e-320)
+    row(11, 5e-324, 1.0e-320)
+    // The f64 ceiling and something just under it.
+    row(12, 1.7976931348623157e308, 1.0e308)
+    row(13, 1.0, 1.7976931348623157e308)
+    // Chains, so a wrong ordering operator cannot cancel itself out.
+    println("c0 ", b(1.0 < 2.0 && 2.0 < 3.0), b(3.0 < 2.0 && 2.0 < 1.0))
+    println("c1 ", b(1.0 <= 1.0 && 1.0 >= 1.0), b(1.0 >= 2.0))
+    println("c2 ", b(1.0 > 2.0 || 2.0 > 3.0), b(1.0 > 2.0 || 3.0 > 2.0))
+    // Comparison results must flow through control flow and accumulate, not
+    // just be returned, or a wrong value could hide in a dead temp.
+    var n = 0
+    var i = 0
+    while (i < 6) {
+        if (floats_lt(i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    println("count ", n)
+    println("sign ", b(0.0 < -0.0), b(-0.0 < 0.0), b(0.0 == -0.0))
+}
+
+fn floats_lt(i: int): bool {
+    if (i < 3) {
+        return 1.0 < 2.0
+    }
+    if (i < 5) {
+        return 2.0 < 1.0
+    }
+    1.0 != 1.0
+}

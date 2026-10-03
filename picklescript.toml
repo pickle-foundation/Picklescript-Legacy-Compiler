@@ -13,9 +13,9 @@ license = "MIT"
 
 [workspace]
 members = [
-    { name = "compiler", path = "compiler-selfhost" },
-    { name = "cli", path = "cli-selfhost" },
-    { name = "runtime", path = "runtime-selfhost" },
+    { name = "compiler", path = "pickle/compiler" },
+    { name = "cli", path = "pickle/cli" },
+    { name = "runtime", path = "pickle/runtime" },
     { name = "std", path = "stdlib" },
 ]
 

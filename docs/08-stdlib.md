@@ -228,7 +228,7 @@ The `std.os` process surface ships as intrinsics:
   to return).
 
 `args()`/`exit()` in a Pickle source are what let the self-hosted compiler's
-driver accept a target-path argument: `pickle run cli-selfhost/main.pkl --
+driver accept a target-path argument: `pickle run pickle/cli/main.pkl --
 target.pkl` forwards the target as `args()[0]` (port gap 3, resolved and wired
 2026-09-24). The ported drivers prefer `args()` targets and fall back to their
 previous file-derived target lists when no trailing `--` args are given.

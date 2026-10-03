@@ -81,6 +81,7 @@ fn top_level_name(item: &Item) -> Option<&str> {
         ItemKind::Enum(e) => Some(&e.name),
         ItemKind::Interface(i) => Some(&i.name),
         ItemKind::Const(c) => Some(&c.name),
+        ItemKind::Global(g) => Some(&g.name),
         ItemKind::Test(f) => Some(&f.name),
     }
 }
@@ -92,11 +93,11 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Return { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
-          | Stmt::While { span, .. }
-          | Stmt::For { span, .. }
-          | Stmt::Try { span, .. }
-          | Stmt::Throw { span, .. }
-          | Stmt::Expr(Expr { span, .. })
+        | Stmt::While { span, .. }
+        | Stmt::For { span, .. }
+        | Stmt::Try { span, .. }
+        | Stmt::Throw { span, .. }
+        | Stmt::Expr(Expr { span, .. })
         | Stmt::Empty(span) => *span,
     }
 }
@@ -1257,6 +1258,13 @@ impl<'a> Rewriter<'a> {
                 }
                 self.rewrite_expr(&mut c.value);
             }
+            ItemKind::Global(g) => {
+                self.rename_decl(&mut g.name, item.span.file);
+                if let Some(ty) = &mut g.ty {
+                    self.rewrite_type(ty);
+                }
+                self.rewrite_expr(&mut g.value);
+            }
         }
     }
 
@@ -1770,12 +1778,12 @@ members = [
     #[test]
     fn parses_single_line_members() {
         let toml = "[workspace]
-members = [{ name = \"compiler\", path = \"compiler-selfhost\" }]
+members = [{ name = \"compiler\", path = \"pickle/compiler\" }]
 ";
         let m = parse_workspace_members(toml);
         assert_eq!(
             m.get("compiler").map(|s| s.as_str()),
-            Some("compiler-selfhost")
+            Some("pickle/compiler")
         );
     }
 
@@ -1794,14 +1802,14 @@ members = [\"alpha\", \"beta\"]
         let toml = "[package]
 name = \"picklescript\"
 [workspace]
-members = [{ name = \"compiler\", path = \"compiler-selfhost\" }]
+members = [{ name = \"compiler\", path = \"pickle/compiler\" }]
 [registry]
 default = \"pickle\"
 ";
         let m = parse_workspace_members(toml);
         assert_eq!(
             m.get("compiler").map(|s| s.as_str()),
-            Some("compiler-selfhost")
+            Some("pickle/compiler")
         );
         assert_eq!(m.len(), 1);
     }

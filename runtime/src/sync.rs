@@ -21,20 +21,20 @@
 //! atomic from user code — so `condWait`/`condSignal` are a one-permit
 //! semaphore, where the permit is the thing that cannot be dropped.
 
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::{Mutex, MutexGuard};
+#[cfg(not(feature = "nostd"))]
+use crate::world;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(feature = "nostd"))]
-use crate::world;
 #[cfg(not(feature = "nostd"))]
 use std::sync::Condvar;
 #[cfg(not(feature = "nostd"))]
 use std::sync::Mutex;
 #[cfg(not(feature = "nostd"))]
 use std::sync::MutexGuard;
-#[cfg(feature = "nostd")]
-use crate::nostd::sync::{Mutex, MutexGuard};
 
 /// Permits plus parked-waiter bookkeeping. One mutex, so the check and the
 /// count cannot be observed out of order.
@@ -59,10 +59,7 @@ pub struct PSemaphore {
 impl PSemaphore {
     fn new(permits: i64) -> Self {
         PSemaphore {
-            state: Mutex::new(SemState {
-                permits,
-                parked: 0,
-            }),
+            state: Mutex::new(SemState { permits, parked: 0 }),
             cv: Condvar::new(),
         }
     }
@@ -134,10 +131,7 @@ pub struct PSemaphore {
 impl PSemaphore {
     fn new(permits: i64) -> Self {
         PSemaphore {
-            state: Mutex::new(SemState {
-                permits,
-                parked: 0,
-            }),
+            state: Mutex::new(SemState { permits, parked: 0 }),
         }
     }
 
@@ -652,7 +646,7 @@ fn once_of(handle: i64) -> Option<&'static POnce> {
     }
 }
 
-    fn channel_of(handle: i64) -> Option<&'static Channel> {
+fn channel_of(handle: i64) -> Option<&'static Channel> {
     match entry(handle) {
         Some(Primitive::Channel(c)) => Some(c),
         _ => None,
@@ -893,7 +887,9 @@ pub extern "C" fn pickle_once_run(handle: i64, body: *mut crate::object::PickleO
 #[no_mangle]
 pub extern "C" fn pickle_channel_new(cap: i64) -> i64 {
     let cap = if cap < 1 {
-        crate::panic::fatal(&format!("pickle: channel capacity must be at least 1, got {cap}"));
+        crate::panic::fatal(&format!(
+            "pickle: channel capacity must be at least 1, got {cap}"
+        ));
     } else {
         cap as usize
     };
@@ -1187,10 +1183,16 @@ mod tests {
         let _guard = crate::gc::test_begin();
         let ch = pickle_channel_new(3);
         assert_eq!(pickle_channel_cap(ch), 3);
-        assert!(pickle_channel_try_recv(ch).is_null(), "empty channel reads null");
+        assert!(
+            pickle_channel_try_recv(ch).is_null(),
+            "empty channel reads null"
+        );
         assert!(pickle_channel_try_send(ch, 0x2A));
         assert_eq!(pickle_channel_len(ch), 1);
-        assert_eq!(crate::boxscalar::pickle_unbox_i64(pickle_channel_try_recv(ch)), 0x2A);
+        assert_eq!(
+            crate::boxscalar::pickle_unbox_i64(pickle_channel_try_recv(ch)),
+            0x2A
+        );
         assert_eq!(pickle_channel_len(ch), 0);
         pickle_channel_send(ch, 0x2B);
         pickle_channel_send(ch, 0x2C);
@@ -1221,7 +1223,11 @@ mod tests {
                 let mut picked = Vec::new();
                 while let Some(v) = {
                     let v = pickle_channel_try_recv(ch_ref);
-                    if v.is_null() { None } else { Some(crate::boxscalar::pickle_unbox_i64(v)) }
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(crate::boxscalar::pickle_unbox_i64(v))
+                    }
                 } {
                     picked.push(v);
                 }
@@ -1233,17 +1239,18 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 assert!(pickle_channel_closed(ch_ref));
-                stopped_ref.store(
-                    if picked == vec![0x41] { 1 } else { 2 },
-                    Ordering::Release,
-                );
+                stopped_ref.store(if picked == vec![0x41] { 1 } else { 2 }, Ordering::Release);
             });
             // Give the reader a moment, then close: it must still see the
             // buffered value before the next receive fails.
             std::thread::sleep(std::time::Duration::from_millis(20));
             pickle_channel_close(ch);
         });
-        assert_eq!(stopped.load(Ordering::Acquire), 1, "buffer drained before close failure");
+        assert_eq!(
+            stopped.load(Ordering::Acquire),
+            1,
+            "buffer drained before close failure"
+        );
     }
 
     #[cfg(not(feature = "nostd"))]

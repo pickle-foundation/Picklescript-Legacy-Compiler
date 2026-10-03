@@ -71,7 +71,7 @@ pub enum ErrorCode {
     OverwriteManual,
     LeakedOwned,
     UnsafeRequired,
-StoredRef,
+    StoredRef,
     // E09xx: checker accepted, codegen has no lowering yet.
     NotLowered,
 }

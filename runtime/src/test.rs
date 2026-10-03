@@ -18,12 +18,12 @@
 // registry and the `pickle_runtime_run_tests` runner need a `Mutex`, and the
 // freestanding build has an API-compatible one; the externs themselves use
 // `alloc` + the always-compiled modules.
+#[cfg(feature = "nostd")]
+use crate::nostd::sync::Mutex;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 #[cfg(not(feature = "nostd"))]
 use std::sync::Mutex;
-#[cfg(feature = "nostd")]
-use crate::nostd::sync::Mutex;
 
 /// A single test descriptor. `#[repr(C)]` so the host toolchain can lay it
 /// out next to compiled code.
@@ -197,8 +197,9 @@ pub extern "C" fn pickle_expect_obj_eq(
                 crate::strings::string_bytes_len(b),
             );
             // SAFETY: both slices come straight from managed string payloads.
-            let eq =
-                unsafe { core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb) };
+            let eq = unsafe {
+                core::slice::from_raw_parts(pa, la) == core::slice::from_raw_parts(pb, lb)
+            };
             eq as i32
         }
         (PICKLE_CLASS_LIST, PICKLE_CLASS_LIST) => {

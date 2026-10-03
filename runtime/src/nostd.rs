@@ -3,12 +3,13 @@
 //! Only compiled when the `nostd` cargo feature is on. Provides the pieces a
 //! freestanding build needs so the resulting `rlib` has no `std`-crate
 //! dependencies and can be linked directly by the pickle-written linker
-//! (`compiler-selfhost/linker.pkl`) without rustc.
+//! (`pickle/compiler/linker.pkl`) without rustc.
 //!
 //! - a Windows `HeapAlloc`-backed global allocator (so `alloc` works)
 //! - a `#[panic_handler]` (leaf, so the compiled crate never reaches `std`)
 //! - `extern "system"` WinAPI entry points used by converted runtime code
 
+use alloc::string::String;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 
@@ -61,6 +62,11 @@ extern "system" {
     pub fn FindFirstFileW(pattern: *const u16, data: *mut Win32FindDataW) -> WinHandle;
     pub fn FindNextFileW(find: WinHandle, data: *mut Win32FindDataW) -> i32;
     pub fn FindClose(find: WinHandle) -> i32;
+    /// Read the process working directory into `lp_buffer` as NUL-terminated
+    /// UTF-16. With `n_buffer_length == 0` and a null buffer it performs no
+    /// write at all and just returns the size a real call would need, counting
+    /// the terminator -- which is what makes the two-call sizing pattern safe.
+    pub fn GetCurrentDirectoryW(n_buffer_length: u32, lp_buffer: *mut u16) -> u32;
 }
 
 #[link(name = "shell32")]
@@ -177,8 +183,10 @@ impl BufferedFile {
     }
 
     fn open(path: &[u8], access: u32, disposition: u32) -> Option<Self> {
-        let mut w: alloc::vec::Vec<u16> =
-            core::str::from_utf8(path).unwrap_or("").encode_utf16().collect();
+        let mut w: alloc::vec::Vec<u16> = core::str::from_utf8(path)
+            .unwrap_or("")
+            .encode_utf16()
+            .collect();
         w.push(0);
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
         let h = unsafe {
@@ -309,7 +317,15 @@ pub fn console_write(buf: &[u8]) -> bool {
     }
     if !buf.is_empty() {
         let mut written: u32 = 0;
-        let ok = unsafe { WriteFile(h, buf.as_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut written, core::ptr::null_mut()) };
+        let ok = unsafe {
+            WriteFile(
+                h,
+                buf.as_ptr(),
+                buf.len().min(u32::MAX as usize) as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            )
+        };
         ok != 0
     } else {
         true
@@ -335,7 +351,15 @@ pub fn console_error_write(buf: &[u8]) -> bool {
     }
     if !buf.is_empty() {
         let mut written: u32 = 0;
-        let ok = unsafe { WriteFile(h, buf.as_ptr(), buf.len().min(u32::MAX as usize) as u32, &mut written, core::ptr::null_mut()) };
+        let ok = unsafe {
+            WriteFile(
+                h,
+                buf.as_ptr(),
+                buf.len().min(u32::MAX as usize) as u32,
+                &mut written,
+                core::ptr::null_mut(),
+            )
+        };
         ok != 0
     } else {
         true
@@ -368,7 +392,7 @@ static GLOBAL: PfHeap = PfHeap;
 
 /// Rust's "allocator shim" symbols. When rustc drives the final binary link it
 /// synthesizes these itself; the pickle-written linker
-/// (`compiler-selfhost/linker.pkl`) does not, so an rlib that declares a
+/// (`pickle/compiler/linker.pkl`) does not, so an rlib that declares a
 /// `#[global_allocator]` must spell them out for the flat link:
 ///
 /// - `___rust_no_alloc_shim_is_unstable_v2`: a marker `alloc` calls (via a
@@ -584,10 +608,7 @@ pub mod sync {
         where
             F: FnOnce(),
         {
-            if !self
-                .done
-                .swap(true, core::sync::atomic::Ordering::AcqRel)
-            {
+            if !self.done.swap(true, core::sync::atomic::Ordering::AcqRel) {
                 f();
             }
         }
@@ -607,7 +628,61 @@ pub fn getenv_present(_name: &str) -> bool {
     false
 }
 
-/// C builtins the pickle-written linker (`compiler-selfhost/linker.pkl`) must
+/// Environment value probe used by the converted runtime, for the one
+/// env-tunable that needs more than presence (`PKL_GC_THRESHOLD`). Freestanding
+/// builds read no environment, so this always reports "unset".
+pub fn getenv_value(_name: &str) -> Option<String> {
+    None
+}
+
+/// The process working directory as UTF-16 code units, without the terminator,
+/// via the Win32 two-call sizing pattern.
+///
+/// The buffer comes from the `HeapAlloc`-backed global allocator rather than the
+/// stack on purpose. An earlier attempt at this used a stack array and faulted
+/// with `0xC0000005` on the *second* call only -- the sizing call, which writes
+/// nothing, always worked. A freestanding PE has no CRT to have probed a default
+/// stack, so the region a large frame spans can be uncommitted; heap memory is
+/// mapped by `HeapAlloc` and is always valid.
+fn current_dir_wide() -> Option<alloc::vec::Vec<u16>> {
+    // Sizing call. `n_buffer_length == 0` with a null buffer returns the number
+    // of UTF-16 units a real call needs, counting the terminating NUL.
+    let need = unsafe { GetCurrentDirectoryW(0, core::ptr::null_mut()) };
+    if need == 0 {
+        return None;
+    }
+    let mut buf: alloc::vec::Vec<u16> = alloc::vec![0u16; need as usize];
+    let written = unsafe { GetCurrentDirectoryW(need, buf.as_mut_ptr()) };
+    // `written` excludes the NUL. A value `>= need` means the directory changed
+    // between the two calls, so what we hold is stale rather than truncated --
+    // reporting "unset" beats returning a wrong path.
+    if written == 0 || written >= need {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(buf)
+}
+
+/// `current_dir()`: the process's working directory as `string?`, or `none`
+/// when it cannot be determined.
+///
+/// `std::env::current_dir` is unavailable in a freestanding build (and the
+/// `process` module is compiled out entirely under `nostd`), so this asks
+/// `kernel32` directly. Matches the `std` implementation's lossy UTF-8
+/// conversion, so the same program gets the same `string?` either way.
+#[no_mangle]
+pub extern "C" fn pickle_current_dir() -> *mut crate::object::PickleObject {
+    match current_dir_wide() {
+        Some(w) => {
+            let bytes = String::from_utf16_lossy(&w).into_bytes();
+            let gc = crate::gc::gc_mut();
+            crate::strings::string_from_bytes(bytes.as_ptr(), bytes.len(), gc)
+        }
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// C builtins the pickle-written linker (`pickle/compiler/linker.pkl`) must
 /// be able to resolve when it links this crate against `core`/`alloc` without
 /// the compiler_builtins crate: byte moves, compares, and the soft 128-bit and
 /// IEEE-half conversions that are pulled into kept `core`/`alloc` code.

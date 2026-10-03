@@ -315,6 +315,20 @@ fn surface_item(out: &mut Vec<PublicItem>, item: &Item) {
                 },
             },
         ),
+        Global(g) => {
+            push(
+                out,
+                PublicItem {
+                    kind: "var",
+                    name: g.name.clone(),
+                    vis: vis_of(g.visibility),
+                    sig: match &g.ty {
+                        Some(ty) => format!("{}: {}", g.name, type_expr_to_string(ty)),
+                        None => g.name.clone(),
+                    },
+                },
+            );
+        }
     }
 }
 

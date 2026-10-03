@@ -776,9 +776,13 @@ impl<'a> Parser<'a> {
                 let c = self.parse_const()?;
                 ItemKind::Const(c)
             }
+            Tok::Var => {
+                let g = self.parse_global()?;
+                ItemKind::Global(g)
+            }
             _ => {
                 self.err_here(format!(
-                    "expected a declaration (class, fn, struct, enum, interface, const), found {}",
+                    "expected a declaration (class, fn, struct, enum, interface, const, var), found {}",
                     self.kind().describe()
                 ));
                 return Err(());
@@ -1426,28 +1430,54 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn parse_const(&mut self) -> PResult<ConstDecl> {
-        let start = self.span();
-        self.expect(&Tok::Const)?;
-        let name = self.expect_ident("constant name")?;
-        let ty = if self.eat(&Tok::Colon) {
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
-        self.expect(&Tok::Assign)?;
-        self.continuation_after(&Tok::Assign);
-        let value = self.parse_expr()?;
-        let span = start.to(self.prev_span());
-        self.expect_stmt_end()?;
-        Ok(ConstDecl {
-            name,
-            visibility: Visibility::Default,
-            ty,
-            value,
-            span,
-        })
-    }
+fn parse_const(&mut self) -> PResult<ConstDecl> {
+   let start = self.span();
+   self.expect(&Tok::Const)?;
+   let name = self.expect_ident("constant name")?;
+   let ty = if self.eat(&Tok::Colon) {
+      Some(self.parse_type()?)
+   } else {
+      None
+   };
+   self.expect(&Tok::Assign)?;
+   self.continuation_after(&Tok::Assign);
+   let value = self.parse_expr()?;
+   let span = start.to(self.prev_span());
+   self.expect_stmt_end()?;
+   Ok(ConstDecl {
+      name,
+      visibility: Visibility::Default,
+      ty,
+      value,
+      span,
+   })
+}
+
+/// Top-level `var name: T = expr`. Same shape as a `const` item, but the slot
+/// persists between calls and is addressable, so it lowers to a data symbol
+/// instead of being inlined.
+fn parse_global(&mut self) -> PResult<GlobalDecl> {
+   let start = self.span();
+   self.expect(&Tok::Var)?;
+   let name = self.expect_ident("global name")?;
+   let ty = if self.eat(&Tok::Colon) {
+      Some(self.parse_type()?)
+   } else {
+      None
+   };
+   self.expect(&Tok::Assign)?;
+   self.continuation_after(&Tok::Assign);
+   let value = self.parse_expr()?;
+   let span = start.to(self.prev_span());
+   self.expect_stmt_end()?;
+   Ok(GlobalDecl {
+      name,
+      visibility: Visibility::Default,
+      ty,
+      value,
+      span,
+   })
+}
 
     // ---------- types ----------
 
@@ -2548,6 +2578,20 @@ impl<'a> Parser<'a> {
     /// a generic value `name<T>` (a function value over explicit type
     /// arguments), or not a generic bracket at all (a chained comparison such
     /// as `a < b > c`, which keeps parsing as an ordinary expression).
+    /// The token that follows a `<` has to be able to open a type, or this is a
+    /// comparison and not a generic instantiation.
+    ///
+    /// Without this, `if (a < 1) { x } else if (b > 2) { y }` parses the first
+    /// `<` as a generic argument list, because the `>` in `b > 2` balances it.
+    /// `parse_type_prefix` accepts `*`, `&`, `fn`, `(`, an identifier, and `_`;
+    /// this is that same set, so a valid `name<T>` still takes this path.
+    fn type_arg_start(t: &Tok) -> bool {
+        matches!(
+            t,
+            Tok::Ident(_) | Tok::Star | Tok::Amp | Tok::Fn | Tok::LParen
+        )
+    }
+
     fn generic_call_flavor(&self) -> Option<GenericCallFlavor> {
         let mut ix = self.pos;
         let toks = &self.tokens;
@@ -2556,6 +2600,9 @@ impl<'a> Parser<'a> {
         }
         ix += 1;
         if !matches!(toks[ix.min(toks.len() - 1)].token.kind, Tok::Lt) {
+            return None;
+        }
+        if !Self::type_arg_start(&toks[(ix + 1).min(toks.len() - 1)].token.kind) {
             return None;
         }
         let mut depth = 0usize;
@@ -2580,6 +2627,9 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Tok::Eof | Tok::Newline => return None,
+                // No type argument list contains a literal, a block, or a
+                // statement end, so the bracket was never a generic.
+                Tok::Number | Tok::LBrace | Tok::RBrace | Tok::Semicolon => return None,
                 _ => {}
             }
             ix += 1;
@@ -3465,11 +3515,11 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Return { span, .. }
         | Stmt::Break { span }
         | Stmt::Continue { span }
-          | Stmt::While { span, .. }
-          | Stmt::For { span, .. }
-          | Stmt::Try { span, .. }
-          | Stmt::Throw { span, .. }
-          | Stmt::Empty(span) => *span,
+        | Stmt::While { span, .. }
+        | Stmt::For { span, .. }
+        | Stmt::Try { span, .. }
+        | Stmt::Throw { span, .. }
+        | Stmt::Empty(span) => *span,
         Stmt::Expr(e) => e.span,
     }
 }

@@ -18,6 +18,23 @@ use pickle_compiler::ir::{FuncId as IrFuncId, IrModule};
 
 use crate::jit;
 
+/// Stack reserve, in bytes, for every executable we link.
+///
+/// The linker's own default is 1 MiB, which is far too small: Pickle's lowering
+/// is recursive and its per-function frames are large (a managed value costs a
+/// GC root cell, so a big function carries a big frame). Compiling even a
+/// three-line program can nest `stmt` -> `expr` -> `call` deep enough to run
+/// the 1 MiB stack out, which shows up as an access violation in the *next*
+/// function's prologue rather than as a stack-overflow report.
+///
+/// This is address space only; pages are committed on demand, so a large
+/// reserve costs nothing at startup. `pelink.pkl` writes the same value for the
+/// self-hosted path so both linkers agree.
+pub const STACK_RESERVE: u64 = 256 * 1024 * 1024;
+/// Initial stack commit, in bytes. Small on purpose: the loader grows the
+/// stack on demand inside `STACK_RESERVE`.
+pub const STACK_COMMIT: u64 = 1024 * 1024;
+
 /// The native backend, PIC off so every `symbol_value` becomes a plain
 /// absolute relocation (matches the JIT path; the linker fixes these up).
 pub fn isa() -> Result<OwnedTargetIsa> {
@@ -63,7 +80,12 @@ pub fn emit_object(module: &IrModule) -> Result<Vec<u8>> {
     // Declare the runtime imports as functions. The `pkl_strdata_*` names in
     // the extern list are actually string data, declared below.
     for (sym, sig) in &externs {
-        if sym.starts_with("pkl_strdata_") {
+        // `pkl_strdata_*` are string blobs and `pkl_global_*` are top-level
+        // `var` slots; both are data, not functions. Declaring them here as
+        // imports makes Cranelift reject the module with
+        // "Incompatible declaration of identifier" when the data symbols are
+        // declared further down.
+        if sym.starts_with("pkl_strdata_") || sym.starts_with("pkl_global_") {
             continue;
         }
         let id = obj.declare_function(sym, Linkage::Import, sig)?;
@@ -89,14 +111,40 @@ pub fn emit_object(module: &IrModule) -> Result<Vec<u8>> {
         obj.define_data(id, &desc)?;
     }
 
-    // Remap the `TestCase` symbol references to module user names (the object
-    // backend refuses test-case names), then define each function.
+    // Top-level `var` slots become read/write data symbols, one per global.
+      // `pkl_global_*` is deliberately *not* prefixed as read-only like the
+      // string blobs: these are written by `storeglobal`.
+      for g in &module.globals {
+          let bytes = match &g.init {
+              Some(b) => b.clone(),
+              // Zero-init: an empty definition still gets a symbol with a
+              // real address, which is what `loadglobal`/`gaddr` need. Cranelift
+              // routes an empty definition to `.bss`, so these never cost file
+              // space.
+              None => Vec::new(),
+          };
+          // `writable = true` is load-bearing, not cosmetic: cranelift-object
+          // picks `StandardSection::Data` (a writable `.data`) only for
+          // writable data symbols and puts everything else in the read-only
+          // `.rdata`. With `writable = false` the symbol still loads correctly
+          // but every `storeglobal` faults with an access violation, because
+          // the PE page holding it is mapped read-only.
+          let id = obj.declare_data(&g.symbol, Linkage::Export, true, false)?;
+          data_ids.insert(g.symbol.clone(), (id, true));
+          let mut desc = DataDescription::new();
+          desc.set_align(8);
+          desc.define(bytes.into_boxed_slice());
+          obj.define_data(id, &desc)?;
+      }
+
+      // Remap the `TestCase` symbol references to module user names (the object
+      // backend refuses test-case names), then define each function.
     while let Some((symbol, mut clif)) = lowered.pop() {
         rewrite_symbol_names(&mut clif, &func_ids, &data_ids);
         let id = func_ids[&symbol].0;
         let mut ctx = ClifContext::new();
         ctx.func = clif;
-        obj.define_function(id, &mut ctx)?;
+obj.define_function(id, &mut ctx)?;
     }
 
     Ok(obj.finish().emit()?)
@@ -288,8 +336,8 @@ pub fn link_object(
     )
     .context("cannot write the AOT main shim")?;
 
-    let status = std::process::Command::new("rustc")
-        .arg(&shim)
+    let mut cmd = std::process::Command::new("rustc");
+    cmd.arg(&shim)
         .arg("--edition")
         .arg("2021")
         .arg("-C")
@@ -298,7 +346,18 @@ pub fn link_object(
         .arg("panic=abort")
         .arg(format!("--extern=pickle_runtime={}", rlib.display()))
         .arg("-C")
-        .arg(format!("link-arg={}", obj_path.display()))
+        .arg(format!("link-arg={}", obj_path.display()));
+
+    // The default 1 MiB stack is not enough for Pickle's recursive lowering;
+    // see `STACK_RESERVE`. Only the PE/COFF linker understands /STACK:.
+    if cfg!(target_os = "windows") {
+        cmd.arg("-C").arg(format!(
+            "link-arg=/STACK:{},{}",
+            STACK_RESERVE, STACK_COMMIT
+        ));
+    }
+
+    let status = cmd
         .arg("-o")
         .arg(out)
         .status()

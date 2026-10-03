@@ -305,7 +305,11 @@ pub extern "C" fn pickle_thread_panic_message(handle: i64) -> *mut PickleObject 
     let Some(message) = message else {
         return core::ptr::null_mut();
     };
-    crate::strings::string_from_bytes(message.as_bytes().as_ptr(), message.len(), crate::gc::gc_mut())
+    crate::strings::string_from_bytes(
+        message.as_bytes().as_ptr(),
+        message.len(),
+        crate::gc::gc_mut(),
+    )
 }
 
 /// A task body cannot record a failure here, so there is never a message to
@@ -604,7 +608,11 @@ mod tests {
             // Hand the lock over and wait for the pool to finish.
             super::drain();
         });
-        assert_eq!(COUNT.load(Ordering::Acquire), 9, "every task ran to the end");
+        assert_eq!(
+            COUNT.load(Ordering::Acquire),
+            9,
+            "every task ran to the end"
+        );
     }
 
     #[test]

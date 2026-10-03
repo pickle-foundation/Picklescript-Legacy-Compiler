@@ -26,10 +26,10 @@ use crate::boxscalar::box_bits;
 use crate::layout::{list_data, list_len, map_cap, map_entries, MapEntry};
 use crate::object::{nil_sentinel, none_key, PickleObject};
 use crate::strings::{string_bytes_len, string_bytes_ptr, string_from_bytes};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -75,7 +75,8 @@ impl Drop for ProcInner {
 
 /// The managed string payload of an object (must be a `string` object).
 fn os_arg(obj: *const PickleObject) -> String {
-    let bytes = unsafe { core::slice::from_raw_parts(string_bytes_ptr(obj), string_bytes_len(obj)) };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(string_bytes_ptr(obj), string_bytes_len(obj)) };
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -159,8 +160,7 @@ fn wait_with_timeout(child: &mut Child, timeout_ms: Option<i64>) -> (Option<i32>
             Err(_) => (None, false),
         };
     };
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return (status.code(), false),
@@ -307,8 +307,18 @@ pub extern "C" fn pickle_run_cmd(
     let err = Arc::new(Mutex::new(Vec::new()));
     let out_eof = Arc::new(AtomicBool::new(false));
     let err_eof = Arc::new(AtomicBool::new(false));
-    let out_t = drainer(child.stdout.take().unwrap(), out.clone(), out_eof.clone(), cap);
-    let err_t = drainer(child.stderr.take().unwrap(), err.clone(), err_eof.clone(), cap);
+    let out_t = drainer(
+        child.stdout.take().unwrap(),
+        out.clone(),
+        out_eof.clone(),
+        cap,
+    );
+    let err_t = drainer(
+        child.stderr.take().unwrap(),
+        err.clone(),
+        err_eof.clone(),
+        cap,
+    );
     // The caller's stdin bytes are written on a helper thread so a child that
     // never reads cannot deadlock the capture.
     let stdin_t = if stdin_bytes.is_null() {
@@ -330,12 +340,7 @@ pub extern "C" fn pickle_run_cmd(
     }
     let out_vec = out.lock().unwrap().clone();
     let err_vec = err.lock().unwrap().clone();
-    cmd_result(
-        code.map(|c| c as i64),
-        &out_vec,
-        &err_vec,
-        timed,
-    )
+    cmd_result(code.map(|c| c as i64), &out_vec, &err_vec, timed)
 }
 
 /// `run_spawn(argv, cwd, envs, env_removes, max_out)`: start a child and
@@ -410,11 +415,7 @@ fn proc_mut(h: *mut PickleObject) -> *mut ProcInner {
 
 /// Read up to `n` drained bytes, removing them from the front of `buf`.
 /// A short/empty read is a poll result; `none` only once EOF is reached.
-fn read_available(
-    n: usize,
-    buf: &Arc<Mutex<Vec<u8>>>,
-    eof: &Arc<AtomicBool>,
-) -> *mut PickleObject {
+fn read_available(n: usize, buf: &Arc<Mutex<Vec<u8>>>, eof: &Arc<AtomicBool>) -> *mut PickleObject {
     let got: Vec<u8> = {
         let mut g = buf.lock().unwrap();
         let take = g.len().min(n);

@@ -53,10 +53,10 @@ function Get-TreeHash([string[]]$dirs) {
 # Content hash that gates oracle regeneration in tools/battery_prep.ps1: every
 # input the oracles are derived from (the self trees, the battery, the stdlib the
 # ported drivers import, and the Rust compiler binary that produces the oracles).
-$batteryPrepDirs = @("compiler-selfhost", "cli-selfhost", "runtime-selfhost", "stdlib", "tests\pickle")
+$batteryPrepDirs = @("pickle\compiler", "pickle\cli", "pickle\runtime", "stdlib", "tests\pickle")
 
 # Source trees embedded in the AOT drivers (compiler + cli + stdlib imports).
-$batteryDriverDirs = @("compiler-selfhost", "cli-selfhost", "stdlib")
+$batteryDriverDirs = @("pickle\compiler", "pickle\cli", "stdlib")
 
 function Get-PrepHash { Get-TreeHash $batteryPrepDirs }
 

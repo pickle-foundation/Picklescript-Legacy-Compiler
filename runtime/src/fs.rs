@@ -91,11 +91,11 @@ mod backend {
         use core::ffi::c_void;
 
         use crate::nostd::{
-            invalid_handle, CreateDirectoryW, CreateFileW, DeleteFileW, FindClose, FindFirstFileW,
-            FindNextFileW, GetFileAttributesW, CloseHandle, ReadFile, RemoveDirectoryW,
-            WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
-            Win32FindDataW,
+            invalid_handle, CloseHandle, CreateDirectoryW, CreateFileW, DeleteFileW, FindClose,
+            FindFirstFileW, FindNextFileW, GetFileAttributesW, ReadFile, RemoveDirectoryW,
+            Win32FindDataW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
+            INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
         };
 
         use super::super::{ends_with_sep, path_w};
@@ -124,7 +124,14 @@ mod backend {
                 let mut read_any = false;
                 loop {
                     let mut n: u32 = 0;
-                    if ReadFile(h, chunk.as_mut_ptr(), chunk.len() as u32, &mut n, core::ptr::null_mut()) == 0 {
+                    if ReadFile(
+                        h,
+                        chunk.as_mut_ptr(),
+                        chunk.len() as u32,
+                        &mut n,
+                        core::ptr::null_mut(),
+                    ) == 0
+                    {
                         break;
                     }
                     read_any = true;
@@ -161,7 +168,13 @@ mod backend {
                 let ok = if data.is_empty() {
                     true
                 } else {
-                    WriteFile(h, data.as_ptr(), data.len() as u32, &mut written, core::ptr::null_mut()) != 0
+                    WriteFile(
+                        h,
+                        data.as_ptr(),
+                        data.len() as u32,
+                        &mut written,
+                        core::ptr::null_mut(),
+                    ) != 0
                         && written as usize == data.len()
                 };
                 CloseHandle(h);

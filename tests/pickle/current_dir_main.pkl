@@ -1,0 +1,31 @@
+module main
+
+// `current_dir()` returns `string?`: the process working directory, or `none`
+// when the platform cannot report one. Under a freestanding build there is no
+// CRT to ask, so this covers the kernel32 two-call sizing path.
+//
+// The printed text is deliberately independent of the actual directory, so the
+// JIT oracle and the freestanding exe can be compared byte-for-byte even though
+// they run from different working directories.
+
+fn classify(d: string?) -> string {
+    match (d) {
+    case none -> "none"
+    case some(p) if len(p) > 0 -> "present"
+    case some(_) -> "empty"
+    }
+}
+
+fn main() {
+    var d = current_dir()
+    println("class:", classify(d))
+
+    // Reading twice must be stable, and must not depend on any leftover buffer
+    // state from the first call.
+    println("class again:", classify(current_dir()))
+
+    // The working directory is where the process was launched, so it is always
+    // reported by a working OS. Treat `none` as a real failure here rather than
+    // an acceptable outcome.
+    println("none:", classify(none))
+}

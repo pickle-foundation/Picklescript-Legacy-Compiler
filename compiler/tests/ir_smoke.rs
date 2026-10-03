@@ -245,7 +245,11 @@ fn emits_spread_trampolines_and_unrolls() {
     assert!(symbols.contains(&"pickle_list_new"), "{:?}", symbols);
     assert!(symbols.contains(&"pickle_list_get"), "{:?}", symbols);
     assert!(symbols.contains(&"pickle_unbox_i64"), "{:?}", symbols);
-    assert!(symbols.contains(&"pickle_panic_arity_diff"), "{:?}", symbols);
+    assert!(
+        symbols.contains(&"pickle_panic_arity_diff"),
+        "{:?}",
+        symbols
+    );
     // `println("spread-print:", ...th)` unrolls with length + element loads.
     assert!(symbols.contains(&"pickle_list_len"), "{:?}", symbols);
     assert!(symbols.contains(&"pickle_print_i64"), "{:?}", symbols);
@@ -1436,9 +1440,15 @@ fn emits_compound_assignment_across_targets() {
             "main must call {sym}"
         );
     }
-    assert!(calls.contains(&"pickle_static_get"), "static get: {calls:?}");
+    assert!(
+        calls.contains(&"pickle_static_get"),
+        "static get: {calls:?}"
+    );
     assert!(calls.contains(&"pickle_list_get"), "list get: {calls:?}");
-    assert!(calls.contains(&"pickle_map_get_boxed"), "map get: {calls:?}");
+    assert!(
+        calls.contains(&"pickle_map_get_boxed"),
+        "map get: {calls:?}"
+    );
     let loadraw = main
         .blocks
         .iter()
@@ -1545,7 +1555,10 @@ fn emits_for_in_list_of_tuples() {
         })
         .filter(|s| *s == "pickle_tuple_field")
         .count();
-    assert_eq!(tuple_field_calls, 2, "two tuple parts per iteration, dump:\n{sum}");
+    assert_eq!(
+        tuple_field_calls, 2,
+        "two tuple parts per iteration, dump:\n{sum}"
+    );
 }
 
 #[test]

@@ -512,7 +512,7 @@ impl LexedToken {
     /// Canonical single-line dump for `pickle lex`. The self-hosted lexer
     /// reproduces this string byte-for-byte; the differential test diffs the
     /// output of `pickle lex` on both compilers, so the format is the
-    /// serialized contract that `compiler-selfhost/lexer/` must match.
+    /// serialized contract that `pickle/compiler/lexer/` must match.
     ///
     /// Format: `Kind start:end field=value ...`, one line per token.
     /// - `Ident`   -> `text="..."` (escaped)
