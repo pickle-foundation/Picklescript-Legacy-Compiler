@@ -2,14 +2,14 @@
 //! simple builtins. The compiler emits calls to these primitives; richer
 //! formatting is left to `std.text` later.
 
-use alloc::string::ToString;
-use alloc::vec::Vec;
 use crate::layout::{enum_tag, list_len, map_len, str_bytes, str_len, tuple_field_count};
 use crate::object::{
     PickleObject, PICKLE_CLASS_BOX_BOOL, PICKLE_CLASS_BOX_CHAR, PICKLE_CLASS_BOX_FLOAT,
     PICKLE_CLASS_BOX_INT, PICKLE_CLASS_ENUM, PICKLE_CLASS_LIST, PICKLE_CLASS_MAP,
     PICKLE_CLASS_STRING, PICKLE_CLASS_TUPLE,
 };
+use alloc::string::ToString;
+use alloc::vec::Vec;
 #[cfg(all(not(test), not(feature = "nostd")))]
 use std::io::Write;
 
@@ -193,7 +193,13 @@ fn print_obj_raw(obj: *mut PickleObject) {
             b"false\0".as_ptr()
         }),
         PICKLE_CLASS_BOX_CHAR => pickle_print_char(crate::boxscalar::box_bits(obj) as i32),
-        #[cfg(not(feature = "nostd"))]
+        // Not gated on `nostd`: `gc.class_name` needs no `std` (it is a scan over
+        // the descriptor table), and `pickle_class_name` already reaches it from
+        // a `nostd` build. Leaving this arm stubbed made `combined.lib` -- which
+        // is built `--features nostd` -- print `<object>` for every user
+        // instance while the `std` JIT printed the class name, so the port could
+        // not reproduce `print_obj_raw` no matter what the ported
+        // `abi_console.pkl` did.
         _ => {
             let gc = crate::gc::gc_mut();
             let name = gc.class_name(class_id);
@@ -202,8 +208,6 @@ fn print_obj_raw(obj: *mut PickleObject) {
                 None => pickle_print_cstr(b"<object>\0".as_ptr()),
             }
         }
-        #[cfg(feature = "nostd")]
-        _ => pickle_print_cstr(b"<object>\0".as_ptr()),
     }
 }
 
@@ -282,7 +286,9 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
             b"false"
         }),
         PICKLE_CLASS_BOX_CHAR => buf.push(crate::boxscalar::box_bits(obj) as u8),
-        #[cfg(not(feature = "nostd"))]
+        // Same reasoning as `print_obj_raw`: the `str()` form of a user instance
+        // resolves its class name through the descriptor table, which is
+        // available in `nostd`.
         _ => {
             let gc = crate::gc::gc_mut();
             match gc.class_name(class_id) {
@@ -290,8 +296,6 @@ pub(crate) fn fmt_obj_to(buf: &mut Vec<u8>, obj: *mut PickleObject) {
                 None => buf.extend_from_slice(b"<object>"),
             }
         }
-        #[cfg(feature = "nostd")]
-        _ => buf.extend_from_slice(b"<object>"),
     }
 }
 

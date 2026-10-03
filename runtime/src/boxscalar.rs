@@ -44,6 +44,23 @@ pub fn box_bits(obj: *const PickleObject) -> i64 {
     unsafe { ((obj as *const u8).add(BOX_PAYLOAD_OFF) as *const i64).read() }
 }
 
+/// Reinterpret a boxed float's payload bits back to an `f64`.
+///
+/// Added for the `pickle_print_obj` port (`pickle/runtime/abi_console.pkl`).
+/// That body's `BOX_FLOAT` arm holds the raw bits and must turn them back into a
+/// float to hand to `pickle_print_f64`.
+///
+/// Pickle has no bitcast: `x as float` is a *numeric* conversion, so
+/// `f64FromBits` has no source-level spelling and needs this symbol. It is the
+/// exact inverse of `pickle_box_f64`, which stores `v.to_bits()`.
+///
+/// Takes the bits as `i64` because that is what `box_bits` yields; the cast
+/// through `u64` restores the bit pattern without changing it.
+#[no_mangle]
+pub extern "C" fn pickle_f64_from_bits(bits: i64) -> f64 {
+    f64::from_bits(bits as u64)
+}
+
 /// Box an `int` as a managed object.
 #[no_mangle]
 pub extern "C" fn pickle_box_i64(v: i64) -> *mut PickleObject {

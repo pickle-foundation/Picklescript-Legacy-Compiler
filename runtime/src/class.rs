@@ -101,6 +101,35 @@ pub extern "C" fn pickle_class_register(
     )
 }
 
+/// Name of a registered class, as a managed `string`, or null when `class_id` has
+/// no descriptor yet.
+///
+/// Added for the `pickle_print_obj` port (`pickle/runtime/abi_console.pkl`).
+/// That body needs the user-class fallback arm, which asks the collector for a
+/// class name; without a symbol to call, the arm had nothing to invoke. The
+/// `nostd` build already degraded this arm to `<object>`, so behaviour there is
+/// unchanged - this makes the name available to both builds.
+///
+/// The returned string is freshly allocated, so the caller owns it and the GC
+    /// may collect it like any other managed value.
+    ///
+    /// An unregistered id yields the literal `<object>` rather than null. That
+    /// folds `print_obj_raw`'s two-arm user-class fallback (name, else
+    /// `<object>`) into the symbol, so callers get the finished text and need no
+    /// null test. It also keeps the result a plain non-optional `string`: a
+    /// nullable `string` from this builtin cannot be consumed by `if (let
+    /// some(..) = ..)` in the port backend today (the AOT COFF stage fails
+    /// silently on an `Option<String>` produced by a `flatBuiltin` call).
+    #[no_mangle]
+    pub extern "C" fn pickle_class_name(class_id: u32) -> *mut PickleObject {
+        let gc = crate::gc::gc_mut();
+        let text = match gc.class_name(class_id) {
+            Some(bytes) => bytes,
+            None => &b"<object>"[..],
+        };
+        crate::strings::string_from_bytes(text.as_ptr(), text.len(), gc)
+    }
+
 fn class_register(
     name_ptr: *const u8,
     name_len: usize,
@@ -122,7 +151,20 @@ fn class_register(
     let nwords = slot_count.div_ceil(32);
     let mut words = vec![0u32; nwords];
     for i in 0..slot_count {
-        if i < 64 && mask & (1u64 << i) != 0 {
+        // The compiler emits a *saturating* managed mask: every slot of a user
+        // class holds a managed pointer, and a class with 64 or more fields sets
+        // all 64 bits the ABI can carry (see `inject_class_registrations`). So an
+        // all-ones mask means "every slot is managed", and the slots past 63 --
+        // which the descriptor still allocates mask words for -- must be traced
+        // too. Reading the mask as 64 literal bits would leave the tail of a
+        // wide class (the self-hosted `Emitter` has 86 fields) untraced, and the
+        // collector would free objects that are still reachable from a field.
+        let managed = if mask == u64::MAX {
+            true
+        } else {
+            i < 64 && mask & (1u64 << i) != 0
+        };
+        if managed {
             words[i / 32] |= 1 << (i % 32);
         }
     }
@@ -460,6 +502,52 @@ mod tests {
         }
         let _ = heap;
         let _ = gc;
+    }
+
+    /// A class wider than the 64 bits of managed mask the ABI carries.
+    ///
+    /// The compiler emits a saturating mask -- all ones meaning "every slot" --
+    /// and `class_register` has to spread that over the extra mask words, or the
+    /// collector frees whatever is reachable only from a field past 63. The
+    /// self-hosted `Emitter` is the class that actually has this shape, with 86
+    /// fields, so the case is reached by ordinary compiler use rather than only
+    /// by this test.
+    #[test]
+    fn gc_marks_through_slots_past_the_mask_width() {
+        const SLOTS: usize = 86;
+        let _guard = crate::gc::test_begin();
+        crate::pickle_runtime_init();
+        // Registered through the compiler's own entry point, so the mask words
+        // are the ones `class_register` derives from the saturating mask.
+        let id = pickle_class_register(b"Wide".as_ptr(), 4, SLOTS, u64::MAX, 0, 0, 0);
+        let gc = crate::gc::gc_mut();
+        let d = gc.descriptors.get(id).unwrap();
+        assert_eq!(d.slot_count, SLOTS as u32);
+        assert_eq!(d.mask_words, 3, "86 fields need three 32-bit mask words");
+        {
+            let words =
+                unsafe { std::slice::from_raw_parts(d.managed_mask, d.mask_words as usize) };
+            // Only the bits that exist: 64 in the first two words, and 86 - 64 in
+            // the last.
+            assert_eq!(words, &[u32::MAX, u32::MAX, (1u32 << (SLOTS - 64)) - 1]);
+        }
+        unsafe {
+            let o = class_new(id.into(), SLOTS, gc);
+            // A payload in the last slot, which is 22 fields past the 64 bits the
+            // mask argument can express.
+            let tail = crate::boxscalar::pickle_box_i64(86);
+            class_set_slot(o, (SLOTS - 1) as i64, tail);
+            assert!(!(*tail).is_marked());
+            let root: *mut PickleObject = o;
+            let roots: Vec<*mut *mut PickleObject> =
+                vec![(&root as *const *mut PickleObject) as *mut _];
+            crate::trace::trace_from_roots(&gc.descriptors, &roots, &[], &[]);
+            assert!((*o).is_marked());
+            assert!(
+                (*tail).is_marked(),
+                "a field past the mask width must still be traced"
+            );
+        }
     }
 
     #[test]
