@@ -321,7 +321,7 @@ enum FnSource<'a> {
     /// `main`; this is the first code that may allocate, so every slot is rooted
     /// first.
     GlobalsInit {
-        inits: Vec<(usize, Expr)>,
+        inits: Vec<(usize, IrTy, Expr)>,
     },
     /// A dynamically-callable forwarder for a top-level function used as a
     /// value. Slot 0 is the closure object (ignored; module functions capture
@@ -586,11 +586,11 @@ struct Emitter<'a> {
     global_decls: HashMap<String, &'a GlobalDecl>,
     /// Globals whose init could not be reduced to bytes, for diagnostics.
     global_failures: Vec<(String, Span, String)>,
-    /// Managed globals as `(global id, initializer expr)`, in declaration
-    /// order. Their value cannot be static bytes, so it is compiled into the
-    /// synthetic `pkl_globals_init` function together with the
+    /// Managed globals as `(global id, slot type, initializer expr)`, in
+    /// declaration order. Their value cannot be static bytes, so it is compiled
+    /// into the synthetic `pkl_globals_init` function together with the
     /// `pickle_gc_root_add` registration for each slot.
-    managed_global_inits: Vec<(usize, Expr)>,
+    managed_global_inits: Vec<(usize, IrTy, Expr)>,
     /// `(class id, const name)` -> declared info + initializer, inlined at use
     /// sites (`Type.NAME`, or the bare name inside the class body).
     class_consts: HashMap<(u32, String), (FieldInfo, &'a Expr)>,
@@ -893,9 +893,9 @@ impl<'a> Emitter<'a> {
         }
         // Managed top-level `var`s get the same treatment: a synthesized function
         // that roots each slot and stores its initializer, called from the same
-        // preamble as `pkl_static_init`. Roots are registered before static-field
-        // initializers run, because those may allocate while a managed global is
-        // still null.
+        // preamble as `pkl_static_init`. Every slot is rooted before any managed
+        // initializer runs, because an initializer may allocate and therefore may
+        // be the first code to trigger a collection.
         if !self.managed_global_inits.is_empty() {
             let inits = std::mem::take(&mut self.managed_global_inits);
             let fid = self.push_class_func(
@@ -1033,6 +1033,15 @@ impl<'a> Emitter<'a> {
                     let mut scope = Vec::new();
                     let mut acc = Vec::new();
                     self.walk_expr(&c.value, None, None, 0, &mut scope, &mut acc);
+                }
+                // A managed global's initializer is real code evaluated by
+                // `pkl_globals_init`, so a lambda in it needs its hoisted body
+                // and closure class registered exactly like one in a function
+                // body. Scalar globals fold to bytes and cannot contain one.
+                ItemKind::Global(g) => {
+                    let mut scope = Vec::new();
+                    let mut acc = Vec::new();
+                    self.walk_expr(&g.value, None, None, 0, &mut scope, &mut acc);
                 }
                 _ => {}
             }
@@ -3296,15 +3305,21 @@ fn global_ir_ty(ty: &Ty) -> Option<IrTy> {
             // and the GC root registration are emitted into the synthetic
             // `pkl_globals_init` function, which the host runs before `main`.
             Ty::String => Some(IrTy::Str),
+            // Every remaining reference type is one GC object of a known class,
+            // so the slot holds a raw object pointer that the collector traces
+            // through the registered root. `Fn` is excluded because a closure is
+            // not a single object, and `Option` because it is not one either.
+            Ty::List(_) | Ty::Map(_, _) | Ty::Tuple(_) | Ty::Class(_, _) | Ty::Struct(_, _)
+            | Ty::Enum(_, _) => Some(IrTy::Ptr),
             _ => None,
         }
     }
 
 /// Slot type for a global declared without a `: T` annotation.
 ///
-/// Inference is deliberately as narrow as `global_init_bytes`: only an integer
-/// literal (optionally negated) determines a type. Anything richer would have
-/// to be a general static-evaluator, which this slice does not have.
+/// Inference covers the literals that have an unambiguous scalar type, plus the
+/// collection literals, which always build one managed object and so are always
+/// `Ptr`. A call or any other computed form stays ambiguous and is reported.
 fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
         match &e.kind {
             ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
@@ -3312,6 +3327,8 @@ fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
             ExprKind::Lit(Lit::Bool(_)) => Some(IrTy::Bool),
             ExprKind::Lit(Lit::Char(_)) => Some(IrTy::Char),
             ExprKind::Lit(Lit::String(_)) => Some(IrTy::Str),
+            // A collection literal builds one managed object at run time.
+            ExprKind::Array(_) | ExprKind::Tuple(_) | ExprKind::Map(_) => Some(IrTy::Ptr),
             ExprKind::Unary { op: AstUnOp::Neg, operand } => match &operand.kind {
                 ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
                 ExprKind::Lit(Lit::Float { .. }) => Some(IrTy::Float),
@@ -3323,10 +3340,14 @@ fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
 
 /// Build the module-level global table in source order.
 ///
-/// Only *static* initializers are accepted, because these bytes are written
-/// into the image before `main` runs. Anything that needs a call, a load, or
-/// an allocation is rejected here with a diagnostic rather than being
-/// silently evaluated at some other time.
+/// Scalars (`int`, `float`, `bool`, `char`) are lowered to literal bytes
+/// written into the image before `main` runs, so their initializers must fold
+/// at compile time. Managed globals (`string`, `List`, `Map`, `Tuple`, class,
+/// struct and enum values) have no static form: the slot is zeroed in the image
+/// and both the GC root registration and the initializer run at program start
+/// from `pkl_globals_init`, where the runtime can allocate. A managed
+/// initializer may therefore call and allocate, but it may not read another
+/// global -- see [`Emitter::global_init_reads_global`].
 fn register_globals(&mut self) {
    let items: Vec<(String, GlobalDecl)> = self
       .global_decls
@@ -3375,25 +3396,47 @@ Some(it) => {
                ty_explicit,
                init,
             });
-            self.global_ids.insert(name, id);
-            if it == IrTy::Str {
-                self.managed_global_inits.push((id, g.value.clone()));
-            }
+            self.global_ids.insert(name.clone(), id);
+         if matches!(it, IrTy::Str | IrTy::Ptr) {
+                // `pkl_globals_init` roots every slot before it evaluates any
+                // initializer, because an initializer is the first code that can
+                // allocate. That ordering also means an initializer cannot
+                // observe another global's value: the slot is still null. Reject
+                // the read here rather than hand back a null dereference.
+                if let Some(other) = self.global_init_reads_global(&g.value) {
+                    self.global_failures.push((
+                        name.clone(),
+                        g.span,
+                        format!(
+                            "the initializer of top-level `var {name}` reads `{other}`, \
+                             but global initializers run after every slot is rooted and before any \
+                             is filled, so it would read a null value"
+                        ),
+                    ));
+                    continue;
+                }
+                self.managed_global_inits.push((id, it, g.value.clone()));
          }
-         None => {
+      }
+      None => {
             self.global_failures.push((
                name.clone(),
                g.span,
-               format!("a top-level `var` of type `{}` is not supported yet; only `int64` slots have a lowering", declared),
+               format!("a top-level `var` of type `{}` is not supported yet; it has no global lowering", declared),
             ));
          }
       }
    }
 }
 
-/// Reduce a global initializer to little-endian bytes, or explain why not.
+/// Reduce a global initializer to little-endian image bytes.
 ///
-/// The supported set is deliberately just integer literals (optionally
+/// Returns `Ok(None)` for a managed slot: `Str` and `Ptr` have no static form,
+/// so the COFF writer emits a zeroed 8-byte slot and the value plus its
+/// `pickle_gc_root_add` registration are emitted into `pkl_globals_init`
+/// instead.
+///
+/// The scalars are deliberately restricted to literals (an int or float may be
 /// negated): enough to prove the `.data` path end to end without inventing a
 /// general static-evaluator.
 fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -3406,7 +3449,7 @@ fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option
                 _ => "an integer",
             };
             format!(
-                "the initializer of top-level `var {name}` must be {want} literal; it runs before `main` and cannot call or read other globals yet"
+                "the initializer of top-level `var {name}` must be {want} literal; a scalar global's value is written into the image before `main` runs, so its initializer cannot call, load, or allocate"
             )
         };
       // Negation is the one unary that still yields a static scalar.
@@ -3452,17 +3495,150 @@ fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option
               ExprKind::Lit(Lit::Char(c)) => Ok(Some((*c as u32).to_le_bytes().to_vec())),
               _ => Err(mismatch()),
           },
-            IrTy::Unit => Ok(None),
-            // Managed: no static bytes. The COFF writer already emits an
-            // all-zero 8-byte slot for `init: None`, and the value plus the
-            // `pickle_gc_root_add` registration are emitted into
-            // `pkl_globals_init` instead.
-            IrTy::Str => Ok(None),
-            other => Err(format!(
-                "a top-level `var {name}` of type `{other}` has no static initializer yet"
-            )),
-      }
-  }
+IrTy::Unit => Ok(None),
+        // Managed: no static bytes. The COFF writer already emits an
+        // all-zero 8-byte slot for `init: None`, and the value plus the
+        // `pickle_gc_root_add` registration are emitted into
+        // `pkl_globals_init` instead.
+        IrTy::Str | IrTy::Ptr => Ok(None),
+    }
+}
+
+/// Name of the first top-level global this initializer reads, if any.
+    ///
+    /// `pkl_globals_init` roots every managed slot before it evaluates any
+    /// initializer, because an initializer is the first code that can allocate
+    /// and therefore the first point at which the collector could run. That
+    /// ordering also means every slot is still null while initializers run, so an
+    /// initializer that reads another global would dereference null. Catching it
+    /// here is the only way to keep it out of the generated program.
+    ///
+    /// A bare `Ident` counts only when it names a top-level `var`. Anything the
+    /// resolver cannot resolve is already reported as an undefined name, and a
+    /// local cannot appear in a global initializer.
+    fn global_init_reads_global(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(name) => self
+                .global_decls
+                .contains_key(name.as_str())
+                .then(|| name.clone()),
+            ExprKind::Lit(_) | ExprKind::This | ExprKind::Super => None,
+            ExprKind::Call { callee, args } => self
+                .global_init_reads_global(callee)
+                .or_else(|| self.call_args_read_global(args)),
+            ExprKind::Member { object, .. } | ExprKind::OptAccess { object, .. } => {
+                self.global_init_reads_global(object)
+            }
+            ExprKind::Index { object, index, .. } => self
+                .global_init_reads_global(object)
+                .or_else(|| self.global_init_reads_global(index)),
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Await(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::OptUnwrap(operand) => self.global_init_reads_global(operand),
+            ExprKind::Binary { lhs, rhs, .. } => self
+                .global_init_reads_global(lhs)
+                .or_else(|| self.global_init_reads_global(rhs)),
+            ExprKind::Range { start, end, .. } => self
+                .global_init_reads_global(start)
+                .or_else(|| self.global_init_reads_global(end)),
+            ExprKind::Assign { target, value, .. } => self
+                .global_init_reads_global(target)
+                .or_else(|| self.global_init_reads_global(value)),
+            ExprKind::If {
+                cond,
+                then,
+                else_else,
+            } => self
+                .if_cond_reads_global(cond)
+                .or_else(|| self.block_reads_global(then))
+                .or_else(|| self.global_init_reads_global_opt(else_else.as_deref())),
+            ExprKind::Match { scrutinee, arms, .. } => self
+                .global_init_reads_global(scrutinee)
+                .or_else(|| {
+                    arms.iter().find_map(|arm| {
+                        self.global_init_reads_global_opt(arm.guard.as_ref())
+                            .or_else(|| self.global_init_reads_global(&arm.body))
+                    })
+                }),
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => self.block_reads_global(b),
+            ExprKind::Array(items) | ExprKind::Tuple(items) => {
+                items.iter().find_map(|i| self.global_init_reads_global(i))
+            }
+            ExprKind::Map(pairs) => pairs.iter().find_map(|(k, v)| {
+                self.global_init_reads_global(k)
+                    .or_else(|| self.global_init_reads_global(v))
+            }),
+            // A lambda body is a separate function: it cannot run during global
+            // initialization, so nothing in it can observe an unfilled slot. A
+            // module-scope lambda cannot capture a global either -- `decide_captures`
+            // rejects that -- so no global read can hide in here. The
+            // `GenericCall` name is a top-level `fn`, not a `var`.
+            ExprKind::Lambda { .. } | ExprKind::GenericCall { .. } => None,
+        }
+    }
+
+    fn global_init_reads_global_opt(&self, e: Option<&Expr>) -> Option<String> {
+        e.and_then(|e| self.global_init_reads_global(e))
+    }
+
+    fn if_cond_reads_global(&self, cond: &IfCond) -> Option<String> {
+        match cond {
+            IfCond::Cond(e) => self.global_init_reads_global(e),
+            IfCond::Binding { value, .. } => self.global_init_reads_global(value),
+        }
+    }
+
+    fn call_args_read_global(&self, args: &[CallArg]) -> Option<String> {
+        args.iter()
+            .find_map(|a| self.global_init_reads_global(&a.value))
+    }
+
+    fn block_reads_global(&self, b: &Block) -> Option<String> {
+        b.stmts
+            .iter()
+            .find_map(|st| self.stmt_reads_global(st))
+            .or_else(|| self.global_init_reads_global_opt(b.expr.as_deref()))
+    }
+
+    fn block_reads_global_opt(&self, b: Option<&Block>) -> Option<String> {
+        b.and_then(|b| self.block_reads_global(b))
+    }
+
+    fn stmt_reads_global(&self, st: &Stmt) -> Option<String> {
+        match st {
+            Stmt::Let { init, .. } => self.global_init_reads_global_opt(init.as_ref()),
+            Stmt::Const { value, .. } | Stmt::Expr(value) => self.global_init_reads_global(value),
+            Stmt::Return { value, .. } => self.global_init_reads_global_opt(value.as_ref()),
+            Stmt::Throw { value, .. } => self.global_init_reads_global(value),
+            Stmt::While { cond, body, .. } => self
+                .global_init_reads_global(cond)
+                .or_else(|| self.block_reads_global(body)),
+            Stmt::For { header, body, .. } => self
+                .for_header_reads_global(header)
+                .or_else(|| self.block_reads_global(body)),
+            Stmt::Try {
+                body,
+                handler,
+                finally,
+                ..
+            } => self
+                .block_reads_global(body)
+                .or_else(|| self.block_reads_global_opt(handler.as_deref()))
+                .or_else(|| self.block_reads_global_opt(finally.as_deref())),
+            Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Empty(_) => None,
+        }
+    }
+
+    fn for_header_reads_global(&self, header: &ForHeader) -> Option<String> {
+        match header {
+            ForHeader::In { sequence, .. } => self.global_init_reads_global(sequence),
+            ForHeader::Range { init, cond, step } => self
+                .stmt_reads_global(init)
+                .or_else(|| self.global_init_reads_global(cond))
+                .or_else(|| self.global_init_reads_global(step)),
+        }
+    }
 
 fn symbol_for(&self, name: &str, is_test: bool) -> String {
    if is_test {
@@ -4923,15 +5099,16 @@ if self.classes.is_empty()
                 }
             }
         }
+        // Managed global initializers run after class registration (a `Ptr`
+        // initializer may call a constructor, which reads the descriptor that
+        // registration creates) but before `pkl_static_init`, whose field
+        // initializers may allocate while a managed global is still null.
         if let Some(fid) = self.globals_init_id {
-            instrs.insert(
-                0,
-                IrInstr::Call {
-                    dst: None,
-                    callee: Callee::Func(fid),
-                    args: Vec::new(),
-                },
-            );
+            instrs.push(IrInstr::Call {
+                dst: None,
+                callee: Callee::Func(fid),
+                args: Vec::new(),
+            });
         }
         if let Some(fid) = self.static_init_id {
             instrs.push(IrInstr::Call {
@@ -7899,8 +8076,8 @@ return Ok(dst);
     /// initializer is the first code that can allocate (building a string), and
     /// a collection during that allocation must not be able to reach a managed
     /// global that has been written but not yet rooted.
-    fn build_globals_init(&mut self, inits: &[(usize, Expr)]) {
-let ex = self.module.extern_id(IrExtern {
+    fn build_globals_init(&mut self, inits: &[(usize, IrTy, Expr)]) {
+        let ex = self.module.extern_id(IrExtern {
             // `pickle_gc_root_add(cell: *mut *mut PickleObject) -> *mut RootCell`.
             // Both are raw machine addresses, not managed references, so they
             // cross as `Int`; declaring them `Ptr` would make the JIT treat the
@@ -7909,7 +8086,7 @@ let ex = self.module.extern_id(IrExtern {
             params: vec![IrTy::Int],
             ret: IrTy::Int,
         });
-for (id, _) in inits {
+for (id, _, _) in inits {
             let addr = self.temp();
             self.instr(IrInstr::GlobalAddr { dst: addr, id: *id });
             self.instr(IrInstr::Call {
@@ -7918,7 +8095,7 @@ for (id, _) in inits {
                 args: vec![addr],
             });
         }
-        for (id, x) in inits {
+        for (id, ty, x) in inits {
             let v = match self.expr(x) {
                 Ok(v) => v,
                 Err(()) => return,
@@ -7926,7 +8103,7 @@ for (id, _) in inits {
             self.instr(IrInstr::StoreGlobal {
                 id: *id,
                 v,
-                ty: IrTy::Str,
+                ty: *ty,
             });
         }
     }

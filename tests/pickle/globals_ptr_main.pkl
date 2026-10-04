@@ -1,0 +1,103 @@
+// Pointer-shaped top-level `var`s: List, Map, Tuple, class, struct and enum.
+//
+// Like a string global, a managed slot has no static initializer bytes. The
+// compiler emits `pkl_globals_init`, which roots every managed slot
+// (`pickle_gc_root_add`) and then stores each initializer, and that function runs
+// after class registration and before `pkl_static_init`. The ordering matters in
+// both directions: a constructor called by an initializer needs the descriptor
+// class registration creates, and a static-field initializer may allocate into a
+// slot that is not yet rooted.
+//
+// The control this fixture provides is the same as `globals_string_main`: no
+// local in `main` ever holds these values, so the only thing keeping them alive
+// across a collection is the compiler-emitted GC root. An unrooted slot is swept
+// and the reads afterwards see freed memory.
+
+class Box {
+    var n: int
+
+    constructor(n: int) {
+        this.n = n
+    }
+
+    fn doubled() -> int {
+        return this.n * 2
+    }
+}
+
+struct Pair {
+    a: int
+    b: int
+}
+
+enum Shade {
+    Light
+    Dark
+}
+
+var numbers: List<int> = [1, 2, 3]
+var table: Map<string, int> = { "a": 1, "b": 2 }
+var pairish: (int, int) = (7, 8)
+var boxed: Box = Box(21)
+var made: Pair = Pair(3, 4)
+var shade: Shade = Shade.Light
+
+fn churn() {
+    var keep = ""
+    var i = 0
+    while (i < 4000) {
+        keep = keep + str(i)
+        i = i + 1
+    }
+    gcCollect(true)
+    gcCollect(true)
+}
+
+fn check(what: string, ok: bool) {
+    if (!ok) {
+        print("BAD " + what)
+        exit(1)
+    }
+}
+
+fn tupleSum(p: (int, int)) -> int {
+    match (p) {
+        case (a, b) -> a + b
+    }
+}
+
+fn main() {
+    // Nothing above holds a reference to any global's value, so only the
+    // compiler-emitted roots keep them alive through this.
+    churn()
+
+    check("list", len(numbers) == 3)
+    check("list head", numbers[0] == 1)
+    check("list tail", numbers[2] == 3)
+
+    check("map size", len(table) == 2)
+    check("map a", table["a"] == 1)
+    check("map b", table["b"] == 2)
+
+    check("tuple", tupleSum(pairish) == 15)
+
+    check("class field", boxed.n == 21)
+    check("class method", boxed.doubled() == 42)
+
+    check("struct a", made.a == 3)
+    check("struct b", made.b == 4)
+
+    check("enum", shade == Shade.Light)
+
+    // A managed global is writable storage, so mutation must survive another
+    // collection just as the initial value did.
+    numbers.push(4)
+    boxed = Box(5)
+    churn()
+    check("list after push", len(numbers) == 4)
+    check("list after push head", numbers[3] == 4)
+    check("class after replace", boxed.doubled() == 10)
+    check("map after churn", table["a"] == 1)
+
+    print("globals-ptr ok")
+}
