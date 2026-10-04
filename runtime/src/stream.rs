@@ -283,10 +283,20 @@ pub extern "C" fn pickle_stream_write(stream: *mut PickleObject, bytes: *mut Pic
 
 /// Write `bytes` to the process's stderr.
 ///
-/// The `std` build writes straight to `std::io::stderr()`. A `nostd` build has
-/// no separate stderr handle yet and mirrors `eprintln!`, which also folds
-/// stderr into the console bridge — so both builds stay consistent and the
-/// test harness still captures the bytes.
+/// Both builds now send these bytes to the real error handle, so a
+/// self-hosted PE's `stderr_stream()` is indistinguishable from a JIT program's.
+///
+/// This previously folded `nostd` stderr into the console bridge, the same one
+/// [`StreamTarget::Stdout`] uses. That made `stderr_stream().write(...)` and
+/// `stdout_stream().write(...)` indistinguishable on `nostd`, which is only
+/// correct for an in-process harness capturing the bridge and wrong for a
+/// standalone executable: the ported runtime was observed writing to stdout
+/// where the `std` build writes to stderr. It also contradicted the runtime's
+/// own [`crate::nostd::console_error_write`], which the uncaught-throw report
+/// uses and which already targets `STD_ERROR_HANDLE` — so on `nostd` the
+/// uncaught message reached the real stderr while `stderr_stream()` did not.
+///
+/// [`StreamTarget::Stdout`]: enum.StreamTarget
 #[cfg(not(feature = "nostd"))]
 fn stderr_write(bytes: *mut PickleObject) -> i64 {
     write_slots(bytes, |b| std::io::stderr().write_all(b).is_ok())
@@ -300,7 +310,7 @@ fn stderr_write(bytes: *mut PickleObject) -> i64 {
         true
     });
     if n > 0 {
-        crate::console::write_to_con(&buf);
+        crate::nostd::console_error_write(&buf);
     }
     n
 }
@@ -341,10 +351,12 @@ fn stderr_flush() -> bool {
 }
 
 #[cfg(feature = "nostd")]
-fn stderr_flush() -> bool {
-    crate::console::write_to_con(&[]);
-    true
-}
+    fn stderr_flush() -> bool {
+        // `console_error_write` writes through `WriteFile`, which is unbuffered,
+        // so there is nothing left to push. Reporting success matches the `std`
+        // arm and keeps `stderr_stream().flush()` from looking like a failure.
+        true
+    }
 
 /// Push a file writer's buffered bytes out. `BufWriter::flush` returns
 /// `io::Result`; `BufferedFile::flush` already reports success as a `bool`.
