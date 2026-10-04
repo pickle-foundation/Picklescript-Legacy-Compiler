@@ -1,0 +1,98 @@
+module main
+
+// Every POD scalar must round-trip through `.data`: the emitter encodes the
+// static initializer and the backend loads/stores it at the IR type's width.
+// `bool` (1 byte) and `char` (4 bytes) are the interesting cases, because the
+// global load/store used to be hardcoded to 64 bits, which would drag the
+// neighbouring bytes of the next global into the value.
+var gBool: bool = true
+var gBoolOff: bool = false
+var gChar: char = 'Z'
+var gFloat: float = 2.5
+var gFloatNeg: float = -1.5
+var gInt: int = 42
+var gIntNeg: int = -7
+
+// Two adjacent one-byte globals: a wrong-width access to either would read or
+// clobber the other's storage.
+var gFirst: bool = true
+var gSecond: bool = false
+
+// Pointer writes go through helpers rather than a `*p = v` statement: that
+// statement form is a pre-existing checker limitation for pointers produced by
+// `&`, and it fails identically for `int`, so it is not what this fixture is
+// about.
+fn setBool(p: *bool, v: bool) {
+    unsafe {
+        *p = v
+    }
+}
+
+fn setChar(p: *char, v: char) {
+    unsafe {
+        *p = v
+    }
+}
+
+fn setFloat(p: *float, v: float) {
+    unsafe {
+        *p = v
+    }
+}
+
+fn main() {
+    // Static initializers must survive process start.
+    println("bool:", gBool)
+    assert(gBool, "a `true` global initialized to false")
+    assert(!gBoolOff, "a `false` global initialized to true")
+    assert(gChar == 'Z', "a char global did not read back its initializer")
+    assert(gFloat == 2.5, "a float global did not read back its initializer")
+    assert(gFloatNeg == -1.5, "a negated float global lost its sign")
+    assert(gInt == 42, "an int global regressed")
+    assert(gIntNeg == -7, "a negated int global lost its sign")
+
+    // Adjacent one-byte globals must not alias each other.
+    assert(gFirst, "the first of two adjacent bool globals is wrong")
+    assert(!gSecond, "the second of two adjacent bool globals is wrong")
+
+    // A narrow store must not spill into the neighbouring global.
+    gBool = false
+    gBoolOff = true
+    println("after flips:", gBool, gBoolOff)
+    assert(!gBool, "storing false into a bool global did not take")
+    assert(gBoolOff, "storing true into a bool global did not take")
+    assert(gFirst && !gSecond, "a bool store clobbered an adjacent global")
+
+    // A 4-byte char store must be exactly four bytes.
+    gChar = 'q'
+    assert(gChar == 'q', "storing into a char global did not take")
+    gChar = 'Z'
+
+    // A float store must reload bit-exactly.
+    gFloat = 0.1
+    assert(gFloat == 0.1, "storing into a float global did not round-trip")
+    gFloat = 2.5
+
+    // Narrow globals must stay mutable through their address, so `&global`
+    // keeps working once the storage is not word-sized.
+    unsafe {
+        let pb: *bool = &gFirst
+        setBool(pb, false)
+    }
+    println("gFirst after pointer store:", gFirst)
+    assert(!gFirst, "a write through &bool did not reach the global")
+
+    unsafe {
+        let pf: *float = &gFloat
+        setFloat(pf, -0.25)
+    }
+    assert(gFloat == -0.25, "a write through &float did not reach the global")
+
+    unsafe {
+        let pc: *char = &gChar
+        setChar(pc, 'x')
+    }
+    assert(gChar == 'x', "a write through &char did not reach the global")
+
+    println("scalars ok")
+}

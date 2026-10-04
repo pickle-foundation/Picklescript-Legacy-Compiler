@@ -3251,11 +3251,14 @@ impl<'a> Emitter<'a> {
     /// Source `Ty` -> IR slot type, or `None` when this slice has no lowering
     /// for it yet.
 fn global_ir_ty(ty: &Ty) -> Option<IrTy> {
-match ty {
-Ty::Int => Some(IrTy::Int),
-_ => None,
-}
-}
+        match ty {
+            Ty::Int => Some(IrTy::Int),
+            Ty::Bool => Some(IrTy::Bool),
+            Ty::Char => Some(IrTy::Char),
+            Ty::Float => Some(IrTy::Float),
+            _ => None,
+        }
+    }
 
 /// Slot type for a global declared without a `: T` annotation.
 ///
@@ -3263,15 +3266,19 @@ _ => None,
 /// literal (optionally negated) determines a type. Anything richer would have
 /// to be a general static-evaluator, which this slice does not have.
 fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
-match &e.kind {
-ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
-ExprKind::Unary { op: AstUnOp::Neg, operand } => match &operand.kind {
-ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
-_ => None,
-},
-_ => None,
-}
-}
+        match &e.kind {
+            ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
+            ExprKind::Lit(Lit::Float { .. }) => Some(IrTy::Float),
+            ExprKind::Lit(Lit::Bool(_)) => Some(IrTy::Bool),
+            ExprKind::Lit(Lit::Char(_)) => Some(IrTy::Char),
+            ExprKind::Unary { op: AstUnOp::Neg, operand } => match &operand.kind {
+                ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
+                ExprKind::Lit(Lit::Float { .. }) => Some(IrTy::Float),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
 /// Build the module-level global table in source order.
 ///
@@ -3346,27 +3353,67 @@ Some(it) => {
 /// negated): enough to prove the `.data` path end to end without inventing a
 /// general static-evaluator.
 fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option<Vec<u8>>, String> {
-   let lit = match &e.kind {
-      ExprKind::Lit(Lit::Int { value: v }) => Some(*v as i64),
-      ExprKind::Unary { op: crate::ast::UnOp::Neg, operand } => match &operand.kind {
-         ExprKind::Lit(Lit::Int { value: v }) => Some((*v as i64).wrapping_neg()),
-         _ => None,
-      },
-      _ => None,
-   };
-   let Some(v) = lit else {
-      return Err(format!(
-         "the initializer of top-level `var {name}` must be an integer literal; it runs before `main` and cannot call or read other globals yet"
-      ));
-   };
-   match ty {
-      IrTy::Int => Ok(Some(v.to_le_bytes().to_vec())),
-      IrTy::Unit => Ok(None),
-      other => Err(format!(
-         "a top-level `var {name}` of type `{other}` has no static initializer yet"
-      )),
-   }
-}
+      let mismatch = || {
+            // The article is part of the type phrase: "an integer" but "a bool".
+            let want = match ty {
+                IrTy::Bool => "a bool",
+                IrTy::Char => "a char",
+                IrTy::Float => "a float",
+                _ => "an integer",
+            };
+            format!(
+                "the initializer of top-level `var {name}` must be {want} literal; it runs before `main` and cannot call or read other globals yet"
+            )
+        };
+      // Negation is the one unary that still yields a static scalar.
+      let negated = match &e.kind {
+          ExprKind::Unary {
+              op: crate::ast::UnOp::Neg,
+              operand,
+          } => Some(&**operand),
+          _ => None,
+      };
+      match ty {
+          IrTy::Int => {
+              let v = match &e.kind {
+                  ExprKind::Lit(Lit::Int { value: v }) => *v as i64,
+                  _ => match negated {
+                      Some(inner) => match &inner.kind {
+                          ExprKind::Lit(Lit::Int { value: v }) => (*v as i64).wrapping_neg(),
+                          _ => return Err(mismatch()),
+                      },
+                      None => return Err(mismatch()),
+                  },
+              };
+              Ok(Some(v.to_le_bytes().to_vec()))
+          }
+          IrTy::Float => {
+              let v = match &e.kind {
+                  ExprKind::Lit(Lit::Float { value: v }) => *v,
+                  _ => match negated {
+                      Some(inner) => match &inner.kind {
+                          ExprKind::Lit(Lit::Float { value: v }) => -*v,
+                          _ => return Err(mismatch()),
+                      },
+                      None => return Err(mismatch()),
+                  },
+              };
+              Ok(Some(v.to_le_bytes().to_vec()))
+          }
+          IrTy::Bool => match &e.kind {
+              ExprKind::Lit(Lit::Bool(b)) => Ok(Some(vec![if *b { 1 } else { 0 }])),
+              _ => Err(mismatch()),
+          },
+          IrTy::Char => match &e.kind {
+              ExprKind::Lit(Lit::Char(c)) => Ok(Some((*c as u32).to_le_bytes().to_vec())),
+              _ => Err(mismatch()),
+          },
+          IrTy::Unit => Ok(None),
+          other => Err(format!(
+              "a top-level `var {name}` of type `{other}` has no static initializer yet"
+          )),
+      }
+  }
 
 fn symbol_for(&self, name: &str, is_test: bool) -> String {
    if is_test {

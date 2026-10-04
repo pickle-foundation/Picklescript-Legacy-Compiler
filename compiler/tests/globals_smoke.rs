@@ -51,7 +51,7 @@ fn literal_globals_lower_and_keep_main() {
 }
 
 #[test]
-fn global_initialize_requires_an_integer_literal() {
+fn global_initialize_requires_a_scalar_literal() {
     // Reading another global: `base` has no value yet when initializers run.
     let err = emit_err(
         r#"
@@ -77,6 +77,83 @@ fn global_initialize_requires_an_integer_literal() {
         err.contains("must be an integer literal"),
         "missing initializer diagnostic:\n{err}"
     );
+
+    // A type-correct initializer that is still not a literal reaches the
+    // emitter, and the message names the type the global actually wants. (A
+    // wrongly-typed literal never gets this far: the checker rejects it first.)
+    let err = emit_err(
+        r#"
+        var seed: bool = true
+        var flag: bool = seed
+        fn main() { println("x") }
+        "#,
+    );
+    assert!(
+        err.contains("must be a bool literal"),
+        "missing bool initializer diagnostic:\n{err}"
+    );
+
+    let err = emit_err(
+        r#"
+        var seed: char = 'a'
+        var letter: char = seed
+        fn main() { println("x") }
+        "#,
+    );
+    assert!(
+        err.contains("must be a char literal"),
+        "missing char initializer diagnostic:\n{err}"
+    );
+
+    let err = emit_err(
+        r#"
+        var seed: float = 1.5
+        var ratio: float = seed
+        fn main() { println("x") }
+        "#,
+    );
+    assert!(
+        err.contains("must be a float literal"),
+        "missing float initializer diagnostic:\n{err}"
+    );
+}
+
+#[test]
+fn scalar_globals_of_every_pod_type_lower() {
+    let m = emit_ok(
+        r#"
+        var flag: bool = true
+        var letter: char = 'Z'
+        var ratio: float = 2.5
+        var negRatio: float = -1.5
+        var count: int = 42
+        fn main() { println("hi") }
+        "#,
+    );
+    assert!(has_main(&m), "a main must still be emitted alongside globals");
+
+    // Each global must carry its declared IR width in `.data`: a bool is one
+    // byte and a char is four, so a fixed 8-byte encoding would misrepresent
+    // the slot the backend loads and stores.
+    let widths: Vec<(String, usize)> = m
+        .globals
+        .iter()
+        .map(|g| (g.symbol.clone(), g.init.as_ref().map(|b| b.len()).unwrap_or(0)))
+        .collect();
+    let expect = [
+        ("pkl_global_flag", 1usize),
+        ("pkl_global_letter", 4),
+        ("pkl_global_ratio", 8),
+        ("pkl_global_negRatio", 8),
+        ("pkl_global_count", 8),
+    ];
+    for (sym, len) in expect {
+        let got = widths
+            .iter()
+            .find(|(s, _)| s == sym)
+            .unwrap_or_else(|| panic!("missing global {sym}"));
+        assert_eq!(got.1, len, "{sym} should be initialized with {len} bytes");
+    }
 }
 
 #[test]
