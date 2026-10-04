@@ -1,0 +1,57 @@
+// Regression: a program's `#[symbol]` definition must be emitted under the exact
+// ABI name and must be the body that runs.
+//
+// Two traps, both of which the earlier bugs fell into:
+//
+//  1. `pickle_str_len` is declared here, so THIS body must run. Rust's
+//     `pickle_str_len` is correct and returns the real length, so a linker that
+//     silently kept the archive copy would print a plausible number and this
+//     test would still "pass". The override returns a fixed sentinel instead,
+//     which no correct archive implementation can produce. Rule recorded in
+//     MEMORIES: make the two implementations distinguishable, then observe
+//     which one runs.
+//
+//  2. `pickle_str_from_bytes` and `pickle_str_cmp` are NOT declared here, so the
+//     archive copies must still win. If the override leaked to undeclared names,
+//     this program would concatenate with a body that has no business running.
+//
+// SCOPE, verified by mutation on 2026-10-04 — read this before trusting the test
+// to cover more than it does. Negating the `#[symbol]` check in
+// `compiler/emit.pkl::itemSymbol` makes this print "FAIL: override did not win",
+// so it genuinely pins the emit path. Disabling the override list
+// (`cli/buildlib.pkl::overrideSymbols`) does NOT make it fail, because the
+// program object is merged at index 0 and so wins every collision by ordering
+// alone. `progOverrides` (compiler a38b3cb) therefore governs *relocation
+// redirection* for archive-internal call sites, not definition selection; this
+// fixture does not cover that. Covering it needs an archive-internal call to a
+// name the program also defines — a case that needs a purpose-built archive, not
+// a program-only fixture.
+//
+// `len(s) != 31337` proves (1). Building a runtime string and comparing it prove
+// (2), since `+` lowers to pickle_str_from_bytes and `!=` to pickle_str_cmp.
+
+module symoverride_main
+
+// Must win over the archive: this value cannot come from Rust's real impl.
+#[symbol("pickle_str_len")]
+fn lyingStrLen(s: *int) -> int {
+    return 31337
+}
+
+fn main() {
+    let s = "abc"
+    let n = len(s)
+    if (n != 31337) {
+        println("FAIL: override did not win")
+        return
+    }
+    // Exercise the undeclared paths: the archive must still supply these.
+    // `+` lowers to pickle_str_from_bytes and `!=` to pickle_str_cmp, so this
+    // one comparison covers both archive bodies that were NOT overridden.
+    let joined = "ab" + "cd"
+    if (joined != "abcd") {
+        println("FAIL: an undeclared archive body was displaced")
+        return
+    }
+    println("SYM_OVERRIDE_OK")
+}

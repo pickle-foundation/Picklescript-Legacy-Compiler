@@ -1,0 +1,25 @@
+// Regression: `stderr_stream()` must reach the process's stderr handle.
+//
+// This is deliberately NOT a `pickle test` case. The bug it pins lived in the
+// Rust `nostd` build of `runtime/src/stream.rs`, where `stderr_write` called the
+// same console bridge `StreamTarget::Stdout` uses, so both streams landed on
+// stdout. That is a property of the *process's* file handles, so no in-process
+// test can observe it: the existing `runtime/stream_test.pkl` writes through
+// `newMemIo`, which bypasses the console bridge entirely and would stay green
+// through the whole bug. Only a spawned executable with separated pipes can see
+// it, which is why `tools/stderr_stream_parity.ps1` drives this file.
+//
+// The markers are distinguishable per stream on purpose. A harness that only
+// checked "some output appeared" would have passed while both writes went to one
+// handle. Each stream carries its own token, and the assertions are per-channel.
+
+module stderrstream_main
+
+fn main() {
+    let err = stderr_stream()
+    let out = stdout_stream()
+    err.write(bytes("[ERRHANDLE]"))
+    out.write(bytes("[OUTHANDLE]"))
+    err.flush()
+    out.flush()
+}
