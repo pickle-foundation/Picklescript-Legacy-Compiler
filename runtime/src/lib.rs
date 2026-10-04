@@ -462,6 +462,20 @@ declare_abi! {
     pickle_gc_bytes_since_gc => crate::gc::pickle_gc_bytes_since_gc,
     pickle_gc_set_threshold => crate::gc::pickle_gc_set_threshold,
 
+    // Exported, and therefore linkable, but missing from this table until now.
+    // `ALL_ABI_NAMES` is the crash reporter's descriptor list: an unlisted name
+    // still resolves through `runtime_addr`, it just has no descriptor, so a
+    // backtrace through one of these could not be symbolicated.
+    pickle_gc_alloc => crate::gc::pickle_gc_alloc,
+    pickle_gc_root_add => crate::gc::pickle_gc_root_add,
+    pickle_gc_root_drop => crate::gc::pickle_gc_root_drop,
+    pickle_gc_register_thread => crate::shadow::pickle_gc_register_thread,
+    pickle_gc_unregister_thread => crate::shadow::pickle_gc_unregister_thread,
+    pickle_manual_adopt => crate::gc::pickle_manual_adopt,
+    pickle_manual_free => crate::gc::pickle_manual_free,
+    pickle_runtime_register_class_table => crate::pickle_runtime_register_class_table,
+    pickle_flush => crate::console::pickle_flush,
+
     pickle_args => crate::os::pickle_args,
     pickle_args_set => crate::os::pickle_args_set,
     pickle_exit => crate::os::pickle_exit,
