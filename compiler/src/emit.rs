@@ -105,6 +105,7 @@ pub fn emit_ir(
         global_ids: HashMap::new(),
         global_decls: HashMap::new(),
         global_failures: Vec::new(),
+        managed_global_inits: Vec::new(),
         class_consts: HashMap::new(),
         const_inlining: Vec::new(),
         fid_list: Vec::new(),
@@ -135,6 +136,7 @@ pub fn emit_ir(
         static_property_ids: HashMap::new(),
         static_inits: Vec::new(),
         static_init_id: None,
+        globals_init_id: None,
         test_setup_id: None,
         owner: None,
         closure_tables: HashMap::new(),
@@ -275,7 +277,7 @@ enum FnSource<'a> {
     /// explicit `constructor(...)` body is present.
     Ctor {
         table: ClassTable,
-        /// (slot, initializer) for each instance field with an initializer,
+    /// (slot, initializer) for each instance field with an initializer,
         /// in declaration order.
         inits: Vec<(usize, &'a Expr)>,
         /// `init { ... }` blocks, in declaration order.
@@ -312,6 +314,14 @@ enum FnSource<'a> {
     /// initializer and is stored as its default (zero/null) value.
     StaticInit {
         inits: Vec<(u32, usize, Option<&'a Expr>)>,
+    },
+    /// The synthesized `pkl_globals_init` function: registers a GC root for every
+    /// managed top-level `var` and then stores its initializer. Managed globals
+    /// have no static initializer bytes, so their value cannot exist before
+    /// `main`; this is the first code that may allocate, so every slot is rooted
+    /// first.
+    GlobalsInit {
+        inits: Vec<(usize, Expr)>,
     },
     /// A dynamically-callable forwarder for a top-level function used as a
     /// value. Slot 0 is the closure object (ignored; module functions capture
@@ -576,6 +586,11 @@ struct Emitter<'a> {
     global_decls: HashMap<String, &'a GlobalDecl>,
     /// Globals whose init could not be reduced to bytes, for diagnostics.
     global_failures: Vec<(String, Span, String)>,
+    /// Managed globals as `(global id, initializer expr)`, in declaration
+    /// order. Their value cannot be static bytes, so it is compiled into the
+    /// synthetic `pkl_globals_init` function together with the
+    /// `pickle_gc_root_add` registration for each slot.
+    managed_global_inits: Vec<(usize, Expr)>,
     /// `(class id, const name)` -> declared info + initializer, inlined at use
     /// sites (`Type.NAME`, or the bare name inside the class body).
     class_consts: HashMap<(u32, String), (FieldInfo, &'a Expr)>,
@@ -682,6 +697,9 @@ struct Emitter<'a> {
     /// The synthesized static-initializer function, called once at the top of
     /// `main` after class registration.
     static_init_id: Option<FuncId>,
+    /// The synthesized pkl_globals_init function, when the module has a
+/// managed top-level `var`. The class-registration preamble calls it.
+    globals_init_id: Option<FuncId>,
     /// The synthesized `pkl_test_setup` function, when the module has tests
     /// (and no `main` to carry the class-registration preamble).
     test_setup_id: Option<FuncId>,
@@ -873,6 +891,20 @@ impl<'a> Emitter<'a> {
             );
             self.static_init_id = Some(fid);
         }
+        // Managed top-level `var`s get the same treatment: a synthesized function
+        // that roots each slot and stores its initializer, called from the same
+        // preamble as `pkl_static_init`. Roots are registered before static-field
+        // initializers run, because those may allocate while a managed global is
+        // still null.
+        if !self.managed_global_inits.is_empty() {
+            let inits = std::mem::take(&mut self.managed_global_inits);
+            let fid = self.push_class_func(
+                "globals.init",
+                "pkl_globals_init",
+                FnSource::GlobalsInit { inits },
+            );
+            self.globals_init_id = Some(fid);
+        }
         // Test modules have no `main`, so the class-registration preamble
         // cannot ride on one. Synthesize a `pkl_test_setup` the runner calls
         // before executing hooks/tests (only when there is anything to set up).
@@ -880,7 +912,11 @@ impl<'a> Emitter<'a> {
             .items
             .iter()
             .any(|i| matches!(i.kind, ItemKind::Test(_)));
-        if has_tests && (!self.classes.is_empty() || self.static_init_id.is_some()) {
+        if has_tests
+            && (!self.classes.is_empty()
+                || self.static_init_id.is_some()
+                || self.globals_init_id.is_some())
+        {
             let fid = self.push_class_func("test.setup", "pkl_test_setup", FnSource::TestSetup);
             self.test_setup_id = Some(fid);
         }
@@ -3256,6 +3292,10 @@ fn global_ir_ty(ty: &Ty) -> Option<IrTy> {
             Ty::Bool => Some(IrTy::Bool),
             Ty::Char => Some(IrTy::Char),
             Ty::Float => Some(IrTy::Float),
+            // Managed. The slot is zeroed statically and both the initial value
+            // and the GC root registration are emitted into the synthetic
+            // `pkl_globals_init` function, which the host runs before `main`.
+            Ty::String => Some(IrTy::Str),
             _ => None,
         }
     }
@@ -3271,6 +3311,7 @@ fn global_infer_ir_ty(e: &Expr) -> Option<IrTy> {
             ExprKind::Lit(Lit::Float { .. }) => Some(IrTy::Float),
             ExprKind::Lit(Lit::Bool(_)) => Some(IrTy::Bool),
             ExprKind::Lit(Lit::Char(_)) => Some(IrTy::Char),
+            ExprKind::Lit(Lit::String(_)) => Some(IrTy::Str),
             ExprKind::Unary { op: AstUnOp::Neg, operand } => match &operand.kind {
                 ExprKind::Lit(Lit::Int { .. }) => Some(IrTy::Int),
                 ExprKind::Lit(Lit::Float { .. }) => Some(IrTy::Float),
@@ -3335,6 +3376,9 @@ Some(it) => {
                init,
             });
             self.global_ids.insert(name, id);
+            if it == IrTy::Str {
+                self.managed_global_inits.push((id, g.value.clone()));
+            }
          }
          None => {
             self.global_failures.push((
@@ -3408,10 +3452,15 @@ fn global_init_bytes(&mut self, e: &Expr, ty: IrTy, name: &str) -> Result<Option
               ExprKind::Lit(Lit::Char(c)) => Ok(Some((*c as u32).to_le_bytes().to_vec())),
               _ => Err(mismatch()),
           },
-          IrTy::Unit => Ok(None),
-          other => Err(format!(
-              "a top-level `var {name}` of type `{other}` has no static initializer yet"
-          )),
+            IrTy::Unit => Ok(None),
+            // Managed: no static bytes. The COFF writer already emits an
+            // all-zero 8-byte slot for `init: None`, and the value plus the
+            // `pickle_gc_root_add` registration are emitted into
+            // `pkl_globals_init` instead.
+            IrTy::Str => Ok(None),
+            other => Err(format!(
+                "a top-level `var {name}` of type `{other}` has no static initializer yet"
+            )),
       }
   }
 
@@ -3703,6 +3752,11 @@ fn symbol_for(&self, name: &str, is_test: bool) -> String {
                         return;
                     }
                 }
+                self.term(IrTerm::Return { v: None });
+            }
+            FnSource::GlobalsInit { inits } => {
+                self.fret = IrTy::Unit;
+                self.build_globals_init(&inits);
                 self.term(IrTerm::Return { v: None });
             }
             FnSource::TestSetup => {
@@ -4727,7 +4781,10 @@ fn symbol_for(&self, name: &str, is_test: bool) -> String {
     /// function, or 0 when it has no `deinit` block; `parent` is the
     /// superclass id, or 0 for a root class.
     fn inject_class_registrations(&mut self) {
-        if self.classes.is_empty() {
+if self.classes.is_empty()
+            && self.static_init_id.is_none()
+            && self.globals_init_id.is_none()
+        {
             return;
         }
         let plans: Vec<(String, usize, u32, u32, u64)> = self
@@ -4865,6 +4922,16 @@ fn symbol_for(&self, name: &str, is_test: bool) -> String {
                     });
                 }
             }
+        }
+        if let Some(fid) = self.globals_init_id {
+            instrs.insert(
+                0,
+                IrInstr::Call {
+                    dst: None,
+                    callee: Callee::Func(fid),
+                    args: Vec::new(),
+                },
+            );
         }
         if let Some(fid) = self.static_init_id {
             instrs.push(IrInstr::Call {
@@ -7825,6 +7892,45 @@ return Ok(dst);
     }
 
     /// Evaluate one static-field initializer and store it.
+    /// Body of the synthesized `pkl_globals_init`: for each managed top-level
+    /// `var`, register the slot as a GC root and then store its initializer.
+    ///
+    /// All registrations are emitted before any initializer is evaluated. An
+    /// initializer is the first code that can allocate (building a string), and
+    /// a collection during that allocation must not be able to reach a managed
+    /// global that has been written but not yet rooted.
+    fn build_globals_init(&mut self, inits: &[(usize, Expr)]) {
+let ex = self.module.extern_id(IrExtern {
+            // `pickle_gc_root_add(cell: *mut *mut PickleObject) -> *mut RootCell`.
+            // Both are raw machine addresses, not managed references, so they
+            // cross as `Int`; declaring them `Ptr` would make the JIT treat the
+            // slot address as a heap object it must root.
+            symbol: "pickle_gc_root_add".to_string(),
+            params: vec![IrTy::Int],
+            ret: IrTy::Int,
+        });
+for (id, _) in inits {
+            let addr = self.temp();
+            self.instr(IrInstr::GlobalAddr { dst: addr, id: *id });
+            self.instr(IrInstr::Call {
+                dst: None,
+                callee: Callee::Extern(ex),
+                args: vec![addr],
+            });
+        }
+        for (id, x) in inits {
+            let v = match self.expr(x) {
+                Ok(v) => v,
+                Err(()) => return,
+            };
+            self.instr(IrInstr::StoreGlobal {
+                id: *id,
+                v,
+                ty: IrTy::Str,
+            });
+        }
+    }
+
     fn build_static_init_one(&mut self, cid: u32, slot: usize, x: &Expr) -> Result<(), ()> {
         let Some(info) = self.static_field_at(cid as i64, slot) else {
             return Ok(());

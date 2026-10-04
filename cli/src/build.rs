@@ -115,13 +115,16 @@ pub fn emit_object(module: &IrModule) -> Result<Vec<u8>> {
       // `pkl_global_*` is deliberately *not* prefixed as read-only like the
       // string blobs: these are written by `storeglobal`.
       for g in &module.globals {
-          let bytes = match &g.init {
+let bytes = match &g.init {
               Some(b) => b.clone(),
-              // Zero-init: an empty definition still gets a symbol with a
-              // real address, which is what `loadglobal`/`gaddr` need. Cranelift
-              // routes an empty definition to `.bss`, so these never cost file
-              // space.
-              None => Vec::new(),
+              // A managed global has no static initializer bytes, but its slot
+              // must still be *sized*. Emitting an empty definition makes the
+              // symbol zero-length, and cranelift then gives zero-length
+              // symbols overlapping addresses: with two managed globals both
+              // `storeglobal`s land in one cell and both reads return the
+              // second value. Emit real zero bytes of the right width instead,
+              // which is also what the port's `zeroGlobalBytes` does.
+              None => vec![0u8; g.ty.byte_width()],
           };
           // `writable = true` is load-bearing, not cosmetic: cranelift-object
           // picks `StandardSection::Data` (a writable `.data`) only for

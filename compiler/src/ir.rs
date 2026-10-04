@@ -27,6 +27,21 @@ impl IrTy {
     pub fn is_unit(self) -> bool {
         self == IrTy::Unit
     }
+
+    /// Storage width of a value of this type, in bits. Mirrors `tyWidth` in
+    /// `pickle/compiler/x64.pkl` so both backends agree on symbol sizes.
+    pub fn bit_width(self) -> u32 {
+        match self {
+            IrTy::Bool => 8,
+            IrTy::Char => 32,
+            IrTy::Int | IrTy::Float | IrTy::Str | IrTy::Unit | IrTy::Ptr => 64,
+        }
+    }
+
+    /// Storage width in bytes: what a `.data`/`.bss` slot for this type needs.
+    pub fn byte_width(self) -> usize {
+        (self.bit_width() / 8) as usize
+    }
 }
 
 impl fmt::Display for IrTy {

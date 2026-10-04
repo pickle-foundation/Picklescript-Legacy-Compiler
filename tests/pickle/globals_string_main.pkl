@@ -1,0 +1,46 @@
+// Managed top-level `var`s: the slot has no static initializer bytes, so the
+// compiler synthesizes `pkl_globals_init`, which registers each slot as a GC
+// root (`pickle_gc_root_add`) and then stores the initializer. All roots are
+// registered before any initializer runs, because an initializer is the first
+// code that can allocate.
+//
+// The control this fixture provides: `churn` forces collections while holding
+// no local reference to either global's string. A rooted global survives; an
+// unrooted one is swept and the reads in `main` then see freed memory.
+
+var greeting: string = "hello"
+var tag: string = "world"
+
+fn churn() {
+    var keep = ""
+    var i = 0
+    while (i < 4000) {
+        keep = keep + str(i)
+        i = i + 1
+    }
+    gcCollect(true)
+    gcCollect(true)
+}
+
+fn main() {
+    // Nothing above mentions `greeting` or `tag`, so the only thing keeping
+    // their strings alive is the compiler-emitted GC root.
+    churn()
+    if (greeting != "hello") {
+        print("BAD greeting")
+        exit(1)
+    }
+    if (tag != "world") {
+        print("BAD tag")
+        exit(1)
+    }
+    greeting = "mutated"
+    churn()
+    if (greeting != "mutated") {
+        print("BAD after churn")
+        exit(1)
+    }
+    print(greeting)
+    print(tag)
+    print("globals-string ok")
+}
