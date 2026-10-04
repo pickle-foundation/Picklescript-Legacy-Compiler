@@ -1,0 +1,67 @@
+module main
+
+// `&global` yields the address of the global's own storage, not a copy. A write
+// through that pointer must land in the global. This is the primitive a ported
+// runtime needs to hand a mutable cell to an extern (e.g. a per-thread frame
+// head) instead of returning a value that gets copied.
+var g: int = 1
+var untouched: int = 5
+
+// Writes through the pointer the caller passed, so the mutation is observable
+// only if the callee really received the global's address.
+fn writeThrough(p: *int, v: int) {
+    unsafe {
+        *p = v
+    }
+}
+
+fn readThrough(p: *int): int {
+    unsafe {
+        return *p
+    }
+}
+
+fn bump(p: *int) {
+    unsafe {
+        *p = *p + 10
+    }
+}
+
+fn main() {
+    unsafe {
+        let p: *int = &g
+        writeThrough(p, 99)
+        println("after writeThrough:", g)
+        assert(g == 99, "a write through &global did not reach the global")
+
+        println("readThrough:", readThrough(p))
+        assert(readThrough(p) == 99, "a read through &global did not see the global")
+
+        // Compound-style update through the pointer: load then store, so the
+        // global's own prior value must contribute.
+        bump(p)
+        println("after bump:", g)
+        assert(g == 109, "read-modify-write through &global lost the old value")
+    }
+
+    // The pointer's lifetime is the caller's, but the cell outlives it: the
+    // global keeps the last stored value with no local still alive.
+    println("outside unsafe:", g)
+    assert(g == 109, "the global did not retain the value written via its address")
+
+    // A second global must be unaffected: the address is per-global, not shared.
+    println("untouched:", untouched)
+    assert(untouched == 5, "taking &g disturbed an unrelated global")
+
+    // Direct assignment still works and agrees with the pointer path.
+    g = 7
+    println("after direct assign:", g)
+    assert(g == 7, "direct assignment to the global regressed")
+
+    unsafe {
+        let p2: *int = &g
+        writeThrough(p2, readThrough(p2) + 1)
+    }
+    println("final:", g)
+    assert(g == 8, "the final pointer update did not land")
+}

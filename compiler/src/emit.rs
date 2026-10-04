@@ -6437,12 +6437,22 @@ fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
                     let ExprKind::Ident(name) = &operand.kind else {
                         return self.bad(e.span, "`&` of a scalar requires a local variable");
                     };
-                    let Some(slot) = self.lookup(name) else {
-                        return self.bad(e.span, "`&` of an unknown local");
-                    };
-                    let dst = self.temp();
-                    self.instr(IrInstr::LocalAddr { dst, slot });
-                    return Ok(dst);
+                    if let Some(slot) = self.lookup(name) {
+                        let dst = self.temp();
+                        self.instr(IrInstr::LocalAddr { dst, slot });
+                        return Ok(dst);
+                    }
+                    // A top-level `var` is addressable too: the cell lives in the
+                    // image's `.data`, so `&g` is the address of that symbol and a
+                    // write through it lands in the global, not a copy. This is
+                    // what lets a ported runtime pass a mutable cell to an extern
+                    // (e.g. a per-thread frame head) instead of returning a value.
+                    if let Some(&id) = self.global_ids.get(name.as_str()) {
+                        let dst = self.temp();
+                        self.instr(IrInstr::GlobalAddr { dst, id });
+                        return Ok(dst);
+                    }
+                    return self.bad(e.span, "`&` of an unknown local");
                 }
                 match t {
                     Some(Ty::Class(..) | Ty::Struct(..) | Ty::Ptr(..)) => self.expr(operand),
