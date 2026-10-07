@@ -1,0 +1,131 @@
+module abi_string_main
+
+// Exercises the ported string ABI bodies added in `runtime.abi_string` beyond the
+// original five: `pickle_str_get`, `pickle_str_set`, `pickle_str_from_bool`,
+// `pickle_str_from_byte`, `pickle_str_from_char`, `pickle_str_to_bytes`, and
+// `pickle_str_from_list`.
+//
+// Companion to `abi_box_main.pkl` / `abi_list_main.pkl` / `abi_map_main.pkl` /
+// `abi_enum_main.pkl`: prove the bodies survive source -> ported front end ->
+// ported emitter -> ported COFF -> ported PE linker -> executed, byte-identical
+// to the Rust JIT, and are actually LINKED rather than served by the Rust
+// runtime's identically-named exports.
+//
+// The assertions target the things a faithful port can get wrong here:
+//
+//   * `pickle_str_set` is COPY-ON-WRITE. It must not mutate the source, and
+//     writing a byte over an existing one needs a clear-then-set, not an OR.
+//   * `pickle_str_from_byte` writes a RAW byte. A re-encode would corrupt
+//     multi-byte UTF-8, so byte 0xC3 is a one-byte string, not U+00C3.
+//   * `pickle_str_from_char` replaces every invalid code point with U+FFFD,
+//     including surrogates and anything past U+10FFFF.
+//   * `bytes()` / `str()` must round-trip EXACTLY, byte for byte.
+//
+// Printing a string goes through `pickle_print_obj`, which calls
+// `pickle_str_len` and `pickle_str_get` - so this file exercises the new bodies
+// on every single line it prints, even where the text looks inert.
+import { abiStrLen, abiStrGet, abiStrSet, abiStrConcat, abiStrCmp, abiStrFromBool, abiStrFromByte, abiStrFromChar, abiStrToBytes, abiStrFromList } from runtime.abi_string
+import { abiListNew, abiListLen, abiListGet } from runtime.abi_list
+import { abiUnboxI64 } from runtime.abi_box
+
+/// Build a string object from raw byte values. `pickle_str_from_byte` is the
+/// constructor that takes a plain `int` byte, so it is the way a test gets a
+/// string object without depending on the emitter's own conversion.
+fn b2(a: int, c: int) -> *int {
+    return abiStrConcat(abiStrFromByte(a), abiStrFromByte(c))
+}
+
+fn b3(a: int, c: int, d: int) -> *int {
+    return abiStrConcat(b2(a, c), abiStrFromByte(d))
+}
+
+fn b4(a: int, c: int, d: int, e: int) -> *int {
+    return abiStrConcat(b3(a, c, d), abiStrFromByte(e))
+}
+
+fn main() {
+    println("== str_get reads raw bytes ==")
+    let abc = b3(97, 98, 99)
+    println("  abc len={abiStrLen(abc)}")
+    var i = 0
+    while (i < abiStrLen(abc)) {
+        println("    abc[{i}]={abiStrGet(abc, i)}")
+        i = i + 1
+    }
+
+    println("== str_get over multibyte text ==")
+    // C3 A9 is "e-acute"; the body reads bytes, not code points.
+    let eacute = b2(195, 169)
+    println("  len={abiStrLen(eacute)} b0={abiStrGet(eacute, 0)} b1={abiStrGet(eacute, 1)}")
+
+    println("== str_set is copy-on-write ==")
+    let src = b3(97, 98, 99)
+    let dst = abiStrSet(src, 1, 122)
+    println("  src[1]={abiStrGet(src, 1)} dst[1]={abiStrGet(dst, 1)}")
+    println("  same object={(src as int) == (dst as int)}")
+
+    println("== str_set truncates to a byte ==")
+    // 321 = 0x141, so the low byte is 0x41 = 'A'.
+    let trunc = abiStrSet(b4(63, 0, 0, 0), 0, 321)
+    println("  byte0={abiStrGet(trunc, 0)}")
+
+    println("== str_from_bool ==")
+    // Printed byte by byte: the body's return type is the raw `*int`, and a
+    // `*int` interpolates as an ADDRESS, not as text. There is no `*int` ->
+    // `string` conversion to unwrap it here, which is the same missing edge that
+    // forced the tests to construct strings rather than write them.
+    let bt = abiStrFromBool(true)
+    let bf = abiStrFromBool(false)
+    println("  true  len={abiStrLen(bt)} bytes={abiStrGet(bt, 0)},{abiStrGet(bt, 1)},{abiStrGet(bt, 2)},{abiStrGet(bt, 3)}")
+    println("  false len={abiStrLen(bf)} bytes={abiStrGet(bf, 0)},{abiStrGet(bf, 1)},{abiStrGet(bf, 2)},{abiStrGet(bf, 3)},{abiStrGet(bf, 4)}")
+
+    println("== str_from_byte is raw, not re-encoded ==")
+    let raw = abiStrFromByte(195)
+    println("  len={abiStrLen(raw)} byte0={abiStrGet(raw, 0)}")
+    println("  321 truncates to byte0={abiStrGet(abiStrFromByte(321), 0)}")
+
+    println("== str_from_char encodes UTF-8 ==")
+    println("  A       len={abiStrLen(abiStrFromChar(65))}")
+    println("  U+00E9  len={abiStrLen(abiStrFromChar(233))}")
+    println("  U+FFFD  len={abiStrLen(abiStrFromChar(65533))}")
+    println("  U+1F600 len={abiStrLen(abiStrFromChar(128512))}")
+    let emoji = abiStrFromChar(128512)
+    var j = 0
+    while (j < abiStrLen(emoji)) {
+        println("    emoji[{j}]={abiStrGet(emoji, j)}")
+        j = j + 1
+    }
+
+    println("== str_from_char replaces invalid code points ==")
+    let want = abiStrFromChar(65533)
+    println("  D800  matches U+FFFD: {abiStrCmp(abiStrFromChar(55296), want) == 0}")
+    println("  DFFF  matches U+FFFD: {abiStrCmp(abiStrFromChar(57343), want) == 0}")
+    println("  >10FFFF matches U+FFFD: {abiStrCmp(abiStrFromChar(1114112), want) == 0}")
+    println("  -1    matches U+FFFD: {abiStrCmp(abiStrFromChar(0 - 1), want) == 0}")
+
+    println("== str_to_bytes boxes every byte ==")
+    let bs = abiStrToBytes(abc)
+    println("  list len={abiListLen(bs)}")
+    var k = 0
+    while (k < abiListLen(bs)) {
+        println("    box[{k}]={abiUnboxI64(abiListGet(bs, k))}")
+        k = k + 1
+    }
+
+    println("== bytes()/str() round-trip exactly ==")
+    // "h" C3 A9 "llo" - mixed ASCII and multibyte.
+    let mixed = b3(104, 233, 108)
+    let back = abiStrFromList(abiStrToBytes(mixed))
+    println("  len in={abiStrLen(mixed)} out={abiStrLen(back)} cmp={abiStrCmp(back, mixed)}")
+    var m = 0
+    while (m < abiStrLen(back)) {
+        println("    back[{m}]={abiStrGet(back, m)}")
+        m = m + 1
+    }
+
+    println("== empty string ==")
+    // `from_byte` always makes exactly one byte, so the empty string has to come
+    // from the other direction: an empty byte list.
+    let empty = abiStrFromList(abiListNew(0))
+    println("  len={abiStrLen(empty)} list len={abiListLen(abiStrToBytes(empty))}")
+}

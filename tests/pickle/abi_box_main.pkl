@@ -1,0 +1,68 @@
+module abi_box_main
+
+// Exercises the sovereign boxed-scalar ABI bodies in `runtime.abi_box`.
+//
+// `pickle_box_i64`/`unbox_i64` are referenced by 163/166 program shapes (measured by
+// tools/extern_surface.ps1), so they are the widest single point of dependence on the
+// native runtime. Once `abi_box.pkl` exports them, this main is what proves the ported
+// bodies survive the whole path: source -> ported front end -> ported emitter -> ported
+// COFF -> ported PE linker against the nostd archive -> executed, with stdout
+// byte-identical to the Rust JIT.
+
+import { abiBoxI64, abiUnboxI64, abiBoxBool, abiUnboxBool, abiBoxChar, abiUnboxChar, abiUnboxF64, newBox, boxBits } from runtime.abi_box
+import { PICKLE_CLASS_BOX_FLOAT } from runtime.object
+
+fn main() {
+    // Round-trip through the exported ABI entry points directly.
+    println("i64 neg: {abiUnboxI64(abiBoxI64(-1234567890123))}")
+    println("i64 zero: {abiUnboxI64(abiBoxI64(0))}")
+    println("i64 max: {abiUnboxI64(abiBoxI64(9223372036854775807))}")
+    println("bool true: {abiUnboxBool(abiBoxBool(true))}")
+    println("bool false: {abiUnboxBool(abiBoxBool(false))}")
+    println("char A: {abiUnboxChar(abiBoxChar(65))}")
+
+    // The path that matters in real code: the compiler boxes implicitly when an int
+    // is stored in a list, read back out, and printed. If the ported box body were
+    // wrong about the header, these would print garbage or crash rather than fail
+    // quietly, because list_set/list_get round-trip the box object itself.
+    var xs = [1, 2, 3]
+    xs.push(4)
+    var total = 0
+    var i = 0
+    while (i < len(xs)) {
+        total = total + xs[i]
+        i = i + 1
+    }
+    println("list sum: {total}")
+
+    // Chars and bools travel the same way through a list.
+    var flags = [true, false, true]
+    var trues = 0
+    var j = 0
+    while (j < len(flags)) {
+        if (flags[j]) {
+            trues = trues + 1
+        }
+        j = j + 1
+    }
+    println("true flags: {trues}")
+
+    // The float half. `pickle_unbox_f64` IS ported; `pickle_box_f64` is not, because
+    // `float -> bits` has no source-level spelling (see the GAP in `abi_box.pkl`).
+    // So the box is built here with the raw IEEE-754 pattern, which is what makes the
+    // unbox body the thing under test: a body that used a numeric conversion would
+    // answer 4609434218613702656.0 here instead of 1.5.
+    let fbox = newBox(PICKLE_CLASS_BOX_FLOAT, 4609434218613702656)
+    println("float 1.5 payload: {boxBits(fbox)}")
+    println("float unboxed: {abiUnboxF64(fbox)}")
+    println("float 0.5: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, 4602678819172646912))}")
+    println("float -2.0: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, -4611686018427387904))}")
+    println("float +inf: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, 9218868437227405312))}")
+    println("float -inf: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, -4503599627370496))}")
+    println("float min subnormal: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, 1))}")
+    println("float max: {abiUnboxF64(newBox(PICKLE_CLASS_BOX_FLOAT, 9218868437227405311))}")
+    let nanbox = newBox(PICKLE_CLASS_BOX_FLOAT, 9221120237041090560)
+    let nan = abiUnboxF64(nanbox)
+    println("float nan self-unequal: {nan != nan}")
+    println("float nan payload preserved: {boxBits(nanbox) == 9221120237041090560}")
+}

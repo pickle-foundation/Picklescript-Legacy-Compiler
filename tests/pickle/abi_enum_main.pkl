@@ -1,0 +1,215 @@
+module tests.pickle.abi_enum_main
+
+/// Parity main for the ported enum ABI.
+///
+/// Prints only what the native runtime would print for the same program, so the JIT
+/// and AOT stdout can be compared byte for byte. Every value printed is one the
+/// native side derives independently, which is what makes the equality in
+/// `pickle_enum_eq` checkable from outside the unit suite.
+
+import { enumNew, enumFieldCount, f64ValueEq } from runtime.abi_enum
+import { abiEnumNew, abiEnumTag, abiEnumField, abiEnumSetField, abiEnumEq } from runtime.abi_enum
+import { abiBoxI64, abiBoxBool, abiBoxChar, abiUnboxI64 } from runtime.abi_box
+import { abiStrFromBytes } from runtime.abi_string
+import { tupleNew } from runtime.abi_tuple
+import { HEADER, ENUM_TAG_OFF, ENUM_FIELDS_OFF } from runtime.layout
+
+/// Word index of the variant tag.
+const TAG_WORD: int = ENUM_TAG_OFF / 8
+/// Word index of payload field 0.
+const FIELDS_WORD: int = ENUM_FIELDS_OFF / 8
+
+/// One raw byte in its own word; `abiStrFromBytes` reads through its pointer.
+fn byteAt(b: int) -> *int {
+    unsafe {
+        var p = alloc(int, 1)
+        p[0] = b
+        return p
+    }
+}
+
+/// A float box built by hand: the float half of the box ABI is not ported, so the raw
+/// payload has to be written directly. Class 4 is `PICKLE_CLASS_BOX_FLOAT`.
+fn floatBox(bits: int) -> *int {
+    unsafe {
+        var p = alloc(int, 4)
+        p[0] = 0
+        p[1] = 4
+        p[2] = 32
+        p[3] = bits
+        return p
+    }
+}
+
+/// Print the shape of an enum: class id, byte size, derived field count, tag.
+fn show(label: string, e: *int) {
+    unsafe {
+        println("  {label}: class={e[1]} size={e[2]} fields={enumFieldCount(e)} tag={abiEnumTag(e)}")
+    }
+}
+
+fn main() {
+    println("== construction ==")
+    show("empty 0/0", enumNew(0, 0))
+    show("unit 5/0", enumNew(5, 0))
+    show("one 7/1", enumNew(7, 1))
+    show("three -2/3", enumNew(-2, 3))
+
+    println("== header words ==")
+    var h = enumNew(11, 2)
+    unsafe {
+        var tagWord = h[TAG_WORD]
+        var field0 = h[FIELDS_WORD]
+        var field1 = h[FIELDS_WORD + 1]
+        println("  next={h[0]} class={h[1]} size={h[2]} tagWord={tagWord} field0={field0} field1={field1}")
+    }
+    println("  HEADER={HEADER} ENUM_TAG_OFF={ENUM_TAG_OFF} ENUM_FIELDS_OFF={ENUM_FIELDS_OFF}")
+
+    println("== field access ==")
+    var f = enumNew(3, 3)
+    abiEnumSetField(f, 0, abiBoxI64(10))
+    abiEnumSetField(f, 1, abiBoxI64(20))
+    abiEnumSetField(f, 2, abiBoxI64(30))
+    println("  tag={abiEnumTag(f)} count={enumFieldCount(f)}")
+    var i = 0
+    while (i < 3) {
+        println("  field[{i}]={abiUnboxI64(abiEnumField(f, i))}")
+        i = i + 1
+    }
+    println("  out of range high={(abiEnumField(f, 3) as int)}")
+    println("  out of range far={(abiEnumField(f, 1000) as int)}")
+
+    println("== out of range writes are ignored ==")
+    var g = enumNew(1, 2)
+    abiEnumSetField(g, 0, abiBoxI64(5))
+    abiEnumSetField(g, 5, abiBoxI64(555))
+    println("  field0={abiUnboxI64(abiEnumField(g, 0))} field1={(abiEnumField(g, 1) as int)} tag={abiEnumTag(g)}")
+
+    println("== equality: identity and shape ==")
+    var e2 = enumNew(1, 2)
+    var nul = 0 as *int
+    println("  same pointer={abiEnumEq(e2, e2)}")
+    println("  null-null={abiEnumEq(nul, nul)} obj-null={abiEnumEq(e2, nul)}")
+
+    println("== equality: tagged payloads ==")
+    var t1 = enumNew(0, 3)
+    var t2 = enumNew(0, 3)
+    abiEnumSetField(t1, 0, abiBoxI64(42))
+    abiEnumSetField(t2, 0, abiBoxI64(42))
+    abiEnumSetField(t1, 1, abiBoxBool(true))
+    abiEnumSetField(t2, 1, abiBoxBool(true))
+    abiEnumSetField(t1, 2, abiBoxChar(90))
+    abiEnumSetField(t2, 2, abiBoxChar(90))
+    println("  equal={abiEnumEq(t1, t2)}")
+    abiEnumSetField(t2, 0, abiBoxI64(43))
+    println("  after int change={abiEnumEq(t1, t2)}")
+    var t3 = enumNew(1, 3)
+    abiEnumSetField(t3, 0, abiBoxI64(42))
+    abiEnumSetField(t3, 1, abiBoxBool(true))
+    abiEnumSetField(t3, 2, abiBoxChar(90))
+    println("  after tag change={abiEnumEq(t1, t3)}")
+
+    println("== equality: int and bool are different classes ==")
+    var c1 = enumNew(0, 1)
+    var c2 = enumNew(0, 1)
+    abiEnumSetField(c1, 0, abiBoxI64(1))
+    abiEnumSetField(c2, 0, abiBoxBool(true))
+    println("  equal={abiEnumEq(c1, c2)}")
+
+    println("== equality: strings compare by content ==")
+    var s1 = enumNew(0, 1)
+    var s2 = enumNew(0, 1)
+    var s3 = enumNew(0, 1)
+    abiEnumSetField(s1, 0, abiStrFromBytes(byteAt(72), 1))
+    abiEnumSetField(s2, 0, abiStrFromBytes(byteAt(72), 1))
+    abiEnumSetField(s3, 0, abiStrFromBytes(byteAt(73), 1))
+    println("  same content={abiEnumEq(s1, s2)} other content={abiEnumEq(s1, s3)}")
+
+    println("== equality: nested enums recurse ==")
+    var outer1 = enumNew(9, 1)
+    var outer2 = enumNew(9, 1)
+    var inner1 = enumNew(4, 1)
+    var inner2 = enumNew(4, 1)
+    var inner3 = enumNew(5, 1)
+    abiEnumSetField(inner1, 0, abiBoxI64(3))
+    abiEnumSetField(inner2, 0, abiBoxI64(3))
+    abiEnumSetField(inner3, 0, abiBoxI64(3))
+    abiEnumSetField(outer1, 0, inner1)
+    abiEnumSetField(outer2, 0, inner2)
+    println("  equal={abiEnumEq(outer1, outer2)}")
+    abiEnumSetField(outer2, 0, inner3)
+    println("  inner tag differs={abiEnumEq(outer1, outer2)}")
+
+    println("== equality: float payloads compare by value ==")
+    var z1 = enumNew(0, 1)
+    var z2 = enumNew(0, 1)
+    abiEnumSetField(z1, 0, floatBox(0x3FF0000000000000))
+    abiEnumSetField(z2, 0, floatBox(0x3FF0000000000000))
+    println("  one=one={abiEnumEq(z1, z2)}")
+    abiEnumSetField(z2, 0, floatBox(0x4000000000000000))
+    println("  one=two={abiEnumEq(z1, z2)}")
+    abiEnumSetField(z1, 0, floatBox(0x0000000000000000))
+    abiEnumSetField(z2, 0, floatBox(0 - 0x7FFFFFFFFFFFFFFF - 1))
+    println("  +0=-0={abiEnumEq(z1, z2)}")
+    abiEnumSetField(z1, 0, floatBox(0x7FF8000000000000))
+    abiEnumSetField(z2, 0, floatBox(0x7FF8000000000000))
+    println("  nan=nan={abiEnumEq(z1, z2)}")
+    abiEnumSetField(z1, 0, floatBox(0x7FF0000000000000))
+    abiEnumSetField(z2, 0, floatBox(0x7FF0000000000000))
+    println("  inf=inf={abiEnumEq(z1, z2)}")
+    abiEnumSetField(z2, 0, floatBox(0 - 0x7FF0000000000000 - 1))
+    println("  inf=-inf={abiEnumEq(z1, z2)}")
+
+    println("== equality: other payload kinds are pointer identity ==")
+    var p1 = enumNew(0, 1)
+    var p2 = enumNew(0, 1)
+    var shared = tupleNew(1)
+    abiEnumSetField(p1, 0, shared)
+    abiEnumSetField(p2, 0, shared)
+    println("  shared={abiEnumEq(p1, p2)}")
+    abiEnumSetField(p2, 0, tupleNew(1))
+    println("  distinct tuples={abiEnumEq(p1, p2)}")
+
+    println("== equality: non-enum operands ==")
+    var str1 = abiStrFromBytes(byteAt(65), 1)
+    var plain = enumNew(0, 0)
+    println("  enum-vs-string={abiEnumEq(plain, str1)} string-vs-enum={abiEnumEq(str1, plain)}")
+
+    println("== deep chain, 12 links ==")
+    var head1 = enumNew(1, 1)
+    var head2 = enumNew(1, 1)
+    var a1 = head1
+    var a2 = head2
+    var i = 0
+    while (i < 12) {
+        var n1 = enumNew(2, 1)
+        var n2 = enumNew(2, 1)
+        abiEnumSetField(n1, 0, abiBoxI64(i))
+        abiEnumSetField(n2, 0, abiBoxI64(i))
+        abiEnumSetField(a1, 0, n1)
+        abiEnumSetField(a2, 0, n2)
+        a1 = n1
+        a2 = n2
+        i = i + 1
+    }
+    println("  equal={abiEnumEq(head1, head2)}")
+    var node = head1
+    i = 0
+    while (i < 6) {
+        node = abiEnumField(node, 0)
+        i = i + 1
+    }
+    abiEnumSetField(node, 0, abiBoxI64(999))
+    println("  after mid-chain break={abiEnumEq(head1, head2)}")
+
+    println("== f64 value equality, directly ==")
+    println("  1=1 {f64ValueEq(0x3FF0000000000000, 0x3FF0000000000000)}")
+    println("  1=2 {f64ValueEq(0x3FF0000000000000, 0x4000000000000000)}")
+    println("  1=-1 {f64ValueEq(0x3FF0000000000000, 0 - 0x4010000000000000)}")
+    println("  +0=-0 {f64ValueEq(0x0000000000000000, 0 - 0x7FFFFFFFFFFFFFFF - 1)}")
+    println("  inf=inf {f64ValueEq(0x7FF0000000000000, 0x7FF0000000000000)}")
+    println("  inf=-inf {f64ValueEq(0x7FF0000000000000, 0 - 0x7FF0000000000000 - 1)}")
+    println("  nan=nan {f64ValueEq(0x7FF8000000000000, 0x7FF8000000000000)}")
+    println("  nan!=nan {f64ValueEq(0x7FF8000000000000, 0x7FF8000000000001)}")
+    println("  nan=1 {f64ValueEq(0x7FF8000000000000, 0x3FF0000000000000)}")
+}

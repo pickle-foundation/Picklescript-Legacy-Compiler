@@ -1,0 +1,145 @@
+module abi_console_main
+
+// Exercises the scalar console ABI bodies in `runtime.abi_console`:
+// `pickle_print_i64`, `pickle_print_u64`, `pickle_print_bool`, `pickle_print_byte`
+// and `pickle_print_char`.
+//
+// Companion to `abi_string_main.pkl` (the string bodies these call) and
+// `print_obj_main.pkl` (the `pickle_print_obj` dispatcher in the same file).
+// Every symbol here has a `#[no_mangle]` twin in `combined.lib`, so the AOT link
+// precedence matters: if the archive copy won, this output would differ.
+//
+// These five are all reachable from ordinary source through `print`, so they were
+// already in the AOT parity set implicitly. This main names them directly and
+// pins the edge cases a plausible port gets wrong:
+//
+//   * `print_i64` on `i64::MIN`. `int64_to_string` takes the magnitude UNSIGNED
+//     rather than negating, because `-i64::MIN` overflows. A port that computes
+//     `0 - v` and divides gets a negative digit count.
+//   * `print_u64` is `int64_to_string(v as i64)`, NOT an unsigned formatter, so
+//     it is deliberately the same body as `print_i64`.
+//   * `print_byte` truncates with `v as u8` and writes the byte RAW. Byte 0xC3
+//     must appear verbatim even though it is not valid UTF-8 on its own, and
+//     byte 300 must become 44 (','). This is what keeps multi-byte text intact
+//     when a `byte` is printed mid-copy.
+//   * `print_char` applies Rust's replacement rule: `char::from_u32(v).unwrap_or
+//     ('\u{FFFD}')`, so surrogates, values above U+10FFFF and negatives all print
+//     as the three bytes EF BF BD rather than being rejected.
+//
+// Printing through `print(...)` rather than calling the ported bodies directly,
+// because that is the path the emitter actually takes - and `print(byte)` /
+// `print(char)` / `print(int)` / `print(bool)` lower to exactly these four
+// symbols. That is also why no body here may use `print` of its own static type:
+// it would re-enter the symbol it is defining.
+
+fn showI64(v: int) {
+    print(v)
+    println("")
+}
+
+fn showByte(v: int) {
+    print(v as byte)
+    println("")
+}
+
+fn showChar(v: int) {
+    print(v as char)
+    println("")
+}
+
+fn main() {
+    println("== print_i64 ==")
+    showI64(0)
+    showI64(1)
+    showI64(-1)
+    showI64(9223372036854775807)
+    showI64(0 - 9223372036854775807)
+    // i64::MIN has no literal spelling; the parser range-checks the magnitude
+    // before applying the sign.
+    showI64(0 - 9223372036854775807 - 1)
+    showI64(1234567890123456789)
+    showI64(0 - 1234567890123456789)
+
+    println("== print_i64 digit edges ==")
+    var v = 9
+    var i = 0
+    while (i < 20) {
+        showI64(v)
+        v = v * 10
+        i = i + 1
+    }
+    // A literal above i64::MAX cannot be written at all, so the wide-magnitude
+    // case is reached by multiplication instead.
+    showI64(0 - 999999999999999999)
+    showI64(1000000000000000000)
+
+    println("== print_bool ==")
+    print(true)
+    println("")
+    print(false)
+    println("")
+
+    println("== print_byte truncates to u8 and writes raw ==")
+    showByte(0)
+    showByte(65)
+    showByte(255)
+    // 300 & 255 == 44, the comma.
+    showByte(300)
+    showByte(0 - 1)
+    showByte(511)
+    // 0xC3 alone is not valid UTF-8, but it is exactly the leading byte of a
+    // two-byte sequence and must survive verbatim.
+    showByte(195)
+    showByte(169)
+    showByte(10)
+
+    println("== print_char lowers to UTF-8 ==")
+    showChar(65)
+    showChar(0)
+    showChar(127)
+    showChar(128)
+    showChar(0xe9)
+    showChar(0x20ac)
+    showChar(0x1F600)
+    // Above U+10FFFF -> U+FFFD.
+    showChar(1114112)
+    // Surrogate D800 -> U+FFFD.
+    showChar(55296)
+    showChar(57343)
+    // Negative, via the i32 char ABI -> U+FFFD.
+    showChar(0 - 1)
+    showChar(0 - 65)
+
+    println("== print and println compose ==")
+    print(1)
+    print(2)
+    print(3)
+    println("")
+    println("")
+
+    println("== values inside containers route through print_obj ==")
+    // Not the scalar printers, but the box/tuple arms of the dispatcher that now
+    // shares this module - one regression guard for the BYTES_WORD rename.
+    var xs: List<int> = [1, 2, 3]
+    print(xs)
+    println("")
+    // Explicit instantiation syntax (`show[int](…)`) is not a source form here;
+    // a typed local drives the same inference instead.
+    var boxedInt: int = -42
+    var boxedMax: int = 9223372036854775807
+    var boxedBool: bool = true
+    var boxedChar: char = 'q'
+    var boxedWide: char = (0x1F600) as char
+    show(boxedInt)
+    show(boxedMax)
+    show(boxedBool)
+    show(boxedChar)
+    show(boxedWide)
+}
+
+/// A generic parameter has no static rep, so the argument is boxed; that is the
+/// only way to reach the BOX_* arms of `print_obj` from source.
+fn show<T>(x: T) {
+    print(x)
+    println("")
+}

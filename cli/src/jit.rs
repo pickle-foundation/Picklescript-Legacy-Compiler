@@ -1557,6 +1557,51 @@ impl JitProgram {
     }
 }
 
+/// Address of a Win32 import, for a relocation naming `__imp_<Func>`.
+///
+/// The AOT linker resolves these from the PE import table it synthesises
+/// (`pelink::buildExe`), so on that path `__imp_` never reaches relocation
+/// resolution at all. The JIT has no PE import table -- it patches addresses
+/// into a raw mapping -- so it has to look the symbol up itself. The compiler
+/// picks the DLL the same way `pelink::isShellImp` does: `CommandLineToArgvW`
+/// lives in SHELL32, everything else in KERNEL32.
+#[cfg(windows)]
+fn win_import_addr(sym: &str) -> Option<usize> {
+    use std::ffi::c_void;
+
+    const IMPORT_PREFIX: &str = "__imp_";
+    let func = sym.strip_prefix(IMPORT_PREFIX)?;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+    let dll: Vec<u16> = if func == "CommandLineToArgvW" {
+        "SHELL32.dll\0".encode_utf16().collect()
+    } else {
+        "KERNEL32.dll\0".encode_utf16().collect()
+    };
+    let mut ansi: Vec<u8> = func.as_bytes().to_vec();
+    ansi.push(0);
+    unsafe {
+        let handle = GetModuleHandleW(dll.as_ptr());
+        if handle.is_null() {
+            return None;
+        }
+        let addr = GetProcAddress(handle, ansi.as_ptr());
+        if addr.is_null() {
+            None
+        } else {
+            Some(addr as usize)
+        }
+    }
+}
+#[cfg(not(windows))]
+fn win_import_addr(sym: &str) -> Option<usize> {
+    let _ = sym;
+    None
+}
+
 impl Jit {
     /// Compile the whole module, lay out all code plus string data into one
     /// executable mapping, and patch every relocation.
@@ -1669,6 +1714,8 @@ impl Jit {
                             format!("relocation to unsupported name {:?}", name)
                         })?;
                         if let Some(&a) = symbols.get(&sym) {
+                            a
+                        } else if let Some(a) = win_import_addr(&sym) {
                             a
                         } else if let Some(a) = runtime_addr(&sym) {
                             a

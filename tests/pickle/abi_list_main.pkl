@@ -1,0 +1,113 @@
+module abi_list_main
+
+// Exercises the sovereign list ABI bodies in `runtime.abi_list`.
+//
+// Companion to `abi_box_main.pkl`. This main is what proves the ten ported list
+// symbols survive the whole path and are the ones actually executed:
+// source -> ported front end -> ported emitter -> ported COFF -> ported PE linker
+// against the nostd archive -> executed, with stdout byte-identical to the Rust JIT.
+//
+// The link-order point matters more here than for any earlier tranche. `pickle_list_get`
+// alone is referenced by 145 program shapes, and the Rust runtime exports its own
+// `pickle_list_new`/`get`/`push`/... with identical names. If the archive ever won, these
+// outputs would still be correct and the gate would silently pass while the port proved
+// nothing. So the assertions below deliberately probe behavior that only the ported body
+// has: the `data` pointer living in header word 5, and growth that reallocates a span
+// and republishes that word.
+
+import { listNew, abiListLen, abiListGet, abiListPush, abiListPop, abiListRemove, abiListInsert, abiListSort, abiRange } from runtime.abi_list
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+
+/// Read element `i` back through the exported `pickle_list_get` ABI entry point.
+fn at(l: *int, i: int) -> int {
+    return abiUnboxI64(abiListGet(l, i))
+}
+
+fn main() {
+    // Header layout. The ported body writes all six words itself because `alloc`
+    // memory is untracked, so a wrong class_id or size shows up here.
+    var l = listNew(0)
+    unsafe {
+        println("class: {l[1]}")
+        println("size: {l[2]}")
+        println("len: {l[3]}")
+        println("cap: {l[4]}")
+    }
+
+    // Push across the 8 -> 16 -> 32 growth boundary, which reallocates the span twice
+    // and republishes word 5 each time. A body that cached the old pointer, or forgot
+    // to copy, prints garbage here.
+    var i = 0
+    while (i < 20) {
+        abiListPush(l, abiBoxI64(i * 3))
+        i = i + 1
+    }
+    println("grown len: {abiListLen(l)}")
+    var sum = 0
+    var k = 0
+    while (k < 20) {
+        sum = sum + at(l, k)
+        k = k + 1
+    }
+    println("grown sum: {sum}")
+    unsafe {
+        println("grown cap: {l[4]}")
+    }
+
+    // Null returns: word 0, the same as the native `core::ptr::null_mut()`.
+    println("get oob: {abiListGet(l, 20) as int}")
+    println("get far oob: {abiListGet(l, 9999) as int}")
+
+    // Pop returns the tail and shrinks.
+    println("pop last: {abiUnboxI64(abiListPop(l))}")
+    println("after pop len: {abiListLen(l)}")
+
+    // Remove shifts the tail left, insert shifts it right.
+    var r = listNew(0)
+    abiListPush(r, abiBoxI64(10))
+    abiListPush(r, abiBoxI64(30))
+    abiListInsert(r, 1, abiBoxI64(20))
+    println("inserted len: {abiListLen(r)}")
+    println("inserted[1]: {at(r, 1)}")
+    println("removed: {abiUnboxI64(abiListRemove(r, 0))}")
+    println("after remove len: {abiListLen(r)}")
+    println("after remove[0]: {at(r, 0)}")
+
+    // Insertion sort with duplicate keys, to pin stability the way the native body does.
+    var s = listNew(0)
+    abiListPush(s, abiBoxI64(5))
+    abiListPush(s, abiBoxI64(-3))
+    abiListPush(s, abiBoxI64(5))
+    abiListPush(s, abiBoxI64(0))
+    abiListSort(s, 0)
+    var sorted = ""
+    var m = 0
+    while (m < 4) {
+        sorted = sorted + "{at(s, m)} "
+        m = m + 1
+    }
+    println("sorted: {sorted}")
+
+    // range: ascending, step > 1, negative step, zero step.
+    var up = abiRange(0, 5, 1)
+    var step3 = abiRange(2, 11, 3)
+    var down = abiRange(5, 0, -2)
+    var zeroStep = abiRange(0, 10, 0)
+    println("range 0..5: {abiListLen(up)} {at(up, 4)}")
+    println("range 2..11/3: {abiListLen(step3)} {at(step3, 2)}")
+    println("range 5..0/-2: {abiListLen(down)} {at(down, 2)}")
+    println("range step 0: {abiListLen(zeroStep)}")
+
+    // The path a real program takes: language-level list operations, which the
+    // compiler lowers onto these very ABI symbols.
+    var xs = [5, 3, 9, 1]
+    xs.push(7)
+    var total = 0
+    var n = 0
+    while (n < len(xs)) {
+        total = total + xs[n]
+        n = n + 1
+    }
+    println("builtin list len: {len(xs)}")
+    println("builtin list sum: {total}")
+}

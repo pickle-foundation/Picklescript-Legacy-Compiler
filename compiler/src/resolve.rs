@@ -582,6 +582,147 @@ impl<'a> Resolver<'a> {
             mk("thread_current", vec![], Ty::Int, false),
             mk("sleep_ms", vec![any("ms")], Ty::Empty, false),
             mk("thread_yield", vec![], Ty::Empty, false),
+            // --- Win32 imports ---
+            //
+            // `win_thread_id` lowers to an `__imp_GetCurrentThreadId` extern.
+            // The linker already exempts every `__imp_*` symbol from the
+            // archive-resolution pass (`linklib::externReqs`) and mints a
+            // KERNEL32.dll import entry for it (`pelink::buildExe`), so this
+            // is the front-end half of a path the back end had all along: a
+            // Pickle runtime body can reach the OS without a Rust shim.
+            //
+            // `win_thread_id` is also the proof that TLS is reachable: see the
+            // `win_tls_*` group below.
+            mk("win_thread_id", vec![], Ty::Int, false),
+            // Win32 thread-local storage, reachable as ordinary imports, so a
+            // Pickle body can get a per-thread slot without
+            // `__declspec(thread)` and therefore without any new codegen. This
+            // is what `shadow::push_frame` needs: the reference keeps the
+            // current thread's `GcThread*` in a `thread_local!`.
+            //
+            // `Tls*` rather than `Fls*`: both hand out the same slots, but
+            // setting a value through `FlsSetValue` faults during teardown in
+            // this environment (reproduced with plain P/Invoke, no Pickle
+            // involved), while `TlsSetValue` exits cleanly.
+            mk("win_tls_alloc", vec![], Ty::Int, false),
+            mk("win_tls_get", vec![any("slot")], Ty::Int, false),
+            mk("win_tls_set", vec![any("slot"), any("value")], Ty::Int, false),
+            // Process termination as an import. This exists so a `#[symbol]`
+            // body can occupy the `pickle_exit` slot without the Rust
+            // implementation behind it: the reference both flushes and exits,
+            // and only the flush half needs the runtime. A body in a module the
+            // JIT never imports keeps the reference behaviour there.
+                mk("win_exit", vec![any("code")], Ty::Empty, false),
+                // The process heap as an import triple, so a `#[symbol]` body
+                // can occupy `pickle_raw_alloc` / `pickle_raw_free` without a
+                // Rust shim. `HeapAlloc(GetProcessHeap(), 0, n)` is what Rust's
+                // `System` allocator uses on Windows, which is what makes the
+                // two implementations' pointers interchangeable.
+                mk("win_get_process_heap", vec![], Ty::Int, false),
+                mk(
+                    "win_heap_alloc",
+                    vec![any("heap"), any("flags"), any("size")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_heap_free",
+                    vec![any("heap"), any("flags"), any("ptr")],
+                    Ty::Empty,
+                    false,
+                ),
+                // The filesystem entry points, so a `#[symbol]` body can own
+                // the whole `fs.rs` surface without a Rust shim. All twelve are
+                // KERNEL32, which is the DLL `win_import_addr` and
+                // `pelink::isShellImp` already fall back to for any `__imp_`
+                // that is not `CommandLineToArgvW`, so no link-side table needs
+                // to learn these names.
+                mk("win_get_file_attributes_w", vec![any("path")], Ty::Int, false),
+                mk("win_delete_file_w", vec![any("path")], Ty::Int, false),
+                mk("win_remove_directory_w", vec![any("path")], Ty::Int, false),
+                mk(
+                    "win_create_directory_w",
+                    vec![any("path"), any("sec")],
+                    Ty::Int,
+                    false,
+                ),
+                // `(0, NULL)` is the sizing call: it returns the UTF-16 units a
+                // real call would need, counting the terminator.
+                mk(
+                    "win_get_current_directory_w",
+                    vec![any("cap"), any("buf")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_create_file_w",
+                    vec![
+                        any("name"),
+                        any("access"),
+                        any("share"),
+                        any("sec"),
+                        any("disp"),
+                        any("flags"),
+                        any("tmpl"),
+                    ],
+                    Ty::Int,
+                    false,
+                ),
+                // `ReadFile`/`WriteFile` report the transferred byte count
+                // through an out-parameter, so the caller supplies a one-word
+                // buffer and `ov` is always null.
+                mk(
+                    "win_read_file",
+                    vec![any("handle"), any("buf"), any("n"), any("pRead"), any("ov")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_write_file",
+                    vec![
+                        any("handle"),
+                        any("buf"),
+                        any("n"),
+                        any("pWritten"),
+                        any("ov"),
+                    ],
+                    Ty::Int,
+                    false,
+                ),
+                mk("win_close_handle", vec![any("handle")], Ty::Int, false),
+                mk(
+                    "win_find_first_file_w",
+                    vec![any("pattern"), any("data")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_find_next_file_w",
+                    vec![any("handle"), any("data")],
+                    Ty::Int,
+                    false,
+                ),
+                mk("win_find_close", vec![any("handle")], Ty::Int, false),
+                // The console handles Rust's `nostd::console_write` /
+                // `console_error_write` write to. `STD_OUTPUT_HANDLE` is
+                // `(DWORD)-11` and `STD_ERROR_HANDLE` is `(DWORD)-12`; both fit
+                // in an `int` and both are KERNEL32, so the FS block's note
+                // about `win_import_addr` applies here too.
+                mk("win_get_std_handle", vec![any("which")], Ty::Int, false),
+                // The command line, so a `#[symbol]` body can own the
+                // `pickle_args` slot without a Rust shim: `GetCommandLineW`
+                // (KERNEL32) hands back the process's own UTF-16 line, and
+                // `CommandLineToArgvW` - the one name `pelink::isShellImp`
+                // routes to SHELL32 - splits it into a null-terminated
+                // `LPWSTR*` that `LocalFree` (KERNEL32) releases.
+                mk("win_get_command_line_w", vec![], Ty::Int, false),
+                mk(
+                    "win_command_line_to_argv_w",
+                    vec![any("cmdline"), any("pargs")],
+                    Ty::Int,
+                    false,
+                ),
+                mk("win_local_free", vec![any("mem")], Ty::Empty, false),
             // --- Garbage collection ---
             //
             // The delegation point from Pickle into the live collector. Named

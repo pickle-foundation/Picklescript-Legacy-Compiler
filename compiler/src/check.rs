@@ -5580,6 +5580,13 @@ if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
                 self.implements_interface(b, a)
             }
             (Ty::Enum(a, _), Ty::Enum(b, _)) => a == b,
+                  // A raw pointer and `int` are both single 64-bit words in the IR
+                  // domain, and every container ABI body needs to move an object
+                  // address between a `*T` value and a word slot (`list[5] = data`).
+                  // Without this the port cannot express a single list/map/object
+                  // runtime symbol; see PICKLE_AUDIT.md 17.1. Identity lowering in
+                  // `convert`, so no trap representation is invented.
+                  (Ty::Ptr(_), Ty::Int) | (Ty::Int, Ty::Ptr(_)) => true,
             (Ty::List(a), Ty::List(b)) | (Ty::Range(a), Ty::Range(b)) => self.cast_related(a, b),
             (Ty::Map(ka, va), Ty::Map(kb, vb)) => {
                 self.cast_related(ka, kb) && self.cast_related(va, vb)

@@ -1,0 +1,165 @@
+module abi_expect_main
+
+// Exercises the ported `expect` ABI bodies in `runtime.abi_expect`:
+// `pickle_expect_obj_eq` (structural equality) and
+// `pickle_expect_str_contains` (substring search).
+//
+// Companion to `abi_box_main.pkl` / `abi_list_main.pkl` / `abi_map_main.pkl` /
+// `abi_enum_main.pkl` / `abi_string_main.pkl`: prove the bodies survive
+// source -> ported front end -> ported emitter -> ported COFF -> ported PE
+// linker -> executed, byte-identical to the Rust JIT, and are actually LINKED
+// rather than served by the Rust runtime's identically-named entries.
+//
+// These two are special in one respect the others are not: the Rust originals
+// carry NO `#[no_mangle]`. They reach a caller through the JIT's hand-written
+// symbol table in `runtime/src/lib.rs`, so they are not in `combined.lib` as
+// exports at all and there is no archive copy to collide with. That removes the
+// precedence question the other tranches had to prove with a sentinel, and it
+// is worth stating rather than leaving as a lucky accident: if these bodies ever
+// stop being called, the AOT build would still succeed, because the link has
+// nothing to resolve.
+//
+// The assertions target what a faithful port can get wrong here:
+//
+//   * `obj_eq` must treat null as a value: `none == none`, but never `none == x`.
+//   * Box flavours pair with THEMSELVES. `(BOX_INT, BOX_CHAR)` is unequal even
+//     with identical payload bits; that arm is four or-patterns in the
+//     reference and collapses to "both are boxes" very easily.
+//   * `obj_eq` recurses into nested lists, so the body calls its own name. That
+//     must resolve to the local function and not become a self-extern.
+//   * `str_contains` is positional: "ab" is in "abc", "ba" is not.
+//   * The empty needle is contained in everything, including an empty haystack,
+//     because the reference returns before searching.
+//   * Both search raw bytes, so a lone 0xC3 matches inside multi-byte UTF-8.
+//
+// Printing a string goes through `pickle_print_obj`, which itself calls
+// `pickle_str_len` and `pickle_str_get`, so every literal printed here also
+// exercises the ported string bodies.
+import { abiExpectObjEq, abiExpectStrContains } from runtime.abi_expect
+import { abiStrFromByte, abiStrConcat, abiStrFromList } from runtime.abi_string
+import { abiListNew, abiListPush } from runtime.abi_list
+import { abiBoxI64, abiBoxBool, abiBoxChar } from runtime.abi_box
+
+fn b1(a: int) -> *int {
+    return abiStrFromByte(a)
+}
+
+fn b2(a: int, c: int) -> *int {
+    return abiStrConcat(abiStrFromByte(a), abiStrFromByte(c))
+}
+
+fn b3(a: int, c: int, d: int) -> *int {
+    return abiStrConcat(b2(a, c), abiStrFromByte(d))
+}
+
+fn b0() -> *int {
+    return abiStrFromList(abiListNew(0))
+}
+
+fn list2(x: *int, y: *int) -> *int {
+    let l = abiListNew(2)
+    abiListPush(l, x)
+    abiListPush(l, y)
+    return l
+}
+
+fn main() {
+    println("== obj_eq: null is a value ==")
+    println("  null == null -> {abiExpectObjEq(0 as *int, 0 as *int)}")
+    println("  null == str  -> {abiExpectObjEq(0 as *int, b1(97))}")
+    println("  str == null  -> {abiExpectObjEq(b1(97), 0 as *int)}")
+
+    println("== obj_eq: identity ==")
+    let s = b3(97, 98, 99)
+    println("  self == self  -> {abiExpectObjEq(s, s)}")
+    let t = b3(97, 98, 99)
+    println("  equal contents, distinct objects -> {abiExpectObjEq(s, t)}")
+    println("  same address? {(s as int) == (t as int)}")
+
+    println("== obj_eq: strings by content ==")
+    println("  abc == abc -> {abiExpectObjEq(b3(97, 98, 99), b3(97, 98, 99))}")
+    let abc = b3(97, 98, 99)
+    let abcd = abiStrConcat(abc, b1(100))
+    println("  abc vs abcd -> {abiExpectObjEq(abc, abcd)}")
+    let abz = b3(97, 98, 122)
+    println("  abc vs abz  -> {abiExpectObjEq(abc, abz)}")
+    println("  empty == empty -> {abiExpectObjEq(b0(), b0())}")
+
+    println("== obj_eq: lists element-wise ==")
+    let l1 = list2(b1(97), b1(98))
+    let l2 = list2(b1(97), b1(98))
+    let l3 = list2(b1(97), b1(99))
+    println("  [a b] == [a b] -> {abiExpectObjEq(l1, l2)}")
+    println("  [a b] == [a c] -> {abiExpectObjEq(l1, l3)}")
+    let l4 = list2(b1(97), b1(98))
+    abiListPush(l4, b1(99))
+    println("  len 2 vs len 3 -> {abiExpectObjEq(l1, l4)}")
+
+    println("== obj_eq: recurses through nested lists ==")
+    let n1 = list2(list2(b1(97), b1(98)), b1(90))
+    let n2 = list2(list2(b1(97), b1(98)), b1(90))
+    let n3 = list2(list2(b1(97), b1(99)), b1(90))
+    println("  nested equal      -> {abiExpectObjEq(n1, n2)}")
+    println("  nested differs at depth 2 -> {abiExpectObjEq(n1, n3)}")
+    let deep = list2(list2(list2(b1(97), b1(98)), b1(90)), b1(33))
+    let deep2 = list2(list2(list2(b1(97), b1(98)), b1(90)), b1(33))
+    println("  three levels equal -> {abiExpectObjEq(deep, deep2)}")
+
+    println("== obj_eq: empty lists ==")
+    let e1 = abiListNew(0)
+    let e2 = abiListNew(0)
+    println("  [] == [] -> {abiExpectObjEq(e1, e2)}")
+    abiListPush(e2, b1(97))
+    println("  [] vs [a] -> {abiExpectObjEq(e1, e2)}")
+
+    println("== obj_eq: boxes by payload bits ==")
+    println("  i64 7 == i64 7 -> {abiExpectObjEq(abiBoxI64(7), abiBoxI64(7))}")
+    println("  i64 7 == i64 8 -> {abiExpectObjEq(abiBoxI64(7), abiBoxI64(8))}")
+    println("  bool true == true -> {abiExpectObjEq(abiBoxBool(true), abiBoxBool(true))}")
+    println("  bool true == false -> {abiExpectObjEq(abiBoxBool(true), abiBoxBool(false))}")
+    println("  char x == x -> {abiExpectObjEq(abiBoxChar(120), abiBoxChar(120))}")
+    println("  char x == y -> {abiExpectObjEq(abiBoxChar(120), abiBoxChar(121))}")
+
+    println("== obj_eq: box flavours pair with themselves ==")
+    // Same payload bits, different class ids. The reference's or-patterns pair
+    // each flavour with itself, so these are unequal.
+    println("  i64(120) vs char(120) -> {abiExpectObjEq(abiBoxI64(120), abiBoxChar(120))}")
+    println("  char(120) vs i64(120) -> {abiExpectObjEq(abiBoxChar(120), abiBoxI64(120))}")
+
+    println("== obj_eq: mismatched kinds ==")
+    println("  string vs i64box -> {abiExpectObjEq(b1(97), abiBoxI64(97))}")
+    println("  string vs list   -> {abiExpectObjEq(b1(97), list2(b1(97), b1(98)))}")
+    println("  list vs string   -> {abiExpectObjEq(list2(b1(97), b1(98)), b1(97))}")
+
+    println("== str_contains: substring ==")
+    let hello = b3(104, 101, 108)
+    let hell4 = abiStrConcat(hello, b1(108))
+    println("  'ell' in 'hell' -> {abiExpectStrContains(hell4, b3(101, 108, 108))}")
+    println("  'e' in 'hell'   -> {abiExpectStrContains(hell4, b1(101))}")
+    println("  'xyz' in 'hell' -> {abiExpectStrContains(hell4, b3(120, 121, 122))}")
+
+    println("== str_contains: positional ==")
+    let abc = b3(97, 98, 99)
+    println("  'ab' in 'abc' -> {abiExpectStrContains(abc, b2(97, 98))}")
+    println("  'bc' in 'abc' -> {abiExpectStrContains(abc, b2(98, 99))}")
+    println("  'ba' in 'abc' -> {abiExpectStrContains(abc, b2(98, 97))}")
+
+    println("  'bc' in 'abc' -> {abiExpectStrContains(abc, b2(98, 99))}")
+    println("== str_contains: length guard and empty needle ==")
+    println("  'ab' in 'a'  -> {abiExpectStrContains(b1(97), b2(97, 98))}")
+    println("  'abc' in 'a' -> {abiExpectStrContains(b1(97), b3(97, 98, 99))}")
+    println("  '' in 'abc'  -> {abiExpectStrContains(abc, b0())}")
+    println("  '' in ''     -> {abiExpectStrContains(b0(), b0())}")
+    println("  'a' in ''    -> {abiExpectStrContains(b0(), b1(97))}")
+    println("  whole string in itself -> {abiExpectStrContains(abc, abc)}")
+
+    println("== str_contains: raw bytes, not code points ==")
+    // C3 A9 is "e-acute". A lone 0xC3 must match at offset 0 of a 2-byte string.
+    let eacute = b2(195, 169)
+    println("  len={abiExpectStrContains(eacute, b1(195))} for lone C3")
+    println("  len={abiExpectStrContains(eacute, b2(195, 169))} for C3 A9")
+    println("  len={abiExpectStrContains(eacute, b1(169))} for lone A9")
+    let mixed = b3(195, 169, 122)
+    println("  C3 at offset 0 of C3 A9 7A -> {abiExpectStrContains(mixed, b1(195))}")
+    println("  A9 7A at offset 1         -> {abiExpectStrContains(mixed, b2(169, 122))}")
+}

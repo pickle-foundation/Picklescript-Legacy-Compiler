@@ -1,0 +1,168 @@
+module abi_class_main
+
+// Exercises the ported class-instance ABI bodies in `runtime.abi_class`:
+// `pickle_class_new`, `pickle_obj_slot_get`, `pickle_obj_slot_set`.
+//
+// Companion to `abi_box_main.pkl` / `abi_list_main.pkl` / `abi_map_main.pkl` /
+// `abi_enum_main.pkl` / `abi_string_main.pkl` / `abi_expect_main.pkl`.
+//
+// All three natives carry `#[no_mangle]` and live in `combined.lib`, so a
+// sentinel test is meaningful here (unlike the `expect` pair, which had no
+// archive copy to collide with).
+//
+// The assertions target the arithmetic trap this tranche has:
+//
+//   * The SIZE HEADER WORD is the CLAMPED size `align8(24 + 8n).max(32)`, not
+//     `24 + 8n`. For a zero-field class those differ (32 vs 24), and the
+//     difference is visible through `obj_slot_get` because the accessor derives
+//     its bound from the stored size.
+//   * `class_new` raises a class id below PICKLE_CLASS_USER_BASE, and clamps a
+//     negative slot count to zero.
+//   * `obj_slot_get`'s guard is `idx > slots` (strictly greater) and the bound
+//     comes from the stored size, not from a stored field count.
+//   * An out-of-range write is a silent no-op, and a null object is inert on
+//     both accessors.
+//
+// Printing a string goes through `pickle_print_obj`, which itself calls
+// `pickle_str_len` and `pickle_str_get`, so every literal printed here also
+// exercises the ported string bodies.
+//
+// The header word indices are IMPORTED from `runtime.abi_class` rather than
+// redeclared. Redeclaring them here compiles under `pickle-cli test` but fails
+// at emit, because a local top-level name that collides with any top-level name
+// in an imported module resolves to "undeclared" inside a `"{...}"`
+// interpolation. See MEMORIES.md, "interpolation cannot see a shadowing local".
+import { abiClassNew, abiObjSlotGet, abiObjSlotSet, abiSizeWords, slotCountFromSize, CLASS_ID_WORD, SIZE_WORD, SLOT_WORD } from runtime.abi_class
+import { PICKLE_CLASS_USER_BASE } from runtime.object
+import { abiBoxI64, abiBoxBool } from runtime.abi_box
+import { abiStrFromByte } from runtime.abi_string
+
+fn word(obj: *int, w: int) -> int {
+    unsafe {
+        return obj[w]
+    }
+}
+
+fn main() {
+    println("== the size word is clamped, not raw ==")
+    // 24 + 8n is the "logical" size; the stored size is what Gc::alloc settled
+    // on, and for n = 0 those differ.
+    var n = 0
+    while (n <= 4) {
+        println("  n={n} raw={HEADER + 8 * n} stored={abiSizeWords(n)} slots={slotCountFromSize(abiSizeWords(n))}")
+        n = n + 1
+    }
+
+    println("== class_new header ==")
+    let two = abiClassNew(10, 2)
+    println("  id={word(two, CLASS_ID_WORD)} size={word(two, SIZE_WORD)} word0={word(two, 0)}")
+    println("  eight-aligned: {abiSizeWords(3) % 8 == 0}")
+    println("  at least MIN_OBJECT: {abiSizeWords(0) == 32}")
+
+    println("== class_new clamps a low class id ==")
+    var probe = 0
+    while (probe <= 11) {
+        println("  ask={probe} -> {word(abiClassNew(probe, 1), CLASS_ID_WORD)}")
+        probe = probe + 1
+    }
+    println("  ask=300 -> {word(abiClassNew(300, 1), CLASS_ID_WORD)}")
+    println("  user base={PICKLE_CLASS_USER_BASE}")
+
+    println("== class_new clamps a negative slot count ==")
+    let neg = abiClassNew(10, 0 - 1)
+    println("  size={word(neg, SIZE_WORD)} id={word(neg, CLASS_ID_WORD)}")
+
+    println("== fields are zeroed, not left as allocator garbage ==")
+    let four = abiClassNew(10, 4)
+    var i = 0
+    while (i < 4) {
+        println("  slot{i}={word(four, SLOT_WORD + i)}")
+        i = i + 1
+    }
+
+    println("== slot set / get round-trip ==")
+    let obj = abiClassNew(10, 3)
+    let v7 = abiBoxI64(7)
+    let vs = abiStrFromByte(65)
+    abiObjSlotSet(obj, 0, v7)
+    abiObjSlotSet(obj, 2, vs)
+    println("  slot0 same address: {(abiObjSlotGet(obj, 0) as int) == (v7 as int)}")
+    println("  slot1 null: {(abiObjSlotGet(obj, 1) as int) == 0}")
+    println("  slot2 same address: {(abiObjSlotGet(obj, 2) as int) == (vs as int)}")
+    println("  slot2 points at a string of len {word(abiObjSlotGet(obj, 2), 3)}")
+
+    println("== the bound is derived from the stored size ==")
+    // 3 fields -> size 48 -> slots = (48-24-8)/8 = 2, guard is `idx > slots`.
+    println("  index 2 ok:  {(abiObjSlotGet(obj, 2) as int) == (vs as int)}")
+    println("  index 3 null: {(abiObjSlotGet(obj, 3) as int) == 0}")
+    println("  index 100 null: {(abiObjSlotGet(obj, 100) as int) == 0}")
+    println("  index -1 null: {(abiObjSlotGet(obj, 0 - 1) as int) == 0}")
+
+    println("== out-of-range writes are silent no-ops ==")
+    let guard = abiClassNew(10, 2)
+    abiObjSlotSet(guard, 99, v7)
+    abiObjSlotSet(guard, 0 - 1, v7)
+    println("  slot0 still null: {(abiObjSlotGet(guard, 0) as int) == 0}")
+
+    println("== a zero-field class still admits slot 0 ==")
+    // The clamp makes this object's stored size 32, so the guard admits index
+    // 0: word 3 is past the 24-byte logical extent but inside the 32-byte
+    // allocation. Reproduced, not corrected.
+    //
+    // Nothing is asserted about that word's *value*. The reference zeroes only
+    // `8 * field_count` bytes, so for field_count == 0 it is uninitialised
+    // allocator memory -- the Rust bump allocator and the ported heap return
+    // different garbage, and printing it would break JIT/AOT byte-parity for
+    // reasons unrelated to the ABI. Addressability is proven by write-then-read.
+    let zero = abiClassNew(10, 0)
+    println("  size={word(zero, SIZE_WORD)}")
+    println("  slots from that size={slotCountFromSize(word(zero, SIZE_WORD))}")
+    let vz = abiBoxI64(11)
+    abiObjSlotSet(zero, 0, vz)
+    println("  slot0 writable and readable: {(abiObjSlotGet(zero, 0) as int) == (vz as int)}")
+    println("  slot1 null: {(abiObjSlotGet(zero, 1) as int) == 0}")
+    abiObjSlotSet(zero, 1, vz)
+    println("  slot1 write still ignored: {(abiObjSlotGet(zero, 1) as int) == 0}")
+
+    println("== zero- and one-field classes are size-indistinguishable ==")
+    println("  size(0)={abiSizeWords(0)} size(1)={abiSizeWords(1)} same={abiSizeWords(0) == abiSizeWords(1)}")
+
+    println("== a null object is inert ==")
+    let nil = 0 as *int
+    abiObjSlotSet(nil, 0, v7)
+    println("  read from null: {(abiObjSlotGet(nil, 0) as int) == 0}")
+    println("  read index 5 from null: {(abiObjSlotGet(nil, 5) as int) == 0}")
+
+    println("== instances do not share slots ==")
+    let a = abiClassNew(10, 2)
+    let b = abiClassNew(10, 2)
+    let vb = abiBoxBool(true)
+    abiObjSlotSet(a, 0, vb)
+    println("  a holds it: {(abiObjSlotGet(a, 0) as int) == (vb as int)}")
+    println("  b does not: {(abiObjSlotGet(b, 0) as int) == 0}")
+    println("  distinct objects: {(a as int) != (b as int)}")
+
+    println("== overwriting a slot replaces the pointer ==")
+    // The `pickle_str_set` trap in a second location: a stored pointer must be
+    // replaced, not OR'd into.
+    let ow = abiClassNew(10, 1)
+    let vm1 = abiBoxI64(0 - 1)
+    let vp1 = abiBoxI64(1)
+    abiObjSlotSet(ow, 0, vm1)
+    abiObjSlotSet(ow, 0, vp1)
+    println("  now the second: {(abiObjSlotGet(ow, 0) as int) == (vp1 as int)}")
+    println("  not the first: {(abiObjSlotGet(ow, 0) as int) == (vm1 as int)}")
+
+    println("== storing null clears a slot ==")
+    let clr = abiClassNew(10, 1)
+    abiObjSlotSet(clr, 0, vb)
+    abiObjSlotSet(clr, 0, 0 as *int)
+    println("  cleared: {(abiObjSlotGet(clr, 0) as int) == 0}")
+
+    println("== a wide instance ==")
+    let wide = abiClassNew(10, 8)
+    println("  size={word(wide, SIZE_WORD)} slots={slotCountFromSize(word(wide, SIZE_WORD))}")
+    abiObjSlotSet(wide, 7, vb)
+    println("  slot7 set: {(abiObjSlotGet(wide, 7) as int) == (vb as int)}")
+    println("  slot8 null: {(abiObjSlotGet(wide, 8) as int) == 0}")
+}

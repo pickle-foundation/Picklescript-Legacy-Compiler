@@ -1,0 +1,175 @@
+module abi_map_main
+
+// Exercises the sovereign map ABI bodies in `runtime.abi_map`.
+//
+// Companion to `abi_box_main.pkl` / `abi_list_main.pkl` / `abi_tuple_main.pkl`: prove the
+// nine ported symbols survive source -> ported front end -> ported emitter -> ported COFF
+// -> ported PE linker -> executed, byte-identical to the Rust JIT, and are the bodies
+// actually linked rather than the Rust runtime's identically-named exports.
+//
+// The assertions target what only a faithful port can get right. The map object keeps its
+// header in words 0-5 (length, capacity, entries pointer) and its entries in a SEPARATE
+// `alloc`ed span reached through word 5. A body that indexed `map[ENTRIES_WORD + slot]`
+// instead of dereferencing the span would read past the 48-byte object into unrelated heap
+// and either print garbage or fault -- which is exactly the bug this main exists to pin.
+// Structural keys are the other half: `map_set`/`map_get` must agree on deep equality of
+// two distinct box/str/list objects, not pointer identity.
+
+import { abiMapNew, abiMapSet, abiMapGet, abiMapGetBoxed, abiMapHas, abiMapRemove, abiMapLen, abiMapKeys, abiMapValues } from runtime.abi_map
+import { abiBoxI64, abiUnboxI64, abiBoxBool, abiUnboxBool } from runtime.abi_box
+import { abiListLen, abiListGet } from runtime.abi_list
+import { newStr, byteInto, abiStrFromI64 } from runtime.abi_string
+
+fn isNull(p: *int) -> bool {
+    return (p as int) == 0
+}
+
+/// A five-byte string built one byte at a time, so the table stores a pointer to a real
+/// string object rather than reusing one global constant.
+fn mkAlpha() -> *int {
+    var s = newStr(5)
+    byteInto(s, 0, 97)
+    byteInto(s, 1, 108)
+    byteInto(s, 2, 112)
+    byteInto(s, 3, 104)
+    byteInto(s, 4, 97)
+    return s
+}
+
+/// A structurally equal but distinct copy of `mkAlpha`, which is the whole point: these two
+/// must collide on the same slot.
+fn mkAlphaTwin() -> *int {
+    var s = newStr(5)
+    byteInto(s, 0, 97)
+    byteInto(s, 1, 108)
+    byteInto(s, 2, 112)
+    byteInto(s, 3, 104)
+    byteInto(s, 4, 97)
+    return s
+}
+
+fn mkBeta() -> *int {
+    var s = newStr(5)
+    byteInto(s, 0, 98)
+    byteInto(s, 1, 101)
+    byteInto(s, 2, 116)
+    byteInto(s, 3, 97)
+    byteInto(s, 4, 32)
+    return s
+}
+
+/// The header words a native map object must expose.
+fn dumpHeader(m: *int) {
+    unsafe {
+        println("  hdr0: {m[0]}")
+        println("  class: {m[1]}")
+        println("  size: {m[2]}")
+        println("  len: {m[3]}")
+        println("  cap: {m[4]}")
+        println("  entries non-null: {(m[5] as int) != 0}")
+    }
+}
+
+fn main() {
+    // --- creation and the header layout -------------------------------------------
+    var m = abiMapNew(0)
+    println("new(0):")
+    dumpHeader(m)
+    println("  len: {abiMapLen(m)}")
+
+    // A below-floor request is floored to 16 and rounded to a power of two, which
+    // findSlot's `idx & (cap - 1)` masking requires.
+    var small = abiMapNew(4)
+    var mid = abiMapNew(20)
+    var big = abiMapNew(64)
+    unsafe {
+        println("new(4) cap: {small[4]}")
+        println("new(20) cap: {mid[4]}")
+        println("new(64) cap: {big[4]}")
+    }
+
+    // --- insert / lookup / overwrite ----------------------------------------------
+    var k1 = mkAlpha()
+    var k2 = mkAlphaTwin()
+    var k3 = mkBeta()
+    var v1 = abiBoxI64(11)
+    var v2 = abiBoxI64(22)
+    println("miss before insert: {isNull(abiMapGet(m, k1))}")
+    abiMapSet(m, k1, v1)
+    // `k2` is a different object holding the same five bytes.
+    println("structural hit: {abiUnboxI64(abiMapGet(m, k2))}")
+    abiMapSet(m, k3, v2)
+    println("len after two: {abiMapLen(m)}")
+    println("has alpha: {abiMapHas(m, k1)}")
+    println("has beta: {abiMapHas(m, k3)}")
+    println("has missing: {abiMapHas(m, abiStrFromI64(9999))}")
+
+    // Overwriting through the twin must replace in place, not insert a second entry.
+    var v3 = abiBoxI64(33)
+    abiMapSet(m, k2, v3)
+    println("overwritten: {abiUnboxI64(abiMapGet(m, k1))}")
+    println("len after overwrite: {abiMapLen(m)}")
+
+    // --- the boxed-get entry point --------------------------------------------------
+    println("boxed default on miss: {abiUnboxI64(abiMapGetBoxed(m, abiStrFromI64(9999), abiBoxI64(-1)))}")
+    println("boxed hit: {abiUnboxI64(abiMapGetBoxed(m, k1, abiBoxI64(-1)))}")
+
+    // --- a boxed scalar key ---------------------------------------------------------
+    // One boxed object, used for both the lookup and the insert. Building a second
+    // `abiBoxI64(4242)` for the probe would exercise the structural path, but a distinct
+    // box must compare by payload, not identity -- so read the value back through the
+    // SAME object, which is what a real program does when it holds the key in a local.
+    var bkey = abiBoxI64(4242)
+    abiMapSet(m, bkey, abiBoxI64(7))
+    println("boxed key after set: {abiUnboxI64(abiMapGet(m, bkey))}")
+    // And a freshly built equal box must still hit, proving deep equality on boxes.
+    println("boxed key via twin: {abiUnboxI64(abiMapGet(m, abiBoxI64(4242)))}")
+
+    // --- growth across a rehash -----------------------------------------------------
+    var g = abiMapNew(0)
+    var i = 0
+    while (i < 200) {
+        abiMapSet(g, abiStrFromI64(i), abiBoxI64(i * 3))
+        i = i + 1
+    }
+    unsafe {
+        println("grown cap: {g[4]}")
+        println("grown len: {abiMapLen(g)}")
+    }
+    // Every key must still be findable after its slot was recomputed by the rehash.
+    var bad = 0
+    var j = 0
+    while (j < 200) {
+        if (isNull(abiMapGet(g, abiStrFromI64(j)))) { bad = bad + 1 }
+        else {
+            if (abiUnboxI64(abiMapGet(g, abiStrFromI64(j))) != j * 3) { bad = bad + 1 }
+        }
+        j = j + 1
+    }
+    println("misses after rehash: {bad}")
+
+    // --- removal leaves a tombstone, and the chain behind it survives ---------------
+    println("remove present: {abiUnboxI64(abiMapRemove(g, abiStrFromI64(5)))}")
+    println("remove again: {abiMapRemove(g, abiStrFromI64(5)) as int}")
+    println("remove absent: {abiMapRemove(g, abiStrFromI64(123456)) as int}")
+    println("len after remove: {abiMapLen(g)}")
+    println("removed gone: {isNull(abiMapGet(g, abiStrFromI64(5)))}")
+    // Keys probed through the tombstone must still resolve.
+    println("survivor after tombstone: {abiUnboxI64(abiMapGet(g, abiStrFromI64(7)))}")
+
+    // --- snapshots ------------------------------------------------------------------
+    var keys = abiMapKeys(m)
+    var vals = abiMapValues(m)
+    println("key snapshot len: {abiListLen(keys)}")
+    println("value snapshot len: {abiListLen(vals)}")
+    println("membership equal: {abiListLen(keys) == abiListLen(vals)}")
+
+    // --- empty-map totality ---------------------------------------------------------
+    var e = abiMapNew(0)
+    println("empty len: {abiMapLen(e)}")
+    println("empty get: {abiMapGet(e, k1) as int}")
+    println("empty has: {abiMapHas(e, k1)}")
+    println("empty remove: {abiMapRemove(e, k1) as int}")
+    println("empty keys: {abiListLen(abiMapKeys(e))}")
+    println("empty values: {abiListLen(abiMapValues(e))}")
+}

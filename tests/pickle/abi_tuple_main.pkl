@@ -1,0 +1,58 @@
+module abi_tuple_main
+
+// Exercises the sovereign tuple ABI bodies in `runtime.abi_tuple`.
+//
+// Companion to `abi_box_main.pkl` / `abi_list_main.pkl`, with the same purpose: prove the
+// four ported symbols survive source -> ported front end -> ported emitter -> ported
+// COFF -> ported PE linker -> executed, byte-identical to the Rust JIT, and are the
+// bodies actually linked rather than the Rust runtime's identically-named exports.
+//
+// The assertions probe what only a faithful port can get right. The element count lives
+// in header word 3 as an explicit `usize`, not derived from the byte size, and the
+// payload fields start at word 4. A body that used `TUPLE_LEN_OFF`/`TUPLE_FIELDS_OFF` as
+// word indices instead of dividing the byte offsets by 8 would read a field one slot early
+// and print shifted values rather than failing cleanly.
+
+import { tupleNew, abiTupleLen, abiTupleSetField, abiTupleField } from runtime.abi_tuple
+import { abiBoxI64, abiUnboxI64 } from runtime.abi_box
+
+/// Read field `i` back through the exported `pickle_tuple_field` ABI entry point.
+fn at(t: *int, i: int) -> int {
+    return abiUnboxI64(abiTupleField(t, i))
+}
+
+fn main() {
+    // Header and count placement.
+    var t = tupleNew(3)
+    unsafe {
+        println("class: {t[1]}")
+        println("size: {t[2]}")
+        println("count word: {t[3]}")
+        println("field0 word: {t[4]}")
+    }
+    println("len: {abiTupleLen(t)}")
+
+    // Fields start at word 4, i.e. TUPLE_FIELDS_OFF / 8.
+    abiTupleSetField(t, 0, abiBoxI64(11))
+    abiTupleSetField(t, 1, abiBoxI64(22))
+    abiTupleSetField(t, 2, abiBoxI64(33))
+    println("f0: {at(t, 0)}")
+    println("f1: {at(t, 1)}")
+    println("f2: {at(t, 2)}")
+
+    // Out-of-range reads are the null pointer, word 0.
+    println("oob: {abiTupleField(t, 3) as int}")
+    println("far oob: {abiTupleField(t, 99) as int}")
+
+    // An empty tuple must report zero fields, not one inferred from the 32-byte minimum.
+    var e = tupleNew(0)
+    println("empty len: {abiTupleLen(e)}")
+    println("empty oob: {abiTupleField(e, 0) as int}")
+
+    // The path a real program takes: language-level tuple destructuring, which the
+    // compiler lowers onto these very ABI symbols.
+    let (a, b) = (7, 9)
+    println("destructure: {a} {b}")
+    let (p, q, r) = (1, 2, 3)
+    println("triple: {p} {q} {r}")
+}

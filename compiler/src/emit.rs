@@ -6746,7 +6746,12 @@ fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
                     return self.bad(e.span, "`&` of an unknown local");
                 }
                 match t {
-                    Some(Ty::Class(..) | Ty::Struct(..) | Ty::Ptr(..)) => self.expr(operand),
+                    // The checker already types `&str` as `*string`, so the
+                    // emitter has to lower it the same way: the value *is* the
+                    // object pointer.
+                    Some(Ty::Class(..) | Ty::Struct(..) | Ty::Ptr(..) | Ty::String) => {
+                        self.expr(operand)
+                    }
                     _ => self.bad(
                         e.span,
                         "`&` currently only supports class, struct, pointer, and scalar local variables",
@@ -7362,6 +7367,15 @@ fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
     /// and numeric conversions are supported; anything else bails.
     fn convert(&mut self, span: Span, v: Temp, from: &Ty, to: &Ty) -> Result<Temp, ()> {
         if from == to {
+            return Ok(v);
+        }
+        // `*T` and `int` are the same machine word. `cast_related` allows the
+        // pair so container ABI bodies can store an object address in a word
+        // slot; the move is a plain register copy, with no trap value and no
+        // new representation.
+        if (matches!(from, Ty::Ptr(..)) && to == &Ty::Int)
+            || (from == &Ty::Int && matches!(to, Ty::Ptr(..)))
+        {
             return Ok(v);
         }
         if from.is_numeric() && to.is_numeric() {
@@ -11771,6 +11785,134 @@ for (id, _, _) in inits {
             "thread_current" => ("pickle_thread_current", vec![], Some(Int), &[]),
             "sleep_ms" => ("pickle_thread_sleep_ms", INT.to_vec(), NONE, &["ms"]),
             "thread_yield" => ("pickle_thread_yield", vec![], NONE, &[]),
+            // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
+            // the backend treats that prefix as "resolve me from a system
+            // DLL" rather than "find me in the runtime archive".
+            "win_thread_id" => ("__imp_GetCurrentThreadId", vec![], Some(Int), &[]),
+            // Win32 thread-local storage, reachable as an import. `Tls*` rather than
+            // `Fls*`: same slots, but `FlsSetValue` faults at teardown here.
+            "win_tls_alloc" => ("__imp_TlsAlloc", vec![], Some(Int), &[]),
+            "win_tls_get" => ("__imp_TlsGetValue", INT.to_vec(), Some(Int), &["slot"]),
+            "win_tls_set" => ("__imp_TlsSetValue", vec![Int, Int], Some(Int), &["slot", "value"]),
+            // Process termination, reachable as an import so a `#[symbol]`
+            // body can own the `pickle_exit` slot. Returns nothing: the
+            // Win32 prototype is `VOID ExitProcess(UINT)`.
+            "win_exit" => ("__imp_ExitProcess", INT.to_vec(), NONE, &["code"]),
+            // The process heap, reachable as an import triple so a `#[symbol]`
+            // body can own the `pickle_raw_alloc` / `pickle_raw_free` slots.
+            // All three are KERNEL32 exports, and `HeapAlloc` on
+            // `GetProcessHeap()` with zero flags is what Rust's `System`
+            // allocator lowers to on Windows - so a block handed out by one
+            // side and released by the other stays valid even if only one half
+            // of the pair ends up ported.
+            "win_get_process_heap" => ("__imp_GetProcessHeap", vec![], Some(Int), &[]),
+            "win_heap_alloc" => (
+                "__imp_HeapAlloc",
+                vec![Int, Int, Int],
+                Some(Int),
+                &["heap", "flags", "size"],
+            ),
+            // Void rather than the Win32 `BOOL`: the caller has no use for the
+            // answer, and reading a 32-bit `BOOL` back as a 64-bit `Int` would
+            // depend on the upper half happening to be zero.
+            "win_heap_free" => (
+                "__imp_HeapFree",
+                vec![Int, Int, Int],
+                NONE,
+                &["heap", "flags", "ptr"],
+            ),
+            // The filesystem entry points, reachable as imports so a
+            // `#[symbol]` body can own `pickle_file_exists`, `pickle_delete`,
+            // `pickle_mkdir`, `pickle_current_dir`, `pickle_read_file`,
+            // `pickle_write_file`, and `pickle_list_dir`. Everything except the
+            // handles takes just a wide path, so UTF-8 -> UTF-16 conversion -
+            // which is the whole of the work for the first four - happens in
+            // Pickle against a `HeapAlloc` buffer. Every name here resolves to
+            // KERNEL32, which is what `win_import_addr` and `pelink::isShellImp`
+            // already assume for any `__imp_` other than `CommandLineToArgvW`.
+            "win_get_file_attributes_w" => (
+                "__imp_GetFileAttributesW",
+                INT.to_vec(),
+                Some(Int),
+                &["path"],
+            ),
+            "win_delete_file_w" => ("__imp_DeleteFileW", INT.to_vec(), Some(Int), &["path"]),
+            "win_remove_directory_w" => (
+                "__imp_RemoveDirectoryW",
+                INT.to_vec(),
+                Some(Int),
+                &["path"],
+            ),
+            "win_create_directory_w" => (
+                "__imp_CreateDirectoryW",
+                vec![Int, Int],
+                Some(Int),
+                &["path", "sec"],
+            ),
+            // Two-call sizing: `(0, NULL)` returns the units a real call needs,
+            // counting the terminator, and the second call reports the units
+            // actually written without it.
+            "win_get_current_directory_w" => (
+                "__imp_GetCurrentDirectoryW",
+                vec![Int, Int],
+                Some(Int),
+                &["cap", "buf"],
+            ),
+            "win_create_file_w" => (
+                "__imp_CreateFileW",
+                vec![Int, Int, Int, Int, Int, Int, Int],
+                Some(Int),
+                &["name", "access", "share", "sec", "disp", "flags", "tmpl"],
+            ),
+            "win_read_file" => (
+                "__imp_ReadFile",
+                vec![Int, Int, Int, Int, Int],
+                Some(Int),
+                &["handle", "buf", "n", "pRead", "ov"],
+            ),
+            "win_write_file" => (
+                "__imp_WriteFile",
+                vec![Int, Int, Int, Int, Int],
+                Some(Int),
+                &["handle", "buf", "n", "pWritten", "ov"],
+            ),
+            "win_close_handle" => ("__imp_CloseHandle", INT.to_vec(), Some(Int), &["handle"]),
+            "win_find_first_file_w" => (
+                "__imp_FindFirstFileW",
+                vec![Int, Int],
+                Some(Int),
+                &["pattern", "data"],
+            ),
+            "win_find_next_file_w" => (
+                "__imp_FindNextFileW",
+                vec![Int, Int],
+                Some(Int),
+                &["handle", "data"],
+            ),
+            "win_find_close" => ("__imp_FindClose", INT.to_vec(), Some(Int), &["handle"]),
+            "win_get_std_handle" => ("__imp_GetStdHandle", INT.to_vec(), Some(Int), &["which"]),
+            // The command line, so a `#[symbol]` body can own the
+            // `pickle_args` slot: `GetCommandLineW` (KERNEL32) hands back
+            // the process's UTF-16 line, `CommandLineToArgvW` (SHELL32 -
+            // the one name `pelink::isShellImp` routes apart from
+            // KERNEL32) splits it into a null-terminated `LPWSTR*`, and
+            // `LocalFree` (KERNEL32) releases that block. The free is void
+            // for the same reason `win_heap_free` is: nobody reads the
+            // answer, and a 32-bit `HLOCAL` would sign-extend oddly into
+            // a 64-bit `Int`.
+            "win_get_command_line_w" => (
+                "__imp_GetCommandLineW",
+                vec![],
+                Some(Int),
+                &[],
+            ),
+            "win_command_line_to_argv_w" => (
+                "__imp_CommandLineToArgvW",
+                vec![Int, Int],
+                Some(Int),
+                &["cmdline", "pargs"],
+            ),
+            "win_local_free" => ("__imp_LocalFree", INT.to_vec(), NONE, &["mem"]),
             // Synchronisation.
             "mutex_new" => ("pickle_mutex_new", vec![], Some(Int), &[]),
             "mutex_lock" => ("pickle_mutex_lock", INT.to_vec(), NONE, &["m"]),
