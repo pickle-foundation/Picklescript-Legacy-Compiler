@@ -723,6 +723,87 @@ impl<'a> Resolver<'a> {
                     false,
                 ),
                 mk("win_local_free", vec![any("mem")], Ty::Empty, false),
+                // Process spawning for `run_cmd`: see the comment in
+                // `resolve.pkl`.
+                mk(
+                    "win_create_process_w",
+                    vec![
+                        any("app"),
+                        any("cmdline"),
+                        any("procAttr"),
+                        any("threadAttr"),
+                        any("inherit"),
+                        any("flags"),
+                        any("env"),
+                        any("cwd"),
+                        any("si"),
+                        any("pi"),
+                    ],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_create_pipe",
+                    vec![any("pRead"), any("pWrite"), any("sec"), any("size")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_set_handle_information",
+                    vec![any("handle"), any("mask"), any("flags")],
+                    Ty::Int,
+                    false,
+                ),
+                mk("win_wait_single", vec![any("handle"), any("ms")], Ty::Int, false),
+                mk(
+                    "win_get_exit_code_process",
+                    vec![any("handle"), any("pCode")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_terminate_process",
+                    vec![any("handle"), any("code")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_peek_pipe",
+                    vec![any("handle"), any("buf"), any("n"), any("pRead"), any("pAvail")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_get_environment_strings_w",
+                    vec![],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_free_environment_strings_w",
+                    vec![any("block")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_get_module_file_name_w",
+                    vec![any("module"), any("buf"), any("size")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_get_system_directory_w",
+                    vec![any("buf"), any("size")],
+                    Ty::Int,
+                    false,
+                ),
+                mk(
+                    "win_get_windows_directory_w",
+                    vec![any("buf"), any("size")],
+                    Ty::Int,
+                    false,
+                ),
+                mk("win_tick_ms64", vec![], Ty::Int, false),
             // --- Garbage collection ---
             //
             // The delegation point from Pickle into the live collector. Named
