@@ -72,6 +72,28 @@ pub struct Heap {
     segments: *mut Segment,
     /// Free-lists by size class; intrusive via `header.next`.
     free_heads: Vec<*mut PickleObject>,
+    /// Cumulative bytes handed out by the bump allocator. Non-moving arenas
+    /// never return pages, so this is a monotone proxy for real footprint.
+    issue: u64,
+    /// Hard ceiling on `issue`; 0 = unlimited. Read from `PICKLE_HEAP_CAP_MB`
+    /// so pathological driver/compiler runs fail fast (seconds, ~MiB scale)
+    /// instead of ballooning to gigabytes of committed memory.
+    cap: u64,
+}
+
+fn heap_cap_bytes() -> u64 {
+    #[cfg(feature = "nostd")]
+    {
+        0
+    }
+    #[cfg(not(feature = "nostd"))]
+    {
+        let mib = std::env::var_os("PICKLE_HEAP_CAP_MB")
+            .and_then(|v| v.into_string().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        mib.saturating_mul(1 << 20)
+    }
 }
 
 /// Bin index for a block of `size` bytes.
@@ -92,6 +114,8 @@ impl Heap {
         Heap {
             segments: first,
             free_heads: vec![core::ptr::null_mut(); NBINS],
+            issue: 0,
+            cap: heap_cap_bytes(),
         }
     }
 
@@ -178,6 +202,16 @@ impl Heap {
             let base = (*seg).data_base();
             let p = base.add((*seg).used);
             (*seg).used += size;
+            self.issue = self.issue.saturating_add(size as u64);
+            let cap = self.cap;
+            if cap > 0 && self.issue > cap {
+                panic!(
+                    "internal error: pickle: heap cap {} MiB exhausted ({} MiB issued); \
+                     set PICKLE_HEAP_CAP_MB=0 to disable",
+                    cap >> 20,
+                    self.issue >> 20
+                );
+            }
             p
         }
     }

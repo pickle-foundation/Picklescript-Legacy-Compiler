@@ -547,16 +547,21 @@ fn find_slot(
 }
 
 fn needs_grow(entries: *mut MapEntry, cap: usize, _len: usize) -> bool {
-    let occupied = entries_count(entries, cap);
+    let occupied = occupied_count(entries, cap);
     (occupied as f64 + 1.0) >= (cap as f64 * MAX_LOAD)
 }
 
-fn entries_count(entries: *mut MapEntry, cap: usize) -> usize {
+/// Slots that hold *anything* - a live entry or a tombstone. Growth must key off
+/// this, not the live count: a tombstone still occupies a probe slot, so a table
+/// whose live count is low but whose tombstones fill the array has no empty slot
+/// left and `find_slot` would probe forever. Counting tombstones here forces a
+/// rehash (which compacts them away) before that can happen.
+fn occupied_count(entries: *mut MapEntry, cap: usize) -> usize {
     unsafe {
         let mut n = 0usize;
         for i in 0..cap {
             let k = entries.add(i).read().key;
-            if !k.is_null() && !core::ptr::eq(k, crate::object::nil_sentinel()) {
+            if !k.is_null() {
                 n += 1;
             }
         }
@@ -858,6 +863,47 @@ mod tests {
             assert_eq!(map_get(m, k), *v, "key {i}");
         }
         assert_eq!(map_len_of(m), 500);
+    }
+
+    #[test]
+    fn tombstones_count_toward_growth() {
+        // Regression: `needs_grow` once counted LIVE entries only, so the tombstones
+        // left by `map_remove` could fill every probe slot while the live count stayed
+        // low. The next insert then called `find_slot` on a table with no empty slot to
+        // stop on and probed forever. This is the smallest form of the real sequence
+        // (grow / churn / grow / churn / grow); it hung before `occupied_count` was
+        // folded into `needs_grow`.
+        let _guard = setup();
+        let gc = crate::gc::gc_mut();
+        let m = map_new(0, gc);
+        let ins = |m: *mut PickleObject, a: usize, b: usize| {
+            for i in a..b {
+                let k = crate::strings::int64_to_string(i as i64);
+                let v = crate::strings::int64_to_string((i * 7) as i64);
+                map_set(m, k, v);
+            }
+        };
+        let del = |m: *mut PickleObject, a: usize, b: usize| {
+            for i in a..b {
+                let k = crate::strings::int64_to_string(i as i64);
+                map_remove(m, k);
+            }
+        };
+        ins(m, 0, 61);
+        del(m, 15, 45);
+        ins(m, 61, 91);
+        del(m, 45, 75);
+        ins(m, 91, 121);
+        del(m, 75, 105);
+        ins(m, 121, 129);
+        assert_eq!(map_len_of(m), 39);
+        // Survivors reachable, removed keys gone.
+        let k5 = crate::strings::int64_to_string(5);
+        assert!(!map_get(m, k5).is_null());
+        let k20 = crate::strings::int64_to_string(20);
+        assert!(map_get(m, k20).is_null());
+        let k128 = crate::strings::int64_to_string(128);
+        assert!(!map_get(m, k128).is_null());
     }
 
     #[test]
