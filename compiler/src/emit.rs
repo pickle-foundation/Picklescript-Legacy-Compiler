@@ -11785,6 +11785,10 @@ for (id, _, _) in inits {
             "thread_current" => ("pickle_thread_current", vec![], Some(Int), &[]),
             "sleep_ms" => ("pickle_thread_sleep_ms", INT.to_vec(), NONE, &["ms"]),
             "thread_yield" => ("pickle_thread_yield", vec![], NONE, &[]),
+            // Win32 import: `Sleep` (`VOID Sleep(DWORD)`), so a `#[symbol]`
+            // body can occupy `pickle_thread_sleep_ms` with wall-clock sleep
+            // and no Rust shim.
+            "win_sleep" => ("__imp_Sleep", INT.to_vec(), NONE, &["ms"]),
             // Win32 import. `__imp_` is the MSVC import-symbol prefix, and
             // the backend treats that prefix as "resolve me from a system
             // DLL" rather than "find me in the runtime archive".

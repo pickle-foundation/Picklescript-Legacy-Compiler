@@ -1573,7 +1573,7 @@ fn win_import_addr(sym: &str) -> Option<usize> {
     let func = sym.strip_prefix(IMPORT_PREFIX)?;
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     }
     let dll: Vec<u16> = if func == "CommandLineToArgvW" {
@@ -1584,7 +1584,12 @@ fn win_import_addr(sym: &str) -> Option<usize> {
     let mut ansi: Vec<u8> = func.as_bytes().to_vec();
     ansi.push(0);
     unsafe {
-        let handle = GetModuleHandleW(dll.as_ptr());
+        // A PE loader resolves an import by loading the DLL if it is not already
+        // mapped; mirror that here. `GetModuleHandleW` (only already-loaded
+        // modules) fails when the importing program never pulled e.g. SHELL32,
+        // which is exactly what happens for `pickle_args`'s CommandLineToArgvW
+        // under `pickle test` dir-mode.
+        let handle = LoadLibraryW(dll.as_ptr());
         if handle.is_null() {
             return None;
         }

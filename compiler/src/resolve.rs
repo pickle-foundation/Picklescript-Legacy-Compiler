@@ -582,6 +582,10 @@ impl<'a> Resolver<'a> {
             mk("thread_current", vec![], Ty::Int, false),
             mk("sleep_ms", vec![any("ms")], Ty::Empty, false),
             mk("thread_yield", vec![], Ty::Empty, false),
+            // `win_sleep` lowers to an `__imp_Sleep` extern (`VOID Sleep(DWORD)`):
+            // a `#[symbol]` body can occupy the `pickle_thread_sleep_ms` slot
+            // with real wall-clock sleep and no Rust shim.
+            mk("win_sleep", vec![any("ms")], Ty::Empty, false),
             // --- Win32 imports ---
             //
             // `win_thread_id` lowers to an `__imp_GetCurrentThreadId` extern.
