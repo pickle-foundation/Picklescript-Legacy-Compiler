@@ -24,8 +24,11 @@ achieved by both sides being wrong in the same way:
   exit 0, stderr empty                              uncaught_none_clean
 
 .PARAMETER SelfhostLink
-Link with the self-hosted linker against `combined.lib` instead of `rustc` and
-a shim. Exercises `pickle\compiler/linker.pkl` rather than the Rust toolchain.
+Link with the self-hosted linker against the PICKLE runtime archive
+(tools\diff\rtlib.ar, every pickle\runtime member lowered to COFF by
+pickle\cli/rtlib.pkl) instead of `rustc` and a shim. Exercises
+`pickle\compiler/linker.pkl` rather than the Rust toolchain — no cargo,
+no combined.lib.
 
 .PARAMETER Filter
 Only run fixtures whose name contains this substring.
@@ -87,9 +90,8 @@ function Show([byte[]]$b) {
 $rtRlib = $null
 $Combined = $null
 if ($SelfhostLink) {
-    $Combined = @("$Temp\rarc\combined.lib", "$Env:TEMP\opencode\x64real\rarc\combined.lib", "$Env:TEMP\opencode\rarc\combined.lib") |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $Combined) { Write-Output "COMBINED LIB NOT FOUND (rebuild via tools/build_combined_lib.ps1 -Install)"; exit 1 }
+    $Combined = Join-Path $Root "tools\diff\rtlib.ar"
+    if (-not (Test-Path $Combined)) { Write-Output "RUNTIME ARCHIVE NOT FOUND: $Combined (run tools\battery_full.ps1, which builds it via rtlib.pkl)"; exit 1 }
 } else {
     $rtDir = Join-Path $Work "rt"
     Push-Location $Root

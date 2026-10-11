@@ -1,0 +1,47 @@
+// Regression for the tombstone-saturation infinite loop in the map.
+//
+// `needsGrow` used to count LIVE entries only, so the tombstones left behind by
+// `map.remove` could fill every slot of the probe table while the live count
+// stayed low. The next `map[k] = v` then called `findSlot` on a table with no
+// empty slot left and probed forever. This exact sequence reproduced the hang
+// (verified against both the native runtime and the port before the fix); with
+// `occupiedCount` counting live entries AND tombstones, the insert that would
+// have saturated the table now triggers a rehash that compacts the tombstones
+// away first.
+//
+// Deterministic output, no key-order dependence, so it is safe for the byte-
+// parity gates (JIT / AOT / irx / rust-free sovereign build).
+
+fn ins(m: Map<int, int>, a: int, b: int) {
+    var i = a
+    while (i < b) {
+        m[i] = i
+        i = i + 1
+    }
+}
+
+fn del(m: Map<int, int>, a: int, b: int) {
+    var j = a
+    while (j < b) {
+        m.remove(j)
+        j = j + 1
+    }
+}
+
+fn main() {
+    var m: Map<int, int> = {0: 0}
+    m.remove(0)
+    ins(m, 0, 61)
+    del(m, 15, 45)
+    ins(m, 61, 91)
+    del(m, 45, 75)
+    ins(m, 91, 121)
+    del(m, 75, 105)
+    ins(m, 121, 129)
+
+    assert(len(m) == 39, "tombstone churn lost or duplicated entries")
+    assert(m[5] == 5, "survivor key 5 missing")
+    assert(m[120] == 120, "survivor key 120 missing")
+    assert(m[128] == 128, "survivor key 128 missing")
+    println("map tombstone churn len " + str(len(m)))
+}

@@ -269,18 +269,17 @@ Write-Output "GATE11 STDLIB BYTE-PARITY (stdout+exit, $($g11tests.Count) files):
 # Deepest build-path proof (PICKLE_AUDIT 17.2): pickle\cli/build.pkl is AOT-built to a
 # native driver (Rust only bootstraps that link), then with no Rust compiler in the loop it
 # lowers every battery main to a real PE .exe via the ported x64 backend, COFF writer, and
-# ported PE linker (compiler.linklib) against the nostd runtime archive. Each produced exe
+# ported PE linker (compiler.linklib). It links against the PICKLE runtime archive
+# (tools\diff\rtlib.ar: every pickle\runtime member lowered to COFF by pickle\cli/rtlib.pkl)
+# — no Rust objects, no cargo, no combined.lib. Each produced exe
 # must then run with stdout byte-identical to the Rust JIT oracle for the same source.
 $pklcBuild = "tools\diff\port\pklc_build.exe"
 if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
     Write-Output "GATE12 PORTED BUILD: DRIVER BUILD FAILED"
 } else {
-    $combinedCand = @(
-        "$env:TEMP\opencode\rarc\combined.lib"
-        "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $combinedCand) {
-        Write-Output "GATE12 PORTED BUILD: COMBINED LIB MISSING (rebuild via tools\build_combined_lib.ps1)"
+    $rtlibCand = Get-RtlibArchive
+    if (-not $rtlibCand) {
+        Write-Output "GATE12 PORTED BUILD: RUNTIME ARCHIVE MISSING (pickle rtlib driver build failed)"
     } else {
         $g12dir = "tools\diff\g12"
         New-Item -ItemType Directory -Path $g12dir -Force | Out-Null
@@ -293,7 +292,13 @@ if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
             # only consumed by `pickle run <driver> -- <args>` under the JIT).
             # Re-linking is skipped when a stamp shows source/compiler/lib unchanged;
             # the exe is still freshly run and byte-compared against the oracle below.
-            if (-not (Invoke-Artifact $pklcBuild $target $combinedCand $exe)) {
+            # gc_observable_main is exempt: its output reflects runtime startup
+            # allocation plumbing, so an inherited stale artifact could flake the
+            # byte compare — it is always freshly re-linked.
+            if ($m.BaseName -eq "gc_observable_main") {
+                Remove-Item $exe, "$exe.hash" -ErrorAction SilentlyContinue
+            }
+            if (-not (Invoke-Artifact $pklcBuild $target $rtlibCand $exe)) {
                 $g12fail++; Write-Output "GATE12 $($m.BaseName): build failed"; continue
             }
             cmd /c "`"$cli`" run `"$target`" > `"$g12dir\rust.txt`" 2>nul"
@@ -313,6 +318,8 @@ if (-not (Invoke-BuildDriver "pickle\cli\build.pkl" $pklcBuild)) {
 # The ported run driver (pickle\cli/run.pkl, AOT-built the same way) goes one step
 # further than the build driver: it compiles the source, links the PE, then spawns the
 # exe and propagates its exit code — with zero Rust compiler or irx-run in the loop.
+# It links the PICKLE runtime archive (tools\diff\rtlib.ar, like GATE12) rather than
+# the Rust combined.lib, so no cargo is involved anywhere in this gate.
 # It also exercises real argv forwarding: the freestanding exe reads the process
 # command line via GetCommandLineW/CommandLineToArgvW (routed through shell32 by the
 # ported PE linker), so os_args_main runs WITH arguments here, unlike the build block.
@@ -320,12 +327,9 @@ $pklcRun = "tools\diff\port\pklc_run.exe"
 if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
     Write-Output "GATE12b PORTED RUN: DRIVER BUILD FAILED"
 } else {
-    $combinedCand = @(
-        "$env:TEMP\opencode\rarc\combined.lib"
-        "C:\Users\vilni\AppData\Local\Temp\opencode\rarc\combined.lib"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $combinedCand) {
-        Write-Output "GATE12b PORTED RUN: COMBINED LIB MISSING (rebuild via tools\build_combined_lib.ps1)"
+    $rtlibCand = Get-RtlibArchive
+    if (-not $rtlibCand) {
+        Write-Output "GATE12b PORTED RUN: RUNTIME ARCHIVE MISSING (pickle rtlib driver build failed)"
     } else {
         $g12bdir = "tools\diff\g12run"
         New-Item -ItemType Directory -Path $g12bdir -Force | Out-Null
@@ -343,11 +347,11 @@ if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
             # case is what proves the run driver's spawn/argv path, so it stays fresh.
             $exe = Join-Path $g12bdir "$($m.BaseName).exe"
             $stamp = "$exe.hash"
-            $want = Get-ArtifactStamp $target $combinedCand
+            $want = Get-ArtifactStamp $target $rtlibCand
             if ($m.BaseName -ne "os_args_main" -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
                 cmd /c "`"$exe`" > `"$g12bdir\port.txt`" 2>nul"
             } else {
-                cmd /c "`"$pklcRun`" `"$target`" `"$combinedCand`" > `"$g12bdir\port.txt`" 2>nul"
+                cmd /c "`"$pklcRun`" `"$target`" `"$rtlibCand`" > `"$g12bdir\port.txt`" 2>nul"
                 if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $exe)) {
                     Set-Content -LiteralPath $stamp -Value $want -NoNewline
                 }
@@ -360,7 +364,7 @@ if (-not (Invoke-BuildDriver "pickle\cli\run.pkl" $pklcRun)) {
         }
         # os_args_main with real arguments: the ported exe must see "2/foo/bar" and
         # exit 7 on a1=="exit", byte-identical to the Rust JIT oracle.
-        cmd /c "`"$pklcRun`" `"tests\pickle\os_args_main.pkl`" `"$combinedCand`" exit exit > `"$g12bdir\port_args.txt`" 2>nul"
+        cmd /c "`"$pklcRun`" `"tests\pickle\os_args_main.pkl`" `"$rtlibCand`" exit exit > `"$g12bdir\port_args.txt`" 2>nul"
         $pa = $LASTEXITCODE
         cmd /c "`"$cli`" run `"tests\pickle\os_args_main.pkl`" -- exit exit > `"$g12bdir\rust_args.txt`" 2>nul"
         $ra = $LASTEXITCODE
@@ -396,7 +400,8 @@ if (-not (Invoke-BuildDriver "pickle\cli\main.pkl" $pklcMain)) {
 }
 
 # ---- Crash-stanza personality: an uncaught throw in a self-host compiled exe
-# (selfhost-linked against combined.lib) must match the Rust oracle on all three
+# (linked by the selfhost PE linker against the PICKLE runtime archive
+# tools\diff\rtlib.ar) must match the Rust oracle on all three
 # channels byte for byte — exit code, stdout, and stderr. ----
 $g14out = & (Join-Path $PSScriptRoot "uncaught_parity.ps1") -SelfhostLink 2>&1
 $g14fail = $LASTEXITCODE
@@ -404,6 +409,29 @@ $g14pass = @($g14out | Select-String -Pattern "^PASS ").Count
 $g14fails = @($g14out | Select-String -Pattern "^FAIL ").Count
 Write-Output "UNCAUGHT PARITY (selfhost link, fixtures=$($g14pass + $g14fails)): PASS=$g14pass FAIL=$g14fails"
 if ($g14fail -ne 0) { Write-Output "uncaught_parity.ps1 -SelfhostLink failed (exit $g14fail)" }
+
+# ---- Sovereign selflink: a zero-Rust-object executable (cli/main.pkl linked
+# against pickle/runtime lowered to COFF, no combined.lib) must resolve with zero
+# unresolved symbols and reproduce the Rust JIT's output byte-for-byte. ----
+$g15out = & (Join-Path $PSScriptRoot "sovereign_selflink.ps1") 2>&1
+$g15fail = $LASTEXITCODE
+$g15pass = @($g15out | Select-String -Pattern "^PASS ").Count
+$g15fails = @($g15out | Select-String -Pattern "^FAIL ").Count
+Write-Output "SOVEREIGN SELFLINK (zero-Rust exe, steps=$($g15pass + $g15fails)): PASS=$g15pass FAIL=$g15fails"
+if ($g15fail -ne 0) { Write-Output "sovereign_selflink.ps1 failed (exit $g15fail)" }
+
+# ---- Sovereign build+run: the PRODUCT path with no Rust archive. GATE12/12b
+# link the Rust runtime archive (combined.lib, needs cargo); this gate builds a
+# representative set of mains with the pickle selfhost linker against the PICKLE
+# runtime dir and byte-compares each produced exe to the Rust JIT oracle — the
+# same build+run semantics with zero Rust objects in the loop. Pass -All is the
+# full 55-main audit (~23 min); the default subset keeps it battery-cheap. ----
+$g16out = & (Join-Path $PSScriptRoot "sovereign_buildrun.ps1") 2>&1
+$g16fail = $LASTEXITCODE
+$g16pass = @($g16out | Select-String -Pattern "^PASS ").Count
+$g16fails = @($g16out | Select-String -Pattern "^FAIL ").Count
+Write-Output "SOVEREIGN BUILDRUN (rust-free build+run, steps=$($g16pass + $g16fails)): PASS=$g16pass FAIL=$g16fails"
+if ($g16fail -ne 0) { Write-Output "sovereign_buildrun.ps1 failed (exit $g16fail)" }
 
 $batterySw.Stop()
 Write-Output "===== BATTERY COMPLETE ($([math]::Round($batterySw.Elapsed.TotalMinutes, 2)) min) ====="

@@ -1,0 +1,132 @@
+// The sovereign sync parity probe: exercises every ported data-sync family
+// (mutex, cond, semaphore, atomic, channel) end-to-end through the *builtin*
+// spellings, exactly as `mutex_main.pkl` / `sem_cond_main.pkl` /
+// `channel_main.pkl` do for the native bodies.
+//
+// The one difference is the import below: importing `runtime.abi_sync` is the
+// measured activation condition for a `#[symbol]` body ("its module is
+// imported AND codegen emits an extern reference to that name",
+// PORT-CHECKLIST 2026-10-06), and every builtin call in this file emits the
+// `pickle_*` reference. Under `pickle run`, that binds the calls to the ported
+// bodies; the transcript printed here must stay byte-identical to the native
+// run (GATE6's `pklc_irx` arm compiles this shape with the prelinked port and
+// irx-runs it, GATE12/12b's AOT arms link the Rust archive, and all three must
+// match the Rust `pickle run` oracle and each other).
+//
+// The once and thread families are absent here on purpose: their ports live in
+// `abi_once.pkl` / `abi_threads.pkl` (the 17.1 slice that also closed the
+// `call_closure0` wall `abi_sync.pkl`'s header reserved), and their sovereign
+// probes are `sync_once_main.pkl` / `sync_threads_main.pkl`. The native-body
+// mains (`once_main.pkl`, `thread_main.pkl`) keep covering them too.
+//
+// NO BLOCKING, NO FATAL: every `take` below is pre-satisfied by a permit that
+// exists before it runs, and no channel/mutex is ever touched with the wrong
+// kind or after close+empty. The broadcast/0-permit and the close-drain cases
+// that the freestanding contract allows are the interesting non-defaults.
+
+import { abiMutexNew } from runtime.abi_sync
+
+fn main() {
+    // --- handles (creation order => deterministic per-process numbering) ---
+    let m = mutex_new()
+    let c = cond_new()
+    let s = sem_new(2)
+    let a = atomic_new(5)
+    let ch = channel_new(3)
+    println(m)
+    println(c)
+    println(s)
+    println(a)
+    println(ch)
+
+    // --- mutex: trylock exclusion, idempotent unlock ---
+    println(mutex_trylock(m))
+    println(mutex_trylock(m))
+    mutex_unlock(m)
+    println(mutex_trylock(m))
+    mutex_unlock(m)
+    mutex_unlock(m)
+    println(mutex_trylock(m))
+    mutex_unlock(m)
+    mutex_lock(m)
+    println(mutex_trylock(m))
+    mutex_unlock(m)
+
+    // --- cond: a remembered signal is consumed by the next wait ---
+    cond_signal(c)
+    cond_wait(c, 0)
+    cond_signal(c)
+    cond_wait(c, m)
+    // the wait re-acquires the mutex, so it is now held
+    println(mutex_trylock(m))
+    mutex_unlock(m)
+    cond_broadcast(c)
+    cond_signal(c)
+    cond_wait(c, 0)
+
+    // --- sem: counting-down exclusion, broadcast gives nothing ---
+    println(sem_try_acquire(s, 1))
+    println(sem_try_acquire(s, 1))
+    println(sem_try_acquire(s, 1))
+    sem_release(s, 1)
+    println(sem_try_acquire(s, 1))
+    println(sem_try_acquire(s, 1))
+    let neg = sem_new(-2)
+    println(sem_try_acquire(neg, 1))
+    sem_release(neg, 0)
+    println(sem_try_acquire(neg, 1))
+    sem_release(neg, 1)
+    println(sem_try_acquire(neg, 1))
+    println(sem_try_acquire(neg, 1))
+    let su = sem_new(0)
+    sem_release(su, 1)
+    sem_acquire(su, 1)
+
+    // --- atomic: fetch_add returns the previous value, cas is exclusive ---
+    println(atomic_load(a))
+    println(atomic_add(a, 3))
+    println(atomic_load(a))
+    atomic_store(a, 1)
+    println(atomic_cas(a, 1, 9))
+    println(atomic_load(a))
+    println(atomic_cas(a, 1, 0))
+    println(atomic_load(a))
+
+    // --- channel: FIFO ring, bounded writes, wrap, close-drain ---
+    println(channel_cap(ch))
+    println(channel_len(ch))
+    let e0 = channel_try_recv(ch)
+    if (let some(v0) = e0) { println(v0) } else { println("none") }
+    println(channel_try_send(ch, 42))
+    println(channel_len(ch))
+    let g1 = channel_try_recv(ch)
+    if (let some(v1) = g1) { println(v1) } else { println("none") }
+    println(channel_len(ch))
+    channel_send(ch, 43)
+    channel_send(ch, 44)
+    println(channel_recv(ch))
+    println(channel_recv(ch))
+    let b = channel_new(1)
+    println(channel_try_send(b, 49))
+    println(channel_try_send(b, 50))
+    println(channel_recv(b))
+    println(channel_try_send(b, 51))
+    let r = channel_new(2)
+    channel_send(r, 10)
+    channel_send(r, 20)
+    println(channel_recv(r))
+    channel_send(r, 30)
+    println(channel_recv(r))
+    println(channel_recv(r))
+    let cl = channel_new(1)
+    println(channel_closed(cl))
+    channel_send(cl, 65)
+    channel_close(cl)
+    println(channel_closed(cl))
+    let g2 = channel_try_recv(cl)
+    if (let some(v2) = g2) { println(v2) } else { println("none") }
+    let e3 = channel_try_recv(cl)
+    if (let some(v3) = e3) { println(v3) } else { println("none") }
+
+    println("sync ok")
+}

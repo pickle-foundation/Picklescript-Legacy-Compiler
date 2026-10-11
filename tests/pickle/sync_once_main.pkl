@@ -1,0 +1,36 @@
+// The sovereign once parity probe: exercises every ported once symbol
+// (new, done, run) end-to-end through the *builtin* spellings, exactly as
+// `once_main.pkl` does for the native bodies.
+//
+// The one difference is the import below: importing `runtime.abi_once` is the
+// measured activation condition for a `#[symbol]` body ("its module is
+// imported AND codegen emits an extern reference to that name"), and every
+// builtin call in this file emits the `pickle_once_*` reference. `abi_once.pkl`
+// closes the wall `abi_sync.pkl`'s header reserved for this family: `once_run`
+// takes a closure, and the ported `abiOnceRun` calls it through a plain
+// function-type parameter (no `call_closure0` seam).
+//
+// Under `pickle run` the import binds the calls to the ported bodies; the
+// transcript printed here must stay byte-identical to the native run (GATE6's
+// `pklc_irx` arm compiles this shape with the prelinked port and irx-runs it,
+// GATE12/12b's AOT arms link the Rust archive, and all three must match the
+// Rust `pickle run` oracle and each other).
+//
+// NO FATAL: no `once_*` call ever names a wrong-kind or unknown handle (the
+// `fatal: pickle: handle {n} is not a once` path is covered by the standalone
+// `sl_once_kindonce` probe).
+
+import { abiOnceNew } from runtime.abi_once
+
+fn main() {
+    var o = once_new()
+    println(once_run(o, fn () { println("body one") }))
+    println(once_run(o, fn () { println("body one again") }))
+    println(once_done(o))
+    var p = once_new()
+    println(once_done(p))
+    println(once_run(p, fn () { println("body two") }))
+    println(once_done(p))
+    println(once_done(o))
+    println("once ok")
+}

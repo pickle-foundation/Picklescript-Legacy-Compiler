@@ -106,3 +106,34 @@ function Invoke-Artifact([string]$builder, [string]$source, [string]$lib, [strin
     }
     return $false
 }
+
+# Pickle-built runtime archive in place of the Rust combined.lib (which needs
+# cargo tools\build_combined_lib.ps1). pickle\cli/rtlib.pkl is AOT-built to a
+# driver, then lowers every pickle\runtime member to COFF and packs them into one
+# GNU .ar (tools\diff\rtlib.ar) — the exact archive build.pkl/run.pkl link against.
+# It is stamp-gated on the driver tree (compiler+cli+stdlib) plus the runtime
+# member sources, so it only rebuilds when any input changed. Returns the archive
+# path, or $null when the driver build or the archive write fails.
+$rtlibArchive = "tools\diff\rtlib.ar"
+$rtlibDriver = "tools\diff\port\pklc_rtlib.exe"
+$rtlibRuntimeDir = "pickle\runtime"
+
+function Get-RtlibArchive() {
+    if (-not (Invoke-BuildDriver "pickle\cli\rtlib.pkl" $rtlibDriver)) {
+        Write-Output "RTLIB-ARCHIVE: driver build failed"
+        return $null
+    }
+    $stamp = "$rtlibArchive.hash"
+    $want = (Get-DriverHash) + "|" + (Get-TreeHash @("$rtlibRuntimeDir"))
+    if ((Test-Path -LiteralPath $rtlibArchive) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
+        return $rtlibArchive
+    }
+    Write-Output "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir)"
+    $null = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive)
+    if (Test-Path -LiteralPath $rtlibArchive) {
+        Set-Content -LiteralPath $stamp -Value $want -NoNewline
+        return $rtlibArchive
+    }
+    Write-Output "RTLIB-ARCHIVE: write failed"
+    return $null
+}

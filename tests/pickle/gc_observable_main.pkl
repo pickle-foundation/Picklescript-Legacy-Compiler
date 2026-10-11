@@ -1,8 +1,16 @@
 module main
 
 fn main() {
-    println("allocations since gc:", gcAllocationsSinceGc())
-    println("bytes since gc:", gcBytesSinceGc())
+    // Do not print absolute counter magnitudes here. In the ported (rust-free)
+    // runtime, gcAllocationsSinceGc/gcBytesSinceGc count the runtime's own
+    // plumbing too — every stream/static/env object is built as a pickle
+    // object through the engine and is indistinguishable from a program
+    // object — while the JIT's plumbing is Rust-side and never counted. The
+    // ABSOLUTE baselines therefore differ structurally (selfhost reports
+    // thousands of startup allocations, JIT reports near zero), even for a
+    // bracketed delta, because the plumbing keeps allocating while the test
+    // runs. Only counter MOVEMENT is contractual, so all assertions below are
+    // boolean behavior checks that hold identically on both runtimes.
     println("collection count:", gcCollectionCount())
 
     // A list forces real object allocations, so both counters must move.

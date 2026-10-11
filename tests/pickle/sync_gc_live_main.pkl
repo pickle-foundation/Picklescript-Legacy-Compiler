@@ -1,0 +1,41 @@
+// The sovereign live-bytes seam probe: end-to-end on the reclamation-gate
+// sweepability registry (phase 2a). The ported object-makers register every
+// managed object they create (`abiRegisterObject` in abi_raw); this main runs
+// that traffic and prints the registered count and byte totals around a
+// collect, where `abiGcCollect` sets its live figure from the registry.
+//
+// Byte-parity discipline: three drivers (Rust `pickle run` / ported AOT /
+// ported irx) must print identically. The transcript snapshots each figure
+// before the printed line interpolates it, so the string machinery's own
+// registrations never leak into a printed delta.
+
+import { abiGcCollect } from runtime.abi_gc
+import { abiRegisteredCount, abiRegisteredBytes } from runtime.abi_raw
+import { listNew, abiListPush } from runtime.abi_list
+import { abiBoxI64 } from runtime.abi_box
+
+fn main() {
+    var c0 = abiRegisteredCount()
+    var b0 = abiRegisteredBytes()
+    var all = listNew(0)
+    abiListPush(all, abiBoxI64(11))
+    abiListPush(all, abiBoxI64(22))
+    var c1 = abiRegisteredCount()
+    var b1 = abiRegisteredBytes()
+    var dc1 = c1 - c0
+    var db1 = b1 - b0
+    println("made: count {dc1} bytes {db1}")
+    abiGcCollect(true)
+    var c2 = abiRegisteredCount()
+    var b2 = abiRegisteredBytes()
+    var dc2 = c2 - c0
+    var db2 = b2 - b0
+    println("live after collect: count {dc2} bytes {db2}")
+    abiGcCollect(false)
+    var c3 = abiRegisteredCount()
+    var b3 = abiRegisteredBytes()
+    var dc3 = c3 - c0
+    var db3 = b3 - b0
+    println("live after second: count {dc3} bytes {db3}")
+    println("registry seam ok")
+}

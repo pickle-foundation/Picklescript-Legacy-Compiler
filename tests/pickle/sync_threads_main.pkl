@@ -1,0 +1,43 @@
+// The sovereign thread parity probe: exercises the freestanding-observable
+// thread surface (count, finished, panic_message, sleep_ms, yield) through the
+// *builtin* spellings, exactly as `thread_main.pkl` does for the native bodies.
+//
+// The one difference is the import below: importing `runtime.abi_threads`
+// activates all eight ported thread `#[symbol]` bodies. `abi_threads.pkl`
+// closes the wall `abi_sync.pkl`'s header reserved for this family and mirrors
+// the nostd reference, whose observable surface this file calls.
+//
+// WHAT IS (AND ISN'T) HERE. The parity battery links every `*_main.pkl`
+// against the freestanding (nostd) archive, where `spawn`/`join` do not exist
+// (`TASKS` is std-only), so this probe never spawns or joins. `current` is
+// also absent on purpose: the port reports the divergence 0 (no collector
+// registry) where the nostd native body reports the registry id, so printing
+// it would break the byte parity honest probes rely on. The remaining surface
+// - count, finished, panic_message, sleep_ms, yield - is printed and must be
+// byte-identical on every arm.
+//
+// Under `pickle run` the import binds the calls to the ported bodies; GATE6's
+// `pklc_irx` arm compiles this shape with the prelinked port and irx-runs it,
+// GATE12/12b's AOT arms link the Rust archive, and all three must match the
+// Rust `pickle run` oracle and each other.
+//
+// NO FATAL: thread bodies never report a wrong-kind or unknown handle.
+
+import { abiThreadCount } from runtime.abi_threads
+
+fn main() {
+    println(thread_count())
+    println(thread_finished(0))
+    println(thread_finished(999))
+    let m = thread_message(0)
+    if (let some(_m) = m) {
+        println("msg=some")
+    } else {
+        println("msg=null")
+    }
+    sleep_ms(7)
+    println("slept")
+    thread_yield()
+    println("yielded")
+    println("threads ok")
+}

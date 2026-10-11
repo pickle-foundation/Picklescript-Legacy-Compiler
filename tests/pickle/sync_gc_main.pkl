@@ -1,0 +1,56 @@
+// The sovereign GC seam probe: exercises the allocation-event counters of
+// `runtime.abi_gc`/`runtime.abi_raw` end-to-end. This is the first measured
+// slice of the real-reclamation gate: the port's `abiRawAlloc` records every
+// block it hands out (count and bytes), `abiGcAllocationsSinceGc`/
+// `abiGcBytesSinceGc` read those seam counters, and a ported `abiGcCollect`
+// zeroes them while advancing the collection count.
+//
+// Why the transcript uses snapshots: `println` formatting itself allocates
+// (the image's string machinery), so a post-collect integer is captured before
+// the printed line rebuilds an interpolated string. The deltas around the list
+// construction are order-independent the same way.
+//
+// Under `pickle run` the imports bind the calls to the ported bodies; GATE6's
+// `pklc_irx` arm compiles this shape with the prelinked port and irx-runs it,
+// GATE12/12b's AOT arms link the Rust archive, and all three must match the
+// Rust `pickle run` oracle and each other.
+
+import { abiGcAllocationsSinceGc, abiGcBytesSinceGc, abiGcCollectionCount, abiGcCollect } from runtime.abi_gc
+import { listNew, abiListPush } from runtime.abi_list
+import { abiBoxI64 } from runtime.abi_box
+
+fn main() {
+    // A known amount of ported allocation traffic: one empty list (object +
+    // backing span) plus two boxed ints pushed into it.
+    var a0 = abiGcAllocationsSinceGc()
+    var b0 = abiGcBytesSinceGc()
+    var all = listNew(0)
+    abiListPush(all, abiBoxI64(42))
+    abiListPush(all, abiBoxI64(43))
+    var a1 = abiGcAllocationsSinceGc()
+    var b1 = abiGcBytesSinceGc()
+    var da = a1 - a0
+    var db = b1 - b0
+    println("allocated: {da}")
+    println("bytes: {db}")
+
+    // A mirrored collection advances the count and resets the seam counters,
+    // exactly native's observable post-cycle accounting.
+    var c0 = abiGcCollectionCount()
+    abiGcCollect(true)
+    var dc = abiGcCollectionCount() - c0
+    var pa = abiGcAllocationsSinceGc()
+    var pb = abiGcBytesSinceGc()
+    println("collected: {dc}")
+    println("alloc after collect: {pa}")
+    println("bytes after collect: {pb}")
+
+    // A fresh list after the reset shows the counters moving again.
+    var fresh = listNew(0)
+    abiListPush(fresh, abiBoxI64(7))
+    var fa = abiGcAllocationsSinceGc()
+    var fb = abiGcBytesSinceGc()
+    println("alloc count now: {fa}")
+    println("byte count now: {fb}")
+    println("gc seam ok")
+}
