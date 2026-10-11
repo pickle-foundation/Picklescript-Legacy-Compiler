@@ -110,6 +110,30 @@ fn rejects_assign_to_immutable() {
 }
 
 #[test]
+fn fn_local_shadows_global_on_assignment() {
+    // Regression: `check_assign` resolved `Ident` targets against session-wide
+    // globals BEFORE the fn-local scope, while reads (`ident_ty`) and the
+    // emitter are locals-first. A same-named top-level `var` (here `pending`)
+    // therefore hijacked assignments to an unrelated fn-local and produced a
+    // bogus type error (E0308), or worse, silently typed against the global.
+    // Lexical scope must win on both sides of the read/write asymmetry.
+    let d = check_str(
+        r#"var pending: int = 0
+
+fn main() {
+    var pending: string?
+    pending = "assigned to the local, not the global"
+    println(pending)
+}"#,
+    );
+    assert!(
+        !has_errors(&d),
+        "expected a clean compile (local shadows global on assignment), got:\n{}",
+        error_msgs(&d)
+    );
+}
+
+#[test]
 fn accepts_option_flows() {
     let d = check_str(
         r#"fn maybe() -> int? {

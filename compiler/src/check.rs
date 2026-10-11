@@ -4162,7 +4162,39 @@ if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
         let moved_from = self.manual_move_source(value);
         match &target.kind {
             ExprKind::Ident(name) => {
-// A top-level `var` is assignable by name from anywhere in the
+                // Lexical scope wins: a fn-local (or parameter) shadows
+                // session-wide globals by name, matching both `ident_ty`
+                // (reads) and the emitter (writes). `resolved.globals`
+                // spans every module in the compile session, so without
+                // this ordering a same-named global in an imported module
+                // would hijack assignments to an unrelated local.
+                if let Some(l) = self.lookup(name).cloned() {
+                    if !l.mutable {
+                        self.err(
+                            target.span,
+                            format!("cannot assign to immutable binding `{name}`"),
+                        );
+                    }
+                    if l.manual {
+                        self.err_note(
+                            target.span,
+                            format!("cannot overwrite `#[manualAlloc]` binding `{name}`"),
+                            format!("`free()` `{name}` first, then bind a new value with `let`"),
+                        );
+                    } else if let Some(src) = &moved_from {
+                        self.err_note(
+                            target.span,
+                            format!(
+                                "cannot assign `#[manualAlloc]` value `{src}` to managed binding `{name}`"
+                            ),
+                            format!("take ownership with `#[manualAlloc] let ... = {src}`, or `{src}.free()`"),
+                        );
+                    }
+                    self.check_assignable(&l.ty, &vt, target.span, "assignment");
+                    self.guard_stored_ref(&l.ty, &vt, target.span, "an assignment");
+                    return Ty::Empty;
+                }
+                // A top-level `var` is assignable by name from anywhere in the
                 // module; there is no shadow-frame entry to consult.
                 if let Some(g) = self.resolved.globals.iter().find(|g| g.name == *name) {
                     // `vt` is the type of `value` computed once above; checking
@@ -4181,78 +4213,42 @@ if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
                     );
                     return Ty::Empty;
                 }
-                match self.lookup(name).cloned() {
-                    Some(l) => {
-                        if !l.mutable {
-                            self.err(
-                                target.span,
-                                format!("cannot assign to immutable binding `{name}`"),
-                            );
-                        }
-                        if l.manual {
-                            self.err_note(
-                                target.span,
-                                format!("cannot overwrite `#[manualAlloc]` binding `{name}`"),
-                                format!(
-                                    "`free()` `{name}` first, then bind a new value with `let`"
-                                ),
-                            );
-                        } else if let Some(src) = &moved_from {
-                            self.err_note(
-                                target.span,
-                                format!(
-                                    "cannot assign `#[manualAlloc]` value `{src}` to managed binding `{name}`"
-                                ),
-                                format!("take ownership with `#[manualAlloc] let ... = {src}`, or `{src}.free()`"),
-                            );
-                        }
-                        self.check_assignable(&l.ty, &vt, target.span, "assignment");
-                        self.guard_stored_ref(&l.ty, &vt, target.span, "an assignment");
-                    }
-                    None => {
-                        // Implicit receiver field assignment: `count = x`
-                        // inside a class body writes `this.count`.
-                        if let Some(st) = &self.self_ty {
-                            if let Some((cn, args_map)) = self.type_key(st) {
-                                if let Some(f) = self.find_field(&cn, name, &args_map) {
-                                    if !f.0.mutable {
-                                        self.err(
-                                            target.span,
-                                            format!("cannot assign to immutable field `{name}`"),
-                                        );
-                                    }
-                                    if f.0.manual {
-                                        self.consume_into_owned(
-                                            value,
-                                            target.span,
-                                            &format!("owned field `{name}`"),
-                                        );
-                                    } else if let Some(src) = &moved_from {
-                                        self.err_note(
-                                            target.span,
-                                            format!(
-                                                "cannot store `#[manualAlloc]` value `{src}` in managed field `{name}`"
-                                            ),
-                                            "an owned value must stay in an owned position",
-                                        );
-                                    }
-                                    self.check_assignable(&f.0.ty, &vt, target.span, "assignment");
-                                    self.guard_stored_ref(
-                                        &f.0.ty,
-                                        &vt,
-                                        target.span,
-                                        "an assignment",
-                                    );
-                                    return Ty::Empty;
-                                }
+                // Implicit receiver field assignment: `count = x`
+                // inside a class body writes `this.count`.
+                if let Some(st) = &self.self_ty {
+                    if let Some((cn, args_map)) = self.type_key(st) {
+                        if let Some(f) = self.find_field(&cn, name, &args_map) {
+                            if !f.0.mutable {
+                                self.err(
+                                    target.span,
+                                    format!("cannot assign to immutable field `{name}`"),
+                                );
                             }
+                            if f.0.manual {
+                                self.consume_into_owned(
+                                    value,
+                                    target.span,
+                                    &format!("owned field `{name}`"),
+                                );
+                            } else if let Some(src) = &moved_from {
+                                self.err_note(
+                                    target.span,
+                                    format!(
+                                        "cannot store `#[manualAlloc]` value `{src}` in managed field `{name}`"
+                                    ),
+                                    "an owned value must stay in an owned position",
+                                );
+                            }
+                            self.check_assignable(&f.0.ty, &vt, target.span, "assignment");
+                            self.guard_stored_ref(&f.0.ty, &vt, target.span, "an assignment");
+                            return Ty::Empty;
                         }
-                        self.err(
-                            target.span,
-                            format!("cannot assign to undeclared name `{name}`"),
-                        );
                     }
                 }
+                self.err(
+                    target.span,
+                    format!("cannot assign to undeclared name `{name}`"),
+                );
             }
             ExprKind::Unary {
                 op: UnOp::Deref,
