@@ -433,5 +433,18 @@ $g16fails = @($g16out | Select-String -Pattern "^FAIL ").Count
 Write-Output "SOVEREIGN BUILDRUN (rust-free build+run, steps=$($g16pass + $g16fails)): PASS=$g16pass FAIL=$g16fails"
 if ($g16fail -ne 0) { Write-Output "sovereign_buildrun.ps1 failed (exit $g16fail)" }
 
+# ---- Self-host: the pickle toolchain reproduces itself (Rust is a seed only).
+# With a pickle seed present (tools\selfhost.ps1 -SeedOnly), every driver above is
+# built by the seed instead of the Rust cli, and this gate proves the seed rebuilds
+# the build driver byte-identically and reproduces the runtime archive. Without a
+# seed the toolchain is on the Rust provider; the gate reports that and passes. ----
+$g17out = & (Join-Path $PSScriptRoot "selfhost_gate.ps1") 2>&1
+$g17fail = $LASTEXITCODE
+$g17out | ForEach-Object { Write-Output $_ }
+$g17pass = @($g17out | Select-String -Pattern "^PASS ").Count
+$g17fails = @($g17out | Select-String -Pattern "^FAIL ").Count
+Write-Output "SELFHOST (pickle seed fixed-point + rt-archive, steps=$($g17pass + $g17fails)): PASS=$g17pass FAIL=$g17fails"
+if ($g17fail -ne 0) { Write-Output "selfhost_gate.ps1 failed (exit $g17fail)" }
+
 $batterySw.Stop()
 Write-Output "===== BATTERY COMPLETE ($([math]::Round($batterySw.Elapsed.TotalMinutes, 2)) min) ====="

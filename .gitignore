@@ -24,6 +24,22 @@
 !/tools/diff/testrunner_golden_main.pkl
 !/tools/diff/testrunner_golden.txt
 
+# Frozen Rust oracles (IR/IRX/lex pairs + their source stamp). Committed as a single
+# compressed bundle: 35 MB of derived IR text is not worth committing raw. A clean
+# checkout has only tools/diff/oracle.zip; tools/battery_prep.ps1 extracts it (into the
+# gitignored tools/diff/oracle/) and uses the files verbatim when the oracle source hash
+# is unchanged - so prepping works with no Rust cli and a source edit is detected.
+/tools/diff/oracle/
+!/tools/diff/oracle.zip
+
+# Pickle self-host seed: a pickled `build` driver that builds every AOT driver in the
+# battery with no Rust (tools/selfhost.ps1 genesis). Committed so a clean checkout is
+# Rust-free; the runtime archive it links against is committed too.
+!/tools/diff/selfhost/
+/tools/diff/selfhost/*
+!/tools/diff/selfhost/seed.exe
+!/tools/diff/rtlib.ar
+
 # Editors
 .vscode/
 .idea/

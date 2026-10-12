@@ -3,7 +3,24 @@
 # Fast byte-equality via SHA256, content-hash stamps for incremental driver
 # rebuilds and oracle regeneration, and the reseeding logic both scripts use.
 
-$batteryCommonCli = (Resolve-Path "target\debug\pickle-cli.exe").Path
+# The Rust cli is the bootstrap/genesis tool and the behaviour oracle. It is not
+# required once a pickle seed exists and the oracles are frozen, so a missing cli
+# is not an error here; callers that truly need it check Test-Path themselves.
+$batteryCommonCli = "target\debug\pickle-cli.exe"
+if (Test-Path -LiteralPath $batteryCommonCli) { $batteryCommonCli = (Resolve-Path $batteryCommonCli).Path }
+
+# Pickle self-host seed: a pickled `build` driver (pickle\cli\build.pkl compiled by
+# the pickle toolchain, linked against the pickle runtime archive, so it runs on the
+# PICKLE runtime). When the seed and the archive it links against both exist, every
+# AOT driver below is built by the seed instead of the Rust cli, so Rust leaves the
+# driver loop. Create the pair once with `tools\selfhost.ps1` (genesis); delete the
+# seed to fall back to the Rust cli. Absence of the seed keeps the old behaviour.
+$selfhostSeed = "tools\diff\selfhost\seed.exe"
+$selfhostArchive = "tools\diff\rtlib.ar"
+
+function Test-SelfHostSeed {
+    (Test-Path -LiteralPath $selfhostSeed) -and (Test-Path -LiteralPath $selfhostArchive)
+}
 
 # Run a native command with its output discarded, leaving the caller's
 # $ErrorActionPreference untouched. Under "Stop" a native stderr line forwarded via
@@ -29,7 +46,10 @@ function ByteEq([string]$a, [string]$b) {
 }
 
 # Incremental SHA256 over a set of files, sorted by relative path so the result
-# is stable across runs on the same tree content.
+# is stable across runs on the same tree content. The Rust cli is deliberately NOT
+# folded in: these hashes gate driver/artifact rebuilds and must be identical whether
+# or not a Rust toolchain is present (a Rust-free checkout with a pickle seed reuses
+# the same stamps). Provider identity is folded in explicitly where it matters.
 function Get-TreeHash([string[]]$dirs) {
     $files = @()
     foreach ($d in $dirs) {
@@ -41,10 +61,6 @@ function Get-TreeHash([string[]]$dirs) {
     foreach ($f in ($files | Sort-Object FullName)) {
         $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
         $null = $hasher.TransformBlock($bytes, 0, $bytes.Length, $null, 0)
-    }
-    if ((Test-Path -LiteralPath $batteryCommonCli)) {
-        $cliBytes = [System.IO.File]::ReadAllBytes($batteryCommonCli)
-        $null = $hasher.TransformBlock($cliBytes, 0, $cliBytes.Length, $null, 0)
     }
     $null = $hasher.TransformFinalBlock([byte[]]@(), 0, 0)
     [BitConverter]::ToString($hasher.Hash).Replace("-", "").ToLowerInvariant()
@@ -62,15 +78,35 @@ function Get-PrepHash { Get-TreeHash $batteryPrepDirs }
 
 function Get-DriverHash { Get-TreeHash $batteryDriverDirs }
 
+# Inputs the frozen IR/IRX/lex oracles are derived from: the 13 self targets
+# (pickle\compiler + pickle\cli) and the battery sources the lex oracles cover.
+# pickle\runtime and stdlib are excluded: no oracle in tools/battery_prep.ps1
+# depends on them.
+$batteryOracleDirs = @("pickle\compiler", "pickle\cli", "tests\pickle")
+
+function Get-OracleHash { Get-TreeHash $batteryOracleDirs }
+
 # Build an AOT driver unless a stamp next to it proves the embedded sources are
 # unchanged since it was last built. Returns $true when the exe exists afterwards.
+# The stamp folds in the build provider (self-host seed vs Rust cli), so switching
+# between them invalidates stale drivers instead of reusing the wrong runtime.
 function Invoke-BuildDriver([string]$src, [string]$out) {
     $stamp = "$out.hash"
-    $want = Get-DriverHash
+    if (Test-SelfHostSeed) {
+        $want = (Get-DriverHash) + "|selfhost:" + (Get-FileHash -LiteralPath $selfhostSeed -Algorithm SHA256).Hash
+    } else {
+        $provider = ""
+        if (Test-Path -LiteralPath $batteryCommonCli) { $provider = "|rust:" + (Get-FileHash -LiteralPath $batteryCommonCli -Algorithm SHA256).Hash }
+        $want = (Get-DriverHash) + $provider
+    }
     if ((Test-Path -LiteralPath $out) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
         return $true
     }
-    $null = Invoke-NativeQuiet $batteryCommonCli @("build", $src, "-o", $out)
+    if (Test-SelfHostSeed) {
+        $null = Invoke-NativeQuiet $selfhostSeed @($src, $selfhostArchive, $out)
+    } else {
+        $null = Invoke-NativeQuiet $batteryCommonCli @("build", $src, "-o", $out)
+    }
     if (Test-Path -LiteralPath $out) {
         Set-Content -LiteralPath $stamp -Value $want -NoNewline
         return $true
