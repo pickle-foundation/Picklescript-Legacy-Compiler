@@ -14,7 +14,8 @@
 # with unchanged inputs is instant.
 
 $ErrorActionPreference = "Continue"
-$env:PKL_NO_AUTO_GC = "1"
+# UNPINNED: the port's shadow frames make the automatic collector safe here.
+Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
 . (Join-Path $PSScriptRoot "battery_common.ps1")
 
 function Get-Sha([string]$path) {

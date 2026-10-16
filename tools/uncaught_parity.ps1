@@ -24,11 +24,14 @@ achieved by both sides being wrong in the same way:
   exit 0, stderr empty                              uncaught_none_clean
 
 .PARAMETER SelfhostLink
-Link with the self-hosted linker against the PICKLE runtime archive
-(tools\diff\rtlib.ar, every pickle\runtime member lowered to COFF by
-pickle\cli/rtlib.pkl) instead of `rustc` and a shim. Exercises
-`pickle\compiler/linker.pkl` rather than the Rust toolchain — no cargo,
-no combined.lib.
+Link with the self-hosted linker against the PICKLE runtime DIRECTORY
+(pickle\runtime, whose members are themselves pickle `#[symbol]` bodies) instead
+of `rustc` and a shim. This is the battery path and it runs with NO Rust cli:
+the selfhost linker (pickle\cli/selflink.pkl, AOT-built by the pickle seed)
+compiles+links each fixture, and the reference behaviour is read from FROZEN
+goldens (tools\diff\golden\uncaught\<stem>.{out,err,exit}, captured by
+tools\capture_goldens.ps1 from `pickle-cli run`). No cargo, no combined.lib, no
+Rust oracle in the loop.
 
 .PARAMETER Filter
 Only run fixtures whose name contains this substring.
@@ -39,14 +42,18 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+# UNPINNED: the port's shadow frames root reachable managed homes, so the
+# automatic collector is safe under heavy compile workloads. (PKL_NO_AUTO_GC
+# remains available for debugging.)
+Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
 $Root = "C:\Users\vilni\Desktop\PickleScript"
 $Cli  = "$Root\target\debug\pickle-cli.exe"
 $Temp = "C:\Users\vilni\AppData\Local\Temp\opencode\uncaught"
 $Work = Join-Path $Temp "work"
 
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
-
-if (-not (Test-Path $Cli)) { Write-Output "CLI NOT FOUND: $Cli (run: cargo build -p pickle-cli)"; exit 1 }
+Set-Location -LiteralPath $Root
+. (Join-Path $Root "tools\battery_common.ps1")
 
 # Run a program, capturing all three channels separately and byte-exactly.
 # Start-Process redirection is used rather than PowerShell's own, which would
@@ -86,13 +93,27 @@ function Show([byte[]]$b) {
     return (($b | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { "<0x{0:X2}>" -f $_ } }) -join '')
 }
 
+function Read-Bytes([string]$p) {
+    if (Test-Path -LiteralPath $p) { [System.IO.File]::ReadAllBytes($p) } else { [byte[]]@() }
+}
+
 # ---- link inputs, built once for every fixture ------------------------------
-$rtRlib = $null
-$Combined = $null
+$slDriver = $null; $rtdir = $null; $rtRlib = $null
 if ($SelfhostLink) {
-    $Combined = Join-Path $Root "tools\diff\rtlib.ar"
-    if (-not (Test-Path $Combined)) { Write-Output "RUNTIME ARCHIVE NOT FOUND: $Combined (run tools\battery_full.ps1, which builds it via rtlib.pkl)"; exit 1 }
+    # Port selfhost linker: AOT-built by the pickle seed, links against the PICKLE
+    # runtime DIRECTORY. No Rust cli, no rtlib.ar, no cargo.
+    $slDriver = "tools\diff\port\pklc_selflink.exe"
+    if (-not (Invoke-BuildDriver "pickle\cli\selflink.pkl" $slDriver)) {
+        Write-Output "SELFHOST LINKER DRIVER BUILD FAILED: $slDriver"
+        exit 1
+    }
+    $rtdir = (Resolve-Path "pickle\runtime").Path
+    if (-not (Test-Path -LiteralPath "$goldenDir\uncaught")) {
+        Write-Output "UNCAUGHT GOLDENS MISSING: $goldenDir\uncaught (run tools\capture_goldens.ps1)"
+        exit 1
+    }
 } else {
+    if (-not (Test-Path $Cli)) { Write-Output "CLI NOT FOUND: $Cli (run: cargo build -p pickle-cli)"; exit 1 }
     $rtDir = Join-Path $Work "rt"
     Push-Location $Root
     try {
@@ -157,32 +178,43 @@ foreach ($f in $fixtures) {
     $stem = $f.BaseName
     $probe = Join-Path $Work $stem
     New-Item -ItemType Directory -Force -Path $probe | Out-Null
-
-    # ---- native ----
-    $nat = Invoke-Captured -Exe $Cli -ExeArgs @("run", $f.FullName) -WorkingDir $Root -Tag "nat_$stem"
-
-    # ---- self-host: source -> IR -> x64 -> COFF ----
-    $drv = & $Cli run pickle\cli\x64_real_run.pkl -- $f.FullName $probe 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
-        Write-Output "FAIL $stem : lowering failed"
-        Write-Output ($drv -join "`n")
-        $fail++
-        continue
-    }
-    $obj = Join-Path $probe "funcs.obj"
-    if (-not (Test-Path $obj)) { Write-Output "FAIL $stem : no funcs.obj"; $fail++; continue }
-
-    # ---- link ----
     $exe = Join-Path $probe "$prefix.exe"
+    Remove-Item -LiteralPath $exe -ErrorAction SilentlyContinue
+
     if ($SelfhostLink) {
-        $lk = & $Cli run pickle\compiler\linker.pkl -- $obj $Combined $exe 2>&1
-        if ($LASTEXITCODE -ne 0 -or (($lk -join "`n") -notmatch "LINKER WROTE")) {
-            Write-Output "FAIL $stem : selfhost link failed"
-            Write-Output ($lk -join "`n")
+        # ---- native reference: FROZEN golden (no Rust cli) ----
+        $nat = [pscustomobject]@{
+            Exit   = [int](Get-Content -LiteralPath "$goldenDir\uncaught\$stem.exit" -Raw)
+            StdOut = Read-Bytes "$goldenDir\uncaught\$stem.out"
+            StdErr = Read-Bytes "$goldenDir\uncaught\$stem.err"
+        }
+        # ---- self-host: compile+link with the pickle selfhost linker ----
+        $linkLog = Join-Path $probe "link.txt"
+        $lrc = Invoke-NativeTimeout $slDriver @($f.FullName, $exe, $rtdir) $linkLog 300
+        $linkOut = @(Get-Content -LiteralPath $linkLog -ErrorAction SilentlyContinue)
+        $unres = @($linkOut | Select-String "SELFLINK UNRESOLVED").Count
+        $okLine = @($linkOut | Select-String "^SELFLINK OK:").Count
+        if ($lrc -ne 0 -or $unres -ne 0 -or $okLine -ne 1 -or (($linkOut -join "`n") -match "SELFLINK FAIL") -or -not (Test-Path -LiteralPath $exe)) {
+            Write-Output "FAIL $stem : selfhost link failed (rc=$lrc unresolved=$unres ok=$okLine)"
+            Write-Output ($linkOut -join "`n")
             $fail++
             continue
         }
     } else {
+        # ---- native ----
+        $nat = Invoke-Captured -Exe $Cli -ExeArgs @("run", $f.FullName) -WorkingDir $Root -Tag "nat_$stem"
+
+        # ---- self-host: source -> IR -> x64 -> COFF ----
+        $drv = & $Cli run pickle\cli\x64_real_run.pkl -- $f.FullName $probe 2>&1
+        if ($LASTEXITCODE -ne 0 -or (($drv -join "`n") -notmatch "X64REAL OK")) {
+            Write-Output "FAIL $stem : lowering failed"
+            Write-Output ($drv -join "`n")
+            $fail++
+            continue
+        }
+        $obj = Join-Path $probe "funcs.obj"
+        if (-not (Test-Path $obj)) { Write-Output "FAIL $stem : no funcs.obj"; $fail++; continue }
+
         & rustc (Join-Path $Work "main_shim.rs") --edition 2021 -C opt-level=2 -C panic=abort `
             "--extern=pickle_runtime=$rtRlib" "-C" "link-arg=$obj" -o $exe *> $null
         if ($LASTEXITCODE -ne 0) { Write-Output "FAIL $stem : rustc link failed"; $fail++; continue }

@@ -3,11 +3,12 @@
 # GATE12/12b build + run every battery main against the PICKLE runtime archive
 # (tools\diff\rtlib.ar, built by pickle\cli/rtlib.pkl), so the battery needs no
 # cargo and no combined.lib. This gate goes still deeper: each main is lowered and
-# linked by the pickle selfhost linker (pickle\cli\selflink.pkl) directly against
+# linked by the pickle selfhost linker (pickle\cli/selflink.pkl) directly against
 # the PICKLE runtime DIRECTORY (pickle\runtime) — members are themselves pickle
 # `#[symbol]` bodies, and no archive step happens at all. The producted exe is then
-# run and its stdout+exit byte-compared to the Rust JIT
-# oracle (`pickle-cli run`), exactly like GATE12.
+# run and its stdout+exit byte-compared to the FROZEN `pickle run` golden
+# (tools\diff\golden\run\<name>.{out,exit}), exactly like GATE12 — so no Rust cli is
+# needed at run time.
 #
 # Default runs a representative subset covering every runtime member category
 # (box/print, strings, maps+alloc, threads/sync, fs/io, os/process, plus the
@@ -28,10 +29,13 @@ param(
     [switch]$All
 )
 $ErrorActionPreference = "Stop"
+# UNPINNED: the port's shadow frames root reachable managed homes, so the
+# automatic collector is safe under heavy compile workloads. (PKL_NO_AUTO_GC
+# remains available for debugging.)
+Remove-Item Env:PKL_NO_AUTO_GC -ErrorAction SilentlyContinue
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Root
 . (Join-Path $PSScriptRoot "battery_common.ps1")
-$cli = (Resolve-Path "target\debug\pickle-cli.exe").Path
 $sl = "pickle\cli\selflink.pkl"
 $rt = (Resolve-Path "pickle\runtime").Path
 
@@ -72,17 +76,16 @@ foreach ($name in $Targets) {
         Cert "$name rust-free-link" $false "unresolved=$unres ok=$okLine $un"
         continue
     }
-    # run ported exe vs oracle, battery-style (stdout to file, capture exit)
-    $prt = Join-Path $work "p.txt"; $ort = Join-Path $work "o.txt"
-    Remove-Item $prt, $ort -ErrorAction SilentlyContinue
-    cmd /c "`"$exe`" > `"$prt`" 2>nul"
-    $prc = $LASTEXITCODE
-    cmd /c "`"$cli`" run `"$target`" > `"$ort`" 2>nul"
-    $orc = $LASTEXITCODE
-    $p = [System.IO.File]::ReadAllText($prt)
-    $o = [System.IO.File]::ReadAllText($ort)
-    $eq = ($prc -eq $orc -and $p -eq $o)
-    Cert "$name build+run parity" $eq "rc=$prc/$orc len=$($p.Length)/$($o.Length)"
+    # run ported exe vs FROZEN golden, battery-style (stdout to file, capture exit)
+    $prt = Join-Path $work "p.txt"
+    Remove-Item $prt -ErrorAction SilentlyContinue
+    $prc = Invoke-NativeTimeout $exe @() $prt 180
+    $goldOut = "$goldenDir\run\$name.out"
+    $goldExit = "$goldenDir\run\$name.exit"
+    if (-not (Test-Path -LiteralPath $goldOut)) { Cert "$name build+run parity" $false "golden missing ($name)"; continue }
+    $orc = [int](Get-Content -LiteralPath $goldExit -Raw)
+    $eq = ($prc -eq $orc -and (ByteEq $prt $goldOut))
+    Cert "$name build+run parity" $eq "rc=$prc/$orc"
 }
 
 Write-Output "SOVEREIGN BUILDRUN (rust-free build+run, $($Targets.Count) mains): PASS=$pass FAIL=$fail"

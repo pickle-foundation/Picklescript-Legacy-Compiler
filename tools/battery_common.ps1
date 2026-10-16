@@ -34,6 +34,43 @@ function Invoke-NativeQuiet([string]$exe, [string[]]$argv) {
     $code
 }
 
+# Run a native exe to completion or until `timeoutSec` elapses, writing its stdout
+# VERBATIM (raw bytes, no re-encoding) to `outPath` and discarding stderr. On timeout
+# the WHOLE process tree is killed (the AOT run/test drivers spawn a linked child that
+# would otherwise be orphaned and keep the pipe open) and the sentinel 124 is returned.
+#
+# This exists because a mis-compiled or contract-divergent program can hang: e.g. the
+# ported runtime implements the nostd single-thread contract, so a program that blocks
+# on a channel from an inline `thread_spawn` body never wakes. Without a bound, that
+# stalls the entire battery.
+$script:NativeTimeoutExit = 124
+function Invoke-NativeTimeout([string]$exe, [string[]]$argv, [string]$outPath, [int]$timeoutSec) {
+    if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = (Resolve-Path -LiteralPath $exe).Path
+    $psi.Arguments = (($argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outFs = [System.IO.File]::Create($outPath)
+    $errFs = [System.IO.Stream]::Null
+    $copyOut = $proc.StandardOutput.BaseStream.CopyToAsync($outFs)
+    $copyErr = $proc.StandardError.BaseStream.CopyToAsync($errFs)
+    $timedOut = -not $proc.WaitForExit($timeoutSec * 1000)
+    if ($timedOut) {
+        & taskkill /PID $proc.Id /T /F 2>&1 | Out-Null
+        $proc.WaitForExit(5000) | Out-Null
+    }
+    try { $copyOut.Wait(5000) | Out-Null } catch { }
+    try { $copyErr.Wait(5000) | Out-Null } catch { }
+    $code = if ($timedOut) { $script:NativeTimeoutExit } else { $proc.ExitCode }
+    $outFs.Dispose()
+    $proc.Dispose()
+    $code
+}
+
 # Byte equality without the old per-byte PowerShell loop: cheap length check
 # first, then a SHA256 over each file's bytes.
 function ByteEq([string]$a, [string]$b) {
@@ -80,11 +117,32 @@ function Get-DriverHash { Get-TreeHash $batteryDriverDirs }
 
 # Inputs the frozen IR/IRX/lex oracles are derived from: the 13 self targets
 # (pickle\compiler + pickle\cli) and the battery sources the lex oracles cover.
-# pickle\runtime and stdlib are excluded: no oracle in tools/battery_prep.ps1
-# depends on them.
-$batteryOracleDirs = @("pickle\compiler", "pickle\cli", "tests\pickle")
+# pickle\runtime is included: cli/main (a self target) imports runtime.* sources,
+# so those modules are compiled into its IR - a runtime edit shifts its fn indices
+# and must regenerate the oracle. stdlib stays excluded: no oracle depends on it.
+$batteryOracleDirs = @("pickle\compiler", "pickle\cli", "pickle\runtime", "tests\pickle")
 
 function Get-OracleHash { Get-TreeHash $batteryOracleDirs }
+
+# Frozen BEHAVIOUR goldens (run/test/irx/cli) committed as tools\diff\golden.zip and
+# captured by tools\capture_goldens.ps1. They are keyed by the sources they are taken
+# from (the battery mains and the stdlib test suite), NOT by the Rust cli: once frozen
+# they let the battery compare port behaviour without a Rust toolchain.
+$batteryGoldenDirs = @("tests\pickle", "stdlib", "tests\uncaught")
+$goldenDir = "tools\diff\golden"
+$goldenZip = "tools\diff\golden.zip"
+
+function Get-GoldenHash { Get-TreeHash $batteryGoldenDirs }
+
+# Stable filesystem key for a golden's target path: `tests\pickle\foo_test.pkl`
+# becomes `tests_pickle_foo_test`. The `test` goldens embed the very path string
+# they were keyed on, so callers must pass the same spelling used at capture.
+function Get-GoldenKey([string]$path) {
+    $p = $path -replace '\\', '/'
+    if ($p.EndsWith(".pkl")) { $p = $p.Substring(0, $p.Length - 4) }
+    if ($p.StartsWith("./")) { $p = $p.Substring(2) }
+    ($p -replace '[/:]', '_')
+}
 
 # Build an AOT driver unless a stamp next to it proves the embedded sources are
 # unchanged since it was last built. Returns $true when the exe exists afterwards.
@@ -102,6 +160,11 @@ function Invoke-BuildDriver([string]$src, [string]$out) {
     if ((Test-Path -LiteralPath $out) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
         return $true
     }
+    # Remove any previous artefact first: a build tool can exit 0 having written
+    # nothing (mis-typed target, unresolved import), and stamping over a stale exe
+    # would then silently pin the WRONG driver for every later gate. With the exe
+    # gone a failed build returns $false and is retried instead of masked.
+    if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
     if (Test-SelfHostSeed) {
         $null = Invoke-NativeQuiet $selfhostSeed @($src, $selfhostArchive, $out)
     } else {
@@ -156,7 +219,7 @@ $rtlibRuntimeDir = "pickle\runtime"
 
 function Get-RtlibArchive() {
     if (-not (Invoke-BuildDriver "pickle\cli\rtlib.pkl" $rtlibDriver)) {
-        Write-Output "RTLIB-ARCHIVE: driver build failed"
+        Write-Host "RTLIB-ARCHIVE: driver build failed"
         return $null
     }
     $stamp = "$rtlibArchive.hash"
@@ -164,12 +227,12 @@ function Get-RtlibArchive() {
     if ((Test-Path -LiteralPath $rtlibArchive) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)) {
         return $rtlibArchive
     }
-    Write-Output "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir)"
+    Write-Host "RTLIB-ARCHIVE: rebuilding $rtlibArchive ($($rtlibDriver) $rtlibRuntimeDir)"
     $null = Invoke-NativeQuiet $rtlibDriver @($rtlibRuntimeDir, $rtlibArchive)
     if (Test-Path -LiteralPath $rtlibArchive) {
         Set-Content -LiteralPath $stamp -Value $want -NoNewline
         return $rtlibArchive
     }
-    Write-Output "RTLIB-ARCHIVE: write failed"
+    Write-Host "RTLIB-ARCHIVE: write failed"
     return $null
 }
