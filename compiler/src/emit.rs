@@ -6805,8 +6805,87 @@ fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
                     vec![start, end1, one],
                 );
             }
-            AstBinOp::Send | AstBinOp::Is | AstBinOp::In | AstBinOp::Pow => {
-                return self.bad(e.span, "this operator is not lowered yet")
+            AstBinOp::Pow => {
+                let a = self.expr(lhs)?;
+                let b = self.expr(rhs)?;
+                let aty = self.irty(lhs.span).ok();
+                let bty = self.irty(rhs.span).ok();
+                if matches!(aty, Some(IrTy::Float)) || matches!(bty, Some(IrTy::Float)) {
+                    let a = self.coerce_to_float(a, aty);
+                    let b = self.coerce_to_float(b, bty);
+                    return self.extern_call_t1(
+                        "pickle_float_pow",
+                        vec![IrTy::Float, IrTy::Float],
+                        IrTy::Float,
+                        vec![a, b],
+                    );
+                }
+                return self.extern_call_t1(
+                    "pickle_int_pow",
+                    vec![IrTy::Int, IrTy::Int],
+                    IrTy::Int,
+                    vec![a, b],
+                );
+            }
+            AstBinOp::In => {
+                let rt = self.ty_of(&rhs.span);
+                return match rt {
+                    Some(Ty::Map(k, _)) => {
+                        let krep = self.key_rep(k.as_ref(), rhs.span)?;
+                        let m = self.expr(rhs)?;
+                        let v = self.expr(lhs)?;
+                        let vt = self.ty_of(&lhs.span).unwrap_or_else(|| (*k).clone());
+                        let key = self.pack_map_key(&krep, v, &vt, lhs.span)?;
+                        self.extern_call_t1(
+                            "pickle_map_has",
+                            vec![IrTy::Ptr, IrTy::Ptr],
+                            IrTy::Bool,
+                            vec![m, key],
+                        )
+                    }
+                    Some(Ty::List(elem)) => {
+                        let erep = self.elem_rep(elem.as_ref(), rhs.span)?;
+                        let list = self.expr(rhs)?;
+                        let v = self.expr(lhs)?;
+                        let vt = self.ty_of(&lhs.span).unwrap_or_else(|| (*elem).clone());
+                        let needle = self.pack_map_key(&erep, v, &vt, lhs.span)?;
+                        self.extern_call_t1(
+                            "pickle_list_contains",
+                            vec![IrTy::Ptr, IrTy::Ptr],
+                            IrTy::Bool,
+                            vec![list, needle],
+                        )
+                    }
+                    Some(Ty::String) => {
+                        let hay = self.expr(rhs)?;
+                        let needle = self.expr(lhs)?;
+                        self.extern_call_t1(
+                            "pickle_str_contains",
+                            vec![IrTy::Ptr, IrTy::Ptr],
+                            IrTy::Bool,
+                            vec![hay, needle],
+                        )
+                    }
+                    _ => {
+                        return self.bad(
+                            e.span,
+                            "`in` requires a `List`, `Map`, or `string` on the right",
+                        )
+                    }
+                };
+            }
+            AstBinOp::Send => {
+                let ch = self.expr(lhs)?;
+                let v = self.expr(rhs)?;
+                self.extern_call_void(
+                    "pickle_channel_send",
+                    vec![IrTy::Int, IrTy::Int],
+                    vec![ch, v],
+                );
+                return Ok(self.int_const(0));
+            }
+            AstBinOp::Is => {
+                return self.bad(e.span, "the `is` operator is not lowered yet")
             }
             AstBinOp::Add if both_str => {
                 let a = self.expr(lhs)?;
@@ -14176,6 +14255,17 @@ for (id, _, _) in inits {
             callee: Callee::Extern(ex),
             args,
         });
+    }
+
+    /// Widen an `int` value to `float` via `Itof`; a value already `float`
+    /// passes through. Used by `**` when one operand is `float`.
+    fn coerce_to_float(&mut self, v: Temp, ty: Option<IrTy>) -> Temp {
+        if matches!(ty, Some(IrTy::Float)) {
+            return v;
+        }
+        let t = self.temp();
+        self.instr(IrInstr::Itof { dst: t, v });
+        t
     }
 
     fn extern_call_t1(

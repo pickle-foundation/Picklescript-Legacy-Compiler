@@ -236,6 +236,27 @@ pub extern "C" fn pickle_list_insert(
     list_insert(list, index, value);
 }
 
+/// Whether `value` occurs in `list`, comparing elements structurally (the
+/// `in` operator's list arm).
+#[no_mangle]
+pub extern "C" fn pickle_list_contains(
+    list: *const PickleObject,
+    value: *const PickleObject,
+) -> bool {
+    unsafe {
+        let len = list_len(list);
+        let data = list_data(list);
+        let mut i = 0usize;
+        while i < len {
+            if crate::map::value_eq(data.add(i).read(), value) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Sort a list of boxed elements in place, ascending. `kind` picks the
 /// comparison: `0` int/byte/char/bool payloads, `1` float, `2` string.
 #[no_mangle]

@@ -40,6 +40,7 @@ mod heap;
 mod layout;
 mod list;
 mod map;
+mod math;
 mod object;
 mod os;
 mod panic;
@@ -422,6 +423,7 @@ declare_abi! {
     pickle_list_set => crate::list::pickle_list_set,
     pickle_list_sort => crate::list::pickle_list_sort,
     pickle_range => crate::list::pickle_range,
+    pickle_list_contains => crate::list::pickle_list_contains,
 
     pickle_map_get => crate::map::pickle_map_get,
     pickle_map_get_boxed => crate::map::pickle_map_get_boxed,
@@ -432,6 +434,9 @@ declare_abi! {
     pickle_map_remove => crate::map::pickle_map_remove,
     pickle_map_set => crate::map::pickle_map_set,
     pickle_map_values => crate::map::pickle_map_values,
+
+    pickle_int_pow => crate::math::pickle_int_pow,
+    pickle_float_pow => crate::math::pickle_float_pow,
 
     pickle_enum_eq => crate::r#enum::pickle_enum_eq,
     pickle_enum_field => crate::r#enum::pickle_enum_field,
@@ -578,6 +583,7 @@ declare_abi! {
 
     pickle_str_cmp => crate::strings::pickle_str_cmp,
     pickle_str_concat => crate::strings::pickle_str_concat,
+    pickle_str_contains => crate::strings::pickle_str_contains,
     pickle_str_from_bool => crate::strings::pickle_str_from_bool,
     pickle_str_from_byte => crate::strings::pickle_str_from_byte,
     pickle_str_from_bytes => crate::strings::pickle_str_from_bytes,

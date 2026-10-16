@@ -3991,17 +3991,22 @@ if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
                     }
                 }
             }
-            Send => Ty::Unknown,
+            Send => {
+                // `channel <- value` sends and yields no value.
+                Ty::Empty
+            }
             Is => {
                 let _ = lt;
                 let _ = rt;
                 Ty::Bool
             }
             In => {
-                let ot = self.check_expr(lhs);
-                let _ = self.check_expr(rhs);
-                if !matches!(ot, Ty::List(_) | Ty::Map(_, _) | Ty::String) {
-                    let _ = ot;
+                if rt != Ty::Unknown && !matches!(rt, Ty::List(_) | Ty::Map(_, _) | Ty::String) {
+                    self.err_note(
+                        e.span,
+                        "right side of `in` must be a `List`, `Map`, or `string`",
+                        format!("found `{rt}`"),
+                    );
                 }
                 Ty::Bool
             }

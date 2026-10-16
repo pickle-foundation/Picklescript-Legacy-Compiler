@@ -165,6 +165,41 @@ pub extern "C" fn pickle_str_cmp(a: *const PickleObject, b: *const PickleObject)
     string_cmp(a, b) as i64
 }
 
+/// Whether `needle` is a substring of `hay` (the `in` operator's string arm).
+#[no_mangle]
+pub extern "C" fn pickle_str_contains(hay: *const PickleObject, needle: *const PickleObject) -> bool {
+    string_contains(hay, needle)
+}
+
+/// Whether the bytes of `needle` occur as a contiguous run in `hay`. An empty
+/// needle is a substring of every string (the `in` operator's string arm).
+pub fn string_contains(hay: *const PickleObject, needle: *const PickleObject) -> bool {
+    let hay_len = string_bytes_len(hay);
+    let needle_len = string_bytes_len(needle);
+    if needle_len == 0 {
+        return true;
+    }
+    if needle_len > hay_len {
+        return false;
+    }
+    unsafe {
+        let h = string_bytes_ptr(hay);
+        let n = string_bytes_ptr(needle);
+        let mut i = 0usize;
+        while i + needle_len <= hay_len {
+            let mut k = 0usize;
+            while k < needle_len && *h.add(i + k) == *n.add(k) {
+                k += 1;
+            }
+            if k == needle_len {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Copy of `obj` with byte `index` replaced by `v` (a `byte` on the compiler's
 /// `i64` ABI, 0..=255); panics on out-of-range. Strings are immutable, so the
 /// bytes are copied into a fresh object (copy-on-write).

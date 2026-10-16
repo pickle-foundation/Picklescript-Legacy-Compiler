@@ -165,6 +165,14 @@ fn key_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
     }
 }
 
+/// Structural equality of two runtime values (boxed scalars, strings, and
+/// composite objects compare by contents; a cycle falls back to root
+/// identity). Same semantics as map-key equality, exposed for `in`-membership
+/// over a list.
+pub(crate) fn value_eq(a: *const PickleObject, b: *const PickleObject) -> bool {
+    key_eq(a, b)
+}
+
 /// Deep structural hash. `path` holds the ancestor chain so cycles are
 /// detected (a revisit reports `cyclic = true` instead of descending); equal
 /// acyclic structures always produce the same hash.
