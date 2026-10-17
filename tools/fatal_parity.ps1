@@ -34,7 +34,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$Root = "C:\Users\vilni\Desktop\PickleScript"
+$Root = "."
 $Cli  = "$Root\target\debug\pickle-cli.exe"
 $Temp = "C:\Users\vilni\AppData\Local\Temp\opencode\fatalparity"
 $Work = Join-Path $Temp "work"

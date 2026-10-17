@@ -27,7 +27,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$Root = "C:\Users\vilni\Desktop\PickleScript"
+$Root = "."
 . "$Root\tools\raw_capture.ps1"
 
 $fixture = "$Root\tests\stderrstream\stderrstream_main.pkl"

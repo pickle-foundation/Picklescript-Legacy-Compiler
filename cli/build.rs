@@ -36,6 +36,12 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // `-bins` rather than a bare link-arg so this does not try to apply a
         // PE/COFF switch to the test harnesses or any non-binary target.
-        println!("cargo:rustc-link-arg-bins=/STACK:{STACK_RESERVE},{STACK_COMMIT}");
+        // `/STACK:` is an MSVC link.exe switch; the GNU (mingw) linker needs the
+        // same reserve spelled as `-Wl,--stack,<bytes>` and rejects the MSVC form.
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/STACK:{STACK_RESERVE},{STACK_COMMIT}");
+        } else {
+            println!("cargo:rustc-link-arg-bins=-Wl,--stack,{STACK_RESERVE}");
+        }
     }
 }

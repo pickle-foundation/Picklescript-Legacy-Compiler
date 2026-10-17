@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$Root   = "C:\Users\vilni\Desktop\PickleScript"
+$Root   = "."
 $Cli    = "$Root\target\debug\pickle-cli.exe"
 $Gcc    = "C:\Users\vilni\Tools\w64devkit\w64devkit\bin\gcc.exe"
 $Temp   = "C:\Users\vilni\AppData\Local\Temp\opencode\x64real"

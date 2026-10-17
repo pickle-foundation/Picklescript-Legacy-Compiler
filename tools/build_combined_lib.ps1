@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Root = "C:\Users\vilni\Desktop\PickleScript"
+$Root = "."
 $Ar   = "C:\Users\vilni\Tools\w64devkit\w64devkit\bin\ar.exe"
 $Work = "$Env:TEMP\opencode\combo\work"
 
