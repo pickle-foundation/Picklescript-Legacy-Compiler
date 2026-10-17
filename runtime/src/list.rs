@@ -431,4 +431,35 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn contains_compares_elements_structurally() {
+        // `in` on a list is structural membership, not pointer identity: the
+        // needle is a distinct box from every element, and a nested list must
+        // match another nested list with the same contents.
+        let _guard = setup();
+        crate::pickle_runtime_init();
+        let l = crate::list::pickle_list_new(0);
+        for v in [3i64, -7, 1000] {
+            crate::list::pickle_list_push(l, crate::boxscalar::pickle_box_i64(v));
+        }
+        assert!(pickle_list_contains(l, crate::boxscalar::pickle_box_i64(-7)));
+        assert!(pickle_list_contains(l, crate::boxscalar::pickle_box_i64(1000)));
+        assert!(!pickle_list_contains(l, crate::boxscalar::pickle_box_i64(42)));
+
+        let inner = crate::list::pickle_list_new(0);
+        crate::list::pickle_list_push(inner, crate::boxscalar::pickle_box_i64(1));
+        crate::list::pickle_list_push(inner, crate::boxscalar::pickle_box_i64(2));
+        crate::list::pickle_list_push(l, inner);
+
+        let same = crate::list::pickle_list_new(0);
+        crate::list::pickle_list_push(same, crate::boxscalar::pickle_box_i64(1));
+        crate::list::pickle_list_push(same, crate::boxscalar::pickle_box_i64(2));
+        assert!(pickle_list_contains(l, same));
+
+        let diff = crate::list::pickle_list_new(0);
+        crate::list::pickle_list_push(diff, crate::boxscalar::pickle_box_i64(1));
+        crate::list::pickle_list_push(diff, crate::boxscalar::pickle_box_i64(9));
+        assert!(!pickle_list_contains(l, diff));
+    }
 }

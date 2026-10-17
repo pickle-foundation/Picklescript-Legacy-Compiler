@@ -388,4 +388,18 @@ mod tests {
             unsafe { core::slice::from_raw_parts(string_bytes_ptr(s), string_bytes_len(s)) };
         assert_eq!(bytes, b"1.5");
     }
+
+    #[test]
+    fn contains_finds_substrings() {
+        let _guard = setup();
+        let mk = |b: &[u8]| string_from_bytes(b.as_ptr(), b.len(), crate::gc::gc_mut());
+        let hay = mk(b"hello");
+        assert!(string_contains(hay, mk(b"ell")));
+        assert!(string_contains(hay, mk(b"hello")));
+        assert!(string_contains(hay, mk(b"")));
+        assert!(!string_contains(hay, mk(b"xyz")));
+        assert!(!string_contains(hay, mk(b"hellos")));
+        assert!(!string_contains(hay, mk(b"ol")));
+        assert!(string_contains(hay, mk(b"lo")));
+    }
 }

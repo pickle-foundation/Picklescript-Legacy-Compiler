@@ -3049,3 +3049,69 @@ fn rejects_string_index_assign_out_of_range_byte() {
         error_msgs(&d)
     );
 }
+
+#[test]
+fn accepts_power_operator() {
+    // `**` types as `int` for integer operands and `float` when either side is
+    // a float; both forms assign to their annotated type.
+    let d = check_str(
+        r#"fn main() {
+            let a: int = 2 ** 10
+            let b: int = 2 ** (0 - 3)
+            let c: float = 2.0 ** 0.5
+            let e: float = 9 ** 0.5
+            print(a, b, c, e)
+        }"#,
+    );
+    assert!(!has_errors(&d), "unexpected errors:\n{}", error_msgs(&d));
+}
+
+#[test]
+fn accepts_in_over_containers() {
+    // `in` is a `bool` over a `List`, `Map`, or `string` on the right.
+    let d = check_str(
+        r#"fn main() {
+            let xs = [1, 2, 3]
+            let a: bool = 2 in xs
+            let m = {"k": 1}
+            let b: bool = "k" in m
+            let c: bool = "ell" in "hello"
+            print(a, b, c)
+        }"#,
+    );
+    assert!(!has_errors(&d), "unexpected errors:\n{}", error_msgs(&d));
+}
+
+#[test]
+fn rejects_in_non_container_rhs() {
+    let d = check_str(
+        r#"fn main() {
+            let b = 1 in 5
+        }"#,
+    );
+    assert!(
+        has_errors(&d),
+        "expected a non-container `in` error, got:\n{}",
+        error_msgs(&d)
+    );
+    assert!(
+        error_msgs(&d).contains("right side of `in` must be a `List`, `Map`, or `string`"),
+        "wrong diagnostics:\n{}",
+        error_msgs(&d)
+    );
+}
+
+#[test]
+fn accepts_channel_send() {
+    // `channel <- value` is a statement that yields no value; the channel
+    // handle and payload both type through.
+    let d = check_str(
+        r#"fn main() {
+            let ch = channel_new(2)
+            ch <- 1
+            ch <- 2
+            print(channel_len(ch))
+        }"#,
+    );
+    assert!(!has_errors(&d), "unexpected errors:\n{}", error_msgs(&d));
+}
