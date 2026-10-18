@@ -5588,6 +5588,15 @@ if let Some(c) = self.resolved.consts.iter().find(|c| c.name == name) {
                   // runtime symbol; see PICKLE_AUDIT.md 17.1. Identity lowering in
                   // `convert`, so no trap representation is invented.
                   (Ty::Ptr(_), Ty::Int) | (Ty::Int, Ty::Ptr(_)) => true,
+                  // A function value is also a single 64-bit word in the IR
+                  // domain (the raw code address, the same word `IrConst::FuncAddr`
+                  // bakes into registration calls). A function type carries params
+                  // and a return type, so it is never a type expression on its own
+                  // - the GC engine keeps registered `deinit` finalizers as int
+                  // words and casts them back to a callable only at invocation.
+                  // Identity lowering in `convert`; no trap representation is
+                  // invented.
+                  (Ty::Fn(_, _), Ty::Int) | (Ty::Int, Ty::Fn(_, _)) => true,
             (Ty::List(a), Ty::List(b)) | (Ty::Range(a), Ty::Range(b)) => self.cast_related(a, b),
             (Ty::Map(ka, va), Ty::Map(kb, vb)) => {
                 self.cast_related(ka, kb) && self.cast_related(va, vb)

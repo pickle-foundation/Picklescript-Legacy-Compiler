@@ -7457,6 +7457,16 @@ fn ident_expr(&mut self, e: &Expr, name: &str) -> Result<Temp, ()> {
         {
             return Ok(v);
         }
+        // An `fn` value is a raw 64-bit code address in the IR domain - the
+        // same word `IrConst::FuncAddr` bakes into `pickle_class_register`
+        // calls. Moving the word between an `fn` value and an `int` slot is a
+        // plain register copy; the GC engine stores `deinit` addresses as int
+        // words and casts them back to callables only at invocation.
+        if (matches!(from, Ty::Fn(..)) && to == &Ty::Int)
+            || (from == &Ty::Int && matches!(to, Ty::Fn(..)))
+        {
+            return Ok(v);
+        }
         if from.is_numeric() && to.is_numeric() {
             // `int` and `byte` share the same machine `Int` domain, so
             // int<->byte casts are identity register moves.
